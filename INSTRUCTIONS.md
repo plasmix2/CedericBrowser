@@ -101,6 +101,16 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`gemini/picture-in-picture`** — Implemented borderless Full Screen mode (F11, Escape, right-click menu, and HTML5 video / YouTube fullscreen):
+  - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `INSTRUCTIONS.md`.
+  - **Key additions:**
+    - F11 shortcut support both in web views (`SHORTCUT_SCRIPT`) and toolbar (`Toolbar::key`), mapped to `ChromeCmd::ToggleFullscreen`.
+    - Escape shortcut support (`Shortcut::Escape`) to exit fullscreen mode.
+    - Right-click page context menu entry: "Full Screen" / "Exit Full Screen" with "F11" shortcut hint (`MenuAction::ToggleFullscreen`).
+    - Full HTML5 Fullscreen API support (`fullscreenchange` and `webkitfullscreenchange` event listeners over IPC with `UserEvent::FullscreenState`).
+    - Seamless borderless fullscreen toggle via `tao::window::Fullscreen::Borderless(None)`.
+    - `top_bar_height(&self)` and `devtools_width(&self)` set to 0.0 in fullscreen, giving the active webview 100% display area without visible native chrome.
+
 - **`gemini/picture-in-picture`** — Fixed Google Account sign-in ("This browser or app may not be secure") and YouTube 0:59 playback disconnection:
   - **Files changed:** `src/main.rs`, `src/thumbs.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
   - **Key fixes:**

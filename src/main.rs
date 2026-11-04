@@ -32,7 +32,7 @@ use tao::{
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     platform::windows::WindowBuilderExtWindows,
     keyboard::ModifiersState,
-    window::{CursorIcon, Icon as WinIcon, Theme, Window, WindowBuilder, WindowId},
+    window::{CursorIcon, Fullscreen, Icon as WinIcon, Theme, Window, WindowBuilder, WindowId},
 };
 use wry::{
     BackgroundThrottlingPolicy, MemoryUsageLevel, NewWindowResponse, PageLoadEvent,
@@ -178,6 +178,13 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (document.pictureInPictureElement) post('pip_off');
   }, true);
 
+  const updateFs = () => {
+    const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    post(isFs ? 'fs_on' : 'fs_off');
+  };
+  document.addEventListener('fullscreenchange', updateFs, true);
+  document.addEventListener('webkitfullscreenchange', updateFs, true);
+
   const map = (e) => {
     const c = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
     if (c && k === 't') return 'new_tab';
@@ -191,11 +198,12 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (e.altKey && e.key === 'ArrowLeft') return 'back';
     if (e.altKey && e.key === 'ArrowRight') return 'forward';
     if (e.altKey && !c && !e.shiftKey && k === 'p') return 'pip';
+    if (e.key === 'F11') return 'fullscreen';
     if (e.key === 'F12' || (c && e.shiftKey && k === 'i')) return 'devtools';
     return null;
   };
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') post('dismiss');
+    if (e.key === 'Escape') post('escape');
     const cmd = map(e);
     if (cmd === 'pip') {
       e.preventDefault(); e.stopPropagation();
@@ -452,6 +460,7 @@ enum UserEvent {
     Prewarm,
     /// Frame tick from the pacer while the UI animates.
     Frame,
+    FullscreenState(TabId, bool),
 }
 
 /// What the browser chrome (the native toolbar, menus) asks the browser to do.
@@ -490,6 +499,7 @@ enum ChromeCmd {
     ToggleBookmark,
     BookmarksMenu { x: f64, y: f64 },
     ThemeMenu { x: f64, y: f64 },
+    ToggleFullscreen,
 }
 
 /// Messages from the built-in New Tab page (accepted only while `tab.is_newtab` is true).
@@ -528,6 +538,8 @@ enum Shortcut {
     Pip,
     Bookmark,
     Bookmarks,
+    Fullscreen,
+    Escape,
 }
 
 impl Shortcut {
@@ -547,6 +559,8 @@ impl Shortcut {
             "pip" => Self::Pip,
             "bookmark" => Self::Bookmark,
             "bookmarks" => Self::Bookmarks,
+            "fullscreen" => Self::Fullscreen,
+            "escape" => Self::Escape,
             _ => return None,
         })
     }
@@ -609,6 +623,7 @@ enum MenuAction {
     ChooseBackground,
     SetBackgroundUrl(String),
     ClearBackground,
+    ToggleFullscreen,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -849,6 +864,8 @@ struct Browser {
     suggestions: Vec<Suggestion>,
     devtools: Devtools,
     clipboard: Option<arboard::Clipboard>,
+    fullscreen: bool,
+    html_fullscreen: bool,
 }
 
 impl Browser {
@@ -857,11 +874,15 @@ impl Browser {
     }
 
     fn top_bar_height(&self) -> f64 {
-        CHROME_HEIGHT
+        if self.fullscreen {
+            0.0
+        } else {
+            CHROME_HEIGHT
+        }
     }
 
     fn devtools_width(&self) -> f64 {
-        if !self.devtools.open || self.devtools.view.is_none() {
+        if self.fullscreen || !self.devtools.open || self.devtools.view.is_none() {
             return 0.0;
         }
         let w = self.logical_size().width;
@@ -952,6 +973,10 @@ impl Browser {
                     let _ = p_ipc.send_event(UserEvent::PipState(id, true));
                 } else if body == "pip_off" {
                     let _ = p_ipc.send_event(UserEvent::PipState(id, false));
+                } else if body == "fs_on" {
+                    let _ = p_ipc.send_event(UserEvent::FullscreenState(id, true));
+                } else if body == "fs_off" {
+                    let _ = p_ipc.send_event(UserEvent::FullscreenState(id, false));
                 } else if let Some(s) = Shortcut::parse(body) {
                     let _ = p_ipc.send_event(UserEvent::Shortcut(s));
                 } else if let Ok(cmd) = serde_json::from_str::<NewTabCmd>(body) {
@@ -1016,6 +1041,9 @@ impl Browser {
     fn close_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() {
             return;
+        }
+        if idx == self.active && self.html_fullscreen {
+            self.set_fullscreen(false, true);
         }
         let was_active = idx == self.active;
         if self.tabs.len() == 1 {
@@ -1082,6 +1110,9 @@ impl Browser {
 
     fn switch_to(&mut self, idx: usize) {
         if idx < self.tabs.len() && idx != self.active {
+            if self.html_fullscreen {
+                self.set_fullscreen(false, true);
+            }
             let previous = self.tabs[self.active].id;
             self.active = idx;
             self.show_active();
@@ -1495,6 +1526,8 @@ impl Browser {
         items.push(MenuItem::sep());
         items.push(MenuItem::new("View page source", MenuAction::ViewSource).enabled(web));
         items.push(MenuItem::new("Inspect", MenuAction::Inspect).hint("F12"));
+        let fs_label = if self.fullscreen { "Exit Full Screen" } else { "Full Screen" };
+        items.push(MenuItem::new(fs_label, MenuAction::ToggleFullscreen).hint("F11"));
 
         // Page coordinates are CSS pixels of the (possibly zoomed) page.
         let zoom = r.dpr / self.window.scale_factor();
@@ -1577,6 +1610,7 @@ impl Browser {
                 }
             }
             MenuAction::ClearBackground => self.apply_background(None, None),
+            MenuAction::ToggleFullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
         }
     }
 
@@ -1621,7 +1655,34 @@ impl Browser {
         self.popups.hide(PopupKind::Suggest);
     }
 
-    // ---------- Picture-in-Picture & DevTools ----------
+    // ---------- Fullscreen, Picture-in-Picture & DevTools ----------
+
+    fn toggle_fullscreen(&mut self) {
+        let next = !self.fullscreen;
+        self.set_fullscreen(next, false);
+    }
+
+    fn set_fullscreen(&mut self, on: bool, is_html: bool) {
+        if self.fullscreen == on {
+            return;
+        }
+        self.fullscreen = on;
+        self.html_fullscreen = on && is_html;
+        if on {
+            self.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        } else {
+            self.window.set_fullscreen(None);
+            if !is_html {
+                let js = "if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document).catch(() => {}); }";
+                self.with_active(|v| v.evaluate_script(js));
+            }
+        }
+        self.close_menu();
+        self.close_suggest();
+        self.hide_preview();
+        self.layout();
+        self.sync_ui();
+    }
 
     fn toggle_pip(&mut self, target: Option<TabId>, prefer_ctx: bool) {
         let id = target.or_else(|| {
@@ -1776,7 +1837,12 @@ impl Browser {
             ChromeCmd::HistoryMenu { x, y } => self.history_menu(x, y),
             ChromeCmd::TabHover { id, x, y } => self.show_preview(id, x, y),
             ChromeCmd::TabHoverEnd => self.hide_preview(),
-            ChromeCmd::Dismiss => self.close_menu(),
+            ChromeCmd::Dismiss => {
+                if self.fullscreen {
+                    self.set_fullscreen(false, false);
+                }
+                self.close_menu();
+            }
             ChromeCmd::Query { text, x, y, w } => self.query(text, x, y, w),
             ChromeCmd::SuggestSelect { index } => {
                 self.popups.select(PopupKind::Suggest, index);
@@ -1804,6 +1870,7 @@ impl Browser {
             ChromeCmd::ToggleBookmark => self.toggle_bookmark(),
             ChromeCmd::BookmarksMenu { x, y } => self.bookmarks_menu(x, y),
             ChromeCmd::ThemeMenu { x, y } => self.theme_menu(x, y),
+            ChromeCmd::ToggleFullscreen => self.toggle_fullscreen(),
         }
     }
 
@@ -1841,8 +1908,17 @@ impl Browser {
             Shortcut::Back => self.handle_chrome(ChromeCmd::Back),
             Shortcut::Forward => self.handle_chrome(ChromeCmd::Forward),
             Shortcut::Devtools => self.toggle_devtools(),
+            Shortcut::Fullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
+            Shortcut::Escape => {
+                if self.fullscreen {
+                    self.set_fullscreen(false, false);
+                }
+                self.close_menu();
+                self.toolbar.blur_address();
+                self.window.request_redraw();
+            }
             Shortcut::Dismiss => {
-                // A click or Escape in the page: close menus and stop editing the address bar.
+                // A click or focus in the page: close menus and stop editing the address bar.
                 self.close_menu();
                 self.toolbar.blur_address();
                 self.window.request_redraw();
@@ -1956,6 +2032,11 @@ impl Browser {
                         }
                     }
                     self.sync_ui();
+                }
+            }
+            UserEvent::FullscreenState(id, on) => {
+                if self.active_tab().map(|t| t.id) == Some(id) {
+                    self.set_fullscreen(on, true);
                 }
             }
             UserEvent::UpgradeHttps(id, https_url) => {
@@ -2118,7 +2199,7 @@ impl Browser {
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f64>(self.window.scale_factor());
                 self.mouse = (p.x, p.y);
-                if p.y < CHROME_HEIGHT || self.toolbar.captures_mouse() {
+                if !self.fullscreen && (p.y < CHROME_HEIGHT || self.toolbar.captures_mouse()) {
                     let icon = self.toolbar.mouse_move(p.x as f32, p.y as f32);
                     self.set_cursor(icon);
                     self.devtools.hover = false;
@@ -2133,18 +2214,20 @@ impl Browser {
                 self.window.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
-                match state {
-                    ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
-                    ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => {
-                        self.toolbar.mouse_up(button, x, y)
+                if !self.fullscreen {
+                    let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
+                    match state {
+                        ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
+                        ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => {
+                            self.toolbar.mouse_up(button, x, y)
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                    if button == MouseButton::Left {
+                        self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
+                    }
+                    self.window.request_redraw();
                 }
-                if button == MouseButton::Left {
-                    self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
-                }
-                self.window.request_redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => {
@@ -2182,6 +2265,9 @@ impl Browser {
     /// pane) is put on screen: the rest of the window is covered by page windows, and painting
     /// under them would flicker.
     fn redraw(&mut self) {
+        if self.fullscreen {
+            return;
+        }
         let now = Instant::now();
         self.next_frame = self.toolbar.tick(now);
         self.flush_toolbar();
@@ -2404,6 +2490,8 @@ fn main() -> wry::Result<()> {
         suggestions: Vec::new(),
         devtools: Devtools { view: None, open: false, width: 520.0, tab: None, dragging: false, hover: false, seq: 0 },
         clipboard: None,
+        fullscreen: false,
+        html_fullscreen: false,
     };
     let start = std::env::args().nth(1).and_then(|a| {
         let resolved = input::resolve_with_info(&unmask(&a))?;
@@ -2502,5 +2590,7 @@ mod tests {
         assert!(matches!(Shortcut::parse("pip"), Some(Shortcut::Pip)));
         assert!(matches!(Shortcut::parse("bookmark"), Some(Shortcut::Bookmark)));
         assert!(matches!(Shortcut::parse("bookmarks"), Some(Shortcut::Bookmarks)));
+        assert!(matches!(Shortcut::parse("fullscreen"), Some(Shortcut::Fullscreen)));
+        assert!(matches!(Shortcut::parse("escape"), Some(Shortcut::Escape)));
     }
 }

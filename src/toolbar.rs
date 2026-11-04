@@ -837,6 +837,7 @@ impl Toolbar {
             (_, Some("w")) if ctrl => Some(ChromeCmd::CloseTab { id: self.model.active }),
             (_, Some("r")) if ctrl => Some(ChromeCmd::Reload),
             (Key::F5, _) => Some(ChromeCmd::Reload),
+            (Key::F11, _) => Some(ChromeCmd::ToggleFullscreen),
             (Key::F12, _) => Some(ChromeCmd::Devtools),
             (_, Some("i")) if ctrl && shift => Some(ChromeCmd::Devtools),
             (_, Some("d")) if ctrl && !shift && !alt => Some(ChromeCmd::ToggleBookmark),
