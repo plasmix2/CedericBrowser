@@ -149,9 +149,15 @@ impl HistoryStore {
         removed
     }
 
-    /// Clears all saved search history and removes the encrypted payload.
+    /// Clears all saved search history, rotates the vault key, and overwrites the encrypted file.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.next_id = 1;
+        let fresh = crypto::random_bytes_32();
+        if let Some(parent) = self.file_path.parent() {
+            let _ = fs::write(parent.join("history.key"), fresh);
+        }
+        self.key = crypto::derive_vault_key(&fresh);
         self.save();
     }
 

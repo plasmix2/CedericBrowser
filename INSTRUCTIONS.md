@@ -101,6 +101,14 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`agy/anonymous-history`** — Anonymous session search history & automatic clearing:
+  - **Files changed:** `src/main.rs`, `src/history.rs`, `src/crypto.rs`, `INSTRUCTIONS.md`.
+  - **Key changes:**
+    - Removed OS username (`USERNAME`), machine hostname (`COMPUTERNAME`), and process ID (`std::process::id()`) from `crypto::derive_vault_key` and `crypto::random_bytes_32`.
+    - Updated `HistoryStore::clear()` to rotate `history.key` with a fresh random seed and reset `next_id` before overwriting `history.enc`.
+    - Auto-clears search history on startup and on browser close (`browser.quit`), and clears browsing data across all open tabs on `ChromeCmd::ClearHistory` and on exit.
+    - Updated `Browser::history_menu` to show newest session searches first with an `"Anonymous session (Auto-clears)"` header and top `"Clear search history"` action, and added `<meta name="referrer" content="no-referrer">` + `rel="noreferrer noopener"` on search results in `BRAND_SCRIPT`.
+
 - **`agy/newtab-autotype`** — Instant auto-typing in the address bar on New Tab open and focus lock:
   - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `INSTRUCTIONS.md`.
   - **Key changes:**
