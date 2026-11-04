@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <title>New Tab</title>
+<link rel="dns-prefetch" href="https://search.brave.com">
+<link rel="preconnect" href="https://search.brave.com" crossorigin>
 <style>
   :root { --bg: #1d1e22; --fg: #ececf0; --dim: #8d909a; --field: #2a2b31; --border: #383a42; --accent: #ff6a3d;
     --ease: cubic-bezier(.2, .8, .2, 1); }
@@ -14,11 +16,9 @@
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); overflow: hidden;
     font: 15px "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; transition: background-color .2s, color .2s; }
-  body::before { content: ""; position: fixed; inset: -20%; pointer-events: none; opacity: .55;
+  body::before { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .55;
     background: radial-gradient(40% 35% at 30% 20%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 70%),
-      radial-gradient(35% 30% at 75% 75%, rgba(120, 90, 255, .18), transparent 70%);
-    animation: drift 18s ease-in-out infinite alternate; }
-  @keyframes drift { to { transform: translate(4%, -3%) scale(1.08); } }
+      radial-gradient(35% 30% at 75% 75%, rgba(120, 90, 255, .18), transparent 70%); }
   #theme-btn { position: fixed; top: 18px; right: 20px; z-index: 2; display: inline-flex; align-items: center; gap: 8px;
     height: 34px; padding: 0 14px; border-radius: 17px; border: 1px solid var(--border); background: var(--field);
     color: var(--dim); font: 12.5px "Segoe UI Variable Text", "Segoe UI", system-ui; cursor: pointer;
@@ -67,7 +67,7 @@
   <h1 id="brand"><b id="brand-name" style="font-weight:inherit">Cederic</b><span>.</span></h1>
   <form id="f">
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
-    <input id="q" placeholder="Search the web" autocomplete="off" autofocus>
+    <input id="q" placeholder="Search the web" autocomplete="off">
   </form>
   <div id="bms"></div>
   <p><kbd>Ctrl T</kbd> new tab &nbsp; <kbd>Ctrl L</kbd> address bar &nbsp; <kbd>Ctrl D</kbd> bookmark &nbsp; <kbd>Ctrl B</kbd> bookmarks &nbsp; <kbd>Ctrl H</kbd> history &nbsp; <kbd>Alt P</kbd> PiP &nbsp; <kbd>F12</kbd> dev tools</p>
@@ -92,6 +92,7 @@
     const box = document.getElementById('bms');
     box.textContent = '';
     for (const b of (s.bookmarks || [])) {
+      if (window.__cedericPreconnect) window.__cedericPreconnect(b.url);
       const el = document.createElement('div');
       el.className = 'bm';
       el.title = b.url;

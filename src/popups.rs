@@ -94,6 +94,7 @@ pub struct Popup {
     pub kind: Kind,
     pub window: Rc<Window>,
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+    surface_size: (u32, u32),
     pm: Pixmap,
     open: bool,
     v: View,
@@ -294,8 +295,11 @@ impl Popups {
         }
         let s = p.window.scale_factor() as f32;
         draw(&mut p.v, &mut p.pm, fonts, &th, s);
-        if p.surface.resize(w, h).is_err() {
-            return;
+        if p.surface_size != (w.get(), h.get()) {
+            if p.surface.resize(w, h).is_err() {
+                return;
+            }
+            p.surface_size = (w.get(), h.get());
         }
         let Ok(mut buf) = p.surface.buffer_mut() else { return };
         for (d, px) in buf.iter_mut().zip(p.pm.data().chunks_exact(4)) {
@@ -331,6 +335,7 @@ impl Popup {
             kind,
             window,
             surface,
+            surface_size: (0, 0),
             pm: Pixmap::new(1, 1).expect("1x1 pixmap"),
             open: false,
             v: View {

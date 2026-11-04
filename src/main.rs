@@ -21,7 +21,7 @@ use std::{
 };
 
 use gfx::Brand;
-use history::{HistoryEntry, HistoryStore};
+use history::HistoryStore;
 use popups::{Card, Content, Kind as PopupKind, MenuEntry, Pick, Popups, SuggestEntry};
 use tiny_skia::Pixmap;
 use toolbar::{BRAND_ICON, Toolbar};
@@ -49,23 +49,23 @@ const DEVTOOLS_MIN: f64 = 280.0;
 const NEWTAB_HTML: &str = include_str!("ui/newtab.html");
 
 /// Every WebView sharing a data directory must use identical arguments.
-/// Hardened for Wi-Fi search privacy:
-/// - Built-in Async DNS + DNS-over-HTTPS (DoH via Cloudflare) so local Wi-Fi routers cannot see DNS queries.
-/// - Encrypted Client Hello (ECH) + Post-Quantum Kyber TLS key exchange + HTTPS-First automatic upgrades.
-/// - WebRTC non-proxied UDP disabled to prevent local Wi-Fi IP leaks.
-/// - SmartScreen, DNS prefetch, hyperlink auditing (`<a ping>`), and background telemetry disabled.
+/// Tuned for fast page loads, GPU rasterization, and Wi-Fi privacy:
+/// - In-process network service, async DNS, Happy Eyeballs v3, parallel downloading, back-forward
+///   cache, GPU/zero-copy rasterization, and QUIC enabled.
+/// - Encrypted Client Hello (ECH) enabled; WebRTC non-proxied UDP disabled to prevent local Wi-Fi IP leaks.
+/// - SmartScreen, hyperlink auditing (`<a ping>`), and background telemetry disabled while keeping
+///   the engine's speculative preconnect and loading predictor active.
 /// - A loopback-only DevTools port chosen by the OS, which the docked DevTools pane connects to.
 const BROWSER_ARGS: &str = "\
-    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate \
-    --enable-features=AsyncDns,DnsOverHttps<DoHTrial,EncryptedClientHello,PostQuantumKyber,HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,StrictOriginIsolation,BackForwardCache,ParallelDownloading \
-    --force-fieldtrials=DoHTrial/Group1 \
-    --force-fieldtrial-params=DoHTrial.Group1:server/https%3A%2F%2Fcloudflare-dns.com%2Fdns-query/method/POST \
+    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,RendererCodeIntegrity \
+    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,BackForwardCache,ParallelDownloading,CanvasOopRasterization,UseEcoQoSForBackgroundProcess \
     --enable-quic \
+    --enable-gpu-rasterization \
+    --enable-zero-copy \
     --ssl-version-min=tls1.2 \
-    --dns-prefetch-disable \
     --no-pings \
     --reduced-referrer-granularity \
-    --disable-background-networking \
+    --disable-component-update \
     --disable-domain-reliability \
     --disable-client-side-phishing-detection \
     --disable-sync \
@@ -73,14 +73,62 @@ const BROWSER_ARGS: &str = "\
     --enforce-webrtc-ip-permission-check \
     --remote-debugging-port=0";
 
-/// Keyboard shortcuts, the context menu, and Wi-Fi form/beacon encryption guard for content pages.
-/// Untrusted web content can only trigger the fixed `Shortcut` whitelist and a validated
-/// `ContextRequest` over IPC.
+/// Keyboard shortcuts, the context menu, speculative link preconnect/prefetch, and Wi-Fi form
+/// encryption guard for content pages. Untrusted web content can only trigger the fixed `Shortcut`
+/// whitelist and a validated `ContextRequest` over IPC.
 const SHORTCUT_SCRIPT: &str = r#"
 (() => {
+  const preconnected = new Set();
+  const preconnect = (raw) => {
+    if (!raw || preconnected.size >= 48) return;
+    try {
+      const u = new URL(raw, location.href);
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return;
+      if (u.protocol === 'http:' && u.hostname !== 'localhost' && !u.hostname.endsWith('.localhost') && u.hostname !== '127.0.0.1') {
+        u.protocol = 'https:';
+      }
+      const origin = u.origin;
+      if (!origin || origin === 'null' || origin === location.origin || preconnected.has(origin)) return;
+      const root = document.head || document.documentElement;
+      if (!root) return;
+      preconnected.add(origin);
+      const dns = document.createElement('link');
+      dns.rel = 'dns-prefetch';
+      dns.href = origin;
+      const pc = document.createElement('link');
+      pc.rel = 'preconnect';
+      pc.href = origin;
+      pc.crossOrigin = 'anonymous';
+      root.append(dns, pc);
+    } catch (_) {}
+  };
+  window.__cedericPreconnect = preconnect;
+
+  const injectSpeculation = () => {
+    if (location.protocol !== 'https:' && location.protocol !== 'http:') return;
+    const root = document.head || document.documentElement;
+    if (!root || document.getElementById('__cederic_spec')) return;
+    const s = document.createElement('script');
+    s.id = '__cederic_spec';
+    s.type = 'speculationrules';
+    s.textContent = '{"prefetch":[{"where":{"href_matches":"https://*"},"eagerness":"moderate"}],"prerender":[{"where":{"href_matches":"https://*"},"eagerness":"conservative"}]}';
+    root.appendChild(s);
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', injectSpeculation, { once: true });
+  } else {
+    injectSpeculation();
+  }
+
+  window.addEventListener('pointerover', (e) => {
+    const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
+    if (a && a.href) preconnect(a.href);
+  }, { capture: true, passive: true });
+
   let ctxVideo = null;
   const videos = (root = document, out = []) => {
     for (const v of root.querySelectorAll('video')) out.push(v);
+    if (out.length) return out;
     for (const el of root.querySelectorAll('*')) {
       if (el.shadowRoot) videos(el.shadowRoot, out);
     }
@@ -90,12 +138,18 @@ const SHORTCUT_SCRIPT: &str = r#"
   const videoAt = (x, y) => {
     for (const el of document.elementsFromPoint(x, y)) {
       if (usable(el)) return el;
+      if (el.shadowRoot) {
+        for (const v of el.shadowRoot.querySelectorAll('video')) {
+          if (usable(v)) return v;
+        }
+      }
     }
-    return videos().find((v) => {
-      if (!usable(v)) return false;
+    for (const v of document.querySelectorAll('video')) {
+      if (!usable(v)) continue;
       const r = v.getBoundingClientRect();
-      return r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
-    }) || null;
+      if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return v;
+    }
+    return null;
   };
   const bestVideo = (preferCtx) => {
     if (preferCtx && usable(ctxVideo)) return ctxVideo;
@@ -161,8 +215,13 @@ const SHORTCUT_SCRIPT: &str = r#"
     }
     if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); }
   }, true);
-  // Popups never take focus, so a click in the page is what closes an open menu.
-  window.addEventListener('pointerdown', () => window.ipc.postMessage('dismiss'), true);
+  // Popups never take focus, so a click or focus into the page is what closes an open menu.
+  window.addEventListener('pointerdown', (e) => {
+    const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
+    if (a && a.href) preconnect(a.href);
+    window.ipc.postMessage('dismiss');
+  }, true);
+  window.addEventListener('focusin', () => window.ipc.postMessage('dismiss'), true);
 
   // Bubble phase: pages with their own context menu call preventDefault first and keep it.
   // Editable fields keep the engine's menu so cut/paste/spellcheck work.
@@ -172,7 +231,7 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (t && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
     e.preventDefault();
     const a = t && t.closest('a[href]'), img = t && t.closest('img');
-    ctxVideo = videoAt(e.clientX, e.clientY) || bestVideo(false);
+    ctxVideo = videoAt(e.clientX, e.clientY) || (document.querySelector('video') && bestVideo(false)) || null;
     window.ipc.postMessage(JSON.stringify({
       x: e.clientX, y: e.clientY, dpr: window.devicePixelRatio,
       link: a ? a.href : '', image: img ? (img.currentSrc || img.src) : '',
@@ -198,26 +257,60 @@ const SHORTCUT_SCRIPT: &str = r#"
 })();
 "#;
 
-/// Shows Cederic's (or Uzaki's) name and wordmark in place of Brave's on Brave Search.
+/// Shows Cederic's (or Uzaki's) name and wordmark in place of Brave's on Brave Search, and
+/// preconnects top search result origins so clicking any result loads without DNS/TLS delay.
 const BRAND_SCRIPT: &str = r#"
 (() => {
   if (location.hostname !== 'search.brave.com') return;
   const style = document.createElement('style');
   let brandName = 'Cederic';
-  const re = /\b(Brave|Cederic|Uzaki)\b/;
   const fix = (s) => s.replace(/\b(Brave|Cederic|Uzaki)\b/g, brandName);
   const fixText = (n) => {
     const p = n.parentElement;
-    if (p && !/^(SCRIPT|STYLE|TEXTAREA)$/.test(p.tagName) && re.test(n.data)) n.data = fix(n.data);
+    if (p && !/^(SCRIPT|STYLE|TEXTAREA|SVG|NOSCRIPT|CODE|PRE)$/i.test(p.tagName) && re.test(n.data)) {
+      const next = fix(n.data);
+      if (next !== n.data) n.data = next;
+    }
   };
   const scrub = (root) => {
     if (!root) return;
-    const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    for (let n; (n = walk.nextNode());) fixText(n);
-    for (const el of root.querySelectorAll('[placeholder], [title], [aria-label], [alt]')) {
-      for (const a of ['placeholder', 'title', 'aria-label', 'alt']) {
-        const v = el.getAttribute(a);
-        if (v && re.test(v)) el.setAttribute(a, fix(v));
+    if (root.nodeType === Node.TEXT_NODE) {
+      fixText(root);
+      return;
+    }
+    const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => {
+        const p = n.parentElement;
+        return (p && /^(SCRIPT|STYLE|TEXTAREA|SVG|NOSCRIPT|CODE|PRE)$/i.test(p.tagName))
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    for (let n; (n = walk.nextNode());) {
+      if (re.test(n.data)) {
+        const next = fix(n.data);
+        if (next !== n.data) n.data = next;
+      }
+    }
+    if (root.querySelectorAll) {
+      for (const el of root.querySelectorAll('[placeholder], [title], [aria-label], [alt]')) {
+        for (const a of ['placeholder', 'title', 'aria-label', 'alt']) {
+          const v = el.getAttribute(a);
+          if (v && re.test(v)) {
+            const next = fix(v);
+            if (next !== v) el.setAttribute(a, next);
+          }
+        }
+      }
+    }
+  };
+  const prewarmResults = () => {
+    if (!window.__cedericPreconnect || !document.body) return;
+    let count = 0;
+    for (const a of document.body.querySelectorAll('a[href^="https://"]')) {
+      if (!a.href.includes('brave.com')) {
+        window.__cedericPreconnect(a.href);
+        if (++count >= 6) break;
       }
     }
   };
@@ -242,7 +335,10 @@ const BRAND_SCRIPT: &str = r#"
         -webkit-background-clip: border-box; background-clip: border-box; color: #fff; font-size: 16px;
         letter-spacing: 0; padding: 0; }`;
     if (document.body) scrub(document.body);
-    if (document.title) document.title = fix(document.title);
+    if (document.title) {
+      const next = fix(document.title);
+      if (next !== document.title) document.title = next;
+    }
   };
   window.__cedericSetBrand(window.__cedericBrand || 'cederic');
   const attach = () => {
@@ -250,17 +346,33 @@ const BRAND_SCRIPT: &str = r#"
     if (root && !style.isConnected) root.appendChild(style);
   };
   attach();
-  new MutationObserver((muts) => {
+  const pending = new Set();
+  let queued = false;
+  new MutationObserver((mutations) => {
     attach();
-    for (const m of muts) {
-      if (m.type === 'characterData') fixText(m.target);
-      else for (const n of m.addedNodes) {
-        if (n.nodeType === 3) fixText(n);
-        else if (n.nodeType === 1) scrub(n);
+    for (const m of mutations) {
+      for (const n of m.addedNodes) {
+        if (n !== style) pending.add(n);
       }
     }
-  }).observe(document, { childList: true, subtree: true, characterData: true });
-  document.addEventListener('DOMContentLoaded', () => scrub(document.body));
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      for (const n of pending) {
+        if (n.isConnected) scrub(n);
+      }
+      pending.clear();
+      if (document.title && re.test(document.title)) {
+        const next = fix(document.title);
+        if (next !== document.title) document.title = next;
+      }
+    });
+  }).observe(document, { childList: true, subtree: true });
+  document.addEventListener('DOMContentLoaded', () => {
+    scrub(document.body);
+    prewarmResults();
+  });
 })();
 "#;
 
@@ -576,6 +688,8 @@ struct Tab {
     url: String,
     favicon: String,
     loading: bool,
+    can_back: bool,
+    can_forward: bool,
     pip: bool,
     is_newtab: bool,
     /// Still painted in the new-tab page color; switches to white once a real page loads.
@@ -588,7 +702,6 @@ struct Tab {
 struct NewTabState<'a> {
     brand: Brand,
     bookmarks: &'a [Bookmark],
-    history: &'a [HistoryEntry],
 }
 
 struct Devtools {
@@ -606,7 +719,9 @@ struct Browser {
     toolbar: Toolbar,
     /// Paints the toolbar strip of the main window (pages are separate child windows on top).
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+    surface_size: (u32, u32),
     frame: Pixmap,
+    window_title: String,
     /// When the toolbar next needs a frame (animation or timer); `None` when idle.
     next_frame: Option<Instant>,
     pacer: pacer::Pacer,
@@ -757,6 +872,8 @@ impl Browser {
             url: url.unwrap_or_default().to_owned(),
             favicon: String::new(),
             loading: url.is_some(),
+            can_back: false,
+            can_forward: false,
             pip: false,
             is_newtab: url.is_none(),
             newtab_bg: url.is_none(),
@@ -894,6 +1011,9 @@ impl Browser {
             let _ = tab.view.set_bounds(bounds);
             let _ = tab.view.set_visible(true);
             let _ = tab.view.focus();
+            if tab.is_newtab {
+                Self::push_newtab_state(&tab.view, &self.prefs);
+            }
             let _ = self.thumbs_tx.send(thumbs::Request::Active(Some(tab.id)));
         }
         self.hide_preview();
@@ -918,11 +1038,10 @@ impl Browser {
         self.window.request_redraw();
     }
 
-    fn push_newtab_state(view: &WebView, prefs: &Prefs, history: &HistoryStore) {
+    fn push_newtab_state(view: &WebView, prefs: &Prefs) {
         let state = NewTabState {
             brand: prefs.brand,
             bookmarks: &prefs.bookmarks,
-            history: history.entries(),
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -946,8 +1065,8 @@ impl Browser {
                 .collect(),
             active: tab.id,
             url: display_url(&tab.url, brand),
-            can_back: tab.view.can_go_back().unwrap_or(false),
-            can_forward: tab.view.can_go_forward().unwrap_or(false),
+            can_back: tab.can_back,
+            can_forward: tab.can_forward,
             loading: tab.loading,
             maximized: self.window.is_maximized(),
             devtools: self.devtools.open,
@@ -955,12 +1074,13 @@ impl Browser {
             bookmarked: self.prefs.is_bookmarked(&tab.url),
             brand,
         };
-        if tab.is_newtab {
-            Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
-        }
         let brand_name = brand.name();
         let title = if tab.title.is_empty() { brand_name } else { &tab.title };
-        self.window.set_title(&format!("{title} - {brand_name}"));
+        let full_title = format!("{title} - {brand_name}");
+        if self.window_title != full_title {
+            self.window.set_title(&full_title);
+            self.window_title = full_title;
+        }
         self.toolbar.set_model(model);
         for url in self.toolbar.take_icon_requests() {
             let _ = self.icons_tx.send(url);
@@ -973,14 +1093,18 @@ impl Browser {
         self.toolbar.set_size(scale, self.logical_size().width as f32);
         self.window.request_redraw();
         let bounds = self.content_bounds();
+        // Only resize the visible active tab (and keep any background PiP tab at its 1x1 offscreen slot);
+        // hidden/suspended background tabs are resized lazily in `show_active` when switched to.
         for (i, tab) in self.tabs.iter().enumerate() {
-            let b = if i != self.active && tab.pip { rect(-10.0, -10.0, 1.0, 1.0) } else { bounds };
-            let _ = tab.view.set_bounds(b);
+            if i == self.active {
+                let _ = tab.view.set_bounds(bounds);
+            } else if tab.pip {
+                let _ = tab.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
+            }
         }
-        if let Some(spare) = &self.spare {
-            let _ = spare.view.set_bounds(bounds);
-        }
-        if let Some(v) = &self.devtools.view {
+        if let Some(v) = &self.devtools.view
+            && self.devtools.open
+        {
             let _ = v.set_bounds(self.devtools_bounds());
         }
     }
@@ -990,12 +1114,12 @@ impl Browser {
         let Some(resolved) = input::resolve_with_info(&unmask(raw_input)) else {
             return;
         };
-        self.history.record(&resolved.query, &resolved.url, resolved.engine, resolved.is_search);
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.is_newtab = false;
             let _ = tab.view.load_url(&resolved.url);
             let _ = tab.view.focus();
         }
+        self.history.record(&resolved.query, &resolved.url, resolved.engine, resolved.is_search);
         self.sync_ui();
     }
 
@@ -1121,13 +1245,13 @@ impl Browser {
     fn sync_all_newtabs(&self) {
         for tab in &self.tabs {
             if tab.is_newtab {
-                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+                Self::push_newtab_state(&tab.view, &self.prefs);
             }
         }
         if let Some(spare) = &self.spare
             && spare.is_newtab
         {
-            Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
+            Self::push_newtab_state(&spare.view, &self.prefs);
         }
     }
 
@@ -1343,6 +1467,13 @@ impl Browser {
             self.suggestions.clear();
             self.popups.hide(PopupKind::Suggest);
             return;
+        }
+        // Preconnect to the target host (or search engine) while the user is still typing.
+        if let Some(target_url) = input::resolve(&unmask(&text))
+            && let Some(host) = host_of(&target_url)
+            && let Ok(origin_js) = serde_json::to_string(&format!("https://{host}"))
+        {
+            self.with_active(|v| v.evaluate_script(&format!("window.__cedericPreconnect && window.__cedericPreconnect({origin_js})")));
         }
         // Show the typed row instantly, then fill in suggestions when they arrive.
         self.suggest_query = text.clone();
@@ -1598,9 +1729,12 @@ impl Browser {
             Shortcut::Devtools => self.toggle_devtools(),
             Shortcut::Dismiss => {
                 // A click or Escape in the page: close menus and stop editing the address bar.
+                let active = self.popups.is_open(PopupKind::Menu) || self.toolbar.is_editing();
                 self.close_menu();
                 self.toolbar.blur_address();
-                self.window.request_redraw();
+                if active {
+                    self.window.request_redraw();
+                }
             }
             Shortcut::Pip => self.toggle_pip(None, false),
             Shortcut::Bookmark => self.toggle_bookmark(),
@@ -1616,7 +1750,7 @@ impl Browser {
             && spare.id == id
         {
             if matches!(cmd, NewTabCmd::Ready) {
-                Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
+                Self::push_newtab_state(&spare.view, &self.prefs);
             }
             return;
         }
@@ -1625,7 +1759,7 @@ impl Browser {
             return;
         }
         match cmd {
-            NewTabCmd::Ready => Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history),
+            NewTabCmd::Ready => Self::push_newtab_state(&self.tabs[i].view, &self.prefs),
             NewTabCmd::Search { input } => {
                 if i != self.active {
                     self.switch_to(i);
@@ -1733,8 +1867,11 @@ impl Browser {
             }
             UserEvent::Frame => self.window.request_redraw(),
             UserEvent::Prewarm => {
-                if self.spare.is_none() {
-                    self.spare = self.build_tab(None).ok();
+                if self.spare.is_none()
+                    && let Ok(spare) = self.build_tab(None)
+                {
+                    let _ = spare.view.set_memory_usage_level(MemoryUsageLevel::Low);
+                    self.spare = Some(spare);
                 }
             }
             UserEvent::Suggestions(res) => {
@@ -1777,6 +1914,8 @@ impl Browser {
                 }
                 let tab = &mut self.tabs[i];
                 tab.loading = started;
+                tab.can_back = tab.view.can_go_back().unwrap_or(false);
+                tab.can_forward = tab.view.can_go_forward().unwrap_or(false);
                 if !url.is_empty() && !url.starts_with("about:") && !url.starts_with("data:") {
                     tab.is_newtab = false;
                 }
@@ -1795,14 +1934,20 @@ impl Browser {
                 if tab.title.is_empty() || tab.title == "New Tab" {
                     tab.title = host_of(&tab.url).unwrap_or("New Tab").to_owned();
                 }
+                let is_newtab = tab.is_newtab;
+                let view_ref = &tab.view;
                 if !started {
-                    let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
-                    let proxy = self.proxy.clone();
-                    let _ = tab.view.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
-                        if let Some(icon) = parse_favicon(&res) {
-                            let _ = proxy.send_event(UserEvent::Favicon(id, icon));
-                        }
-                    });
+                    if !is_newtab {
+                        let proxy = self.proxy.clone();
+                        let _ = view_ref.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
+                            if let Some(icon) = parse_favicon(&res) {
+                                let _ = proxy.send_event(UserEvent::Favicon(id, icon));
+                            }
+                        });
+                    }
+                    if !is_newtab && self.tabs.len() > 1 {
+                        let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
+                    }
                 }
                 self.sync_ui();
             }
@@ -1942,15 +2087,17 @@ impl Browser {
         self.toolbar.render(&mut self.frame);
         let dt = self.devtools_width();
         let logical_w = self.logical_size().width;
-        if self.surface.resize(w, h).is_err() {
-            return;
+        if self.surface_size != (w.get(), h.get()) {
+            if self.surface.resize(w, h).is_err() {
+                return;
+            }
+            self.surface_size = (w.get(), h.get());
         }
         let Ok(mut buf) = self.surface.buffer_mut() else { return };
         let width = w.get() as usize;
-        for (dst, src) in buf.chunks_exact_mut(width).zip(self.frame.data().chunks_exact(width * 4)) {
-            for (d, p) in dst.iter_mut().zip(src.chunks_exact(4)) {
-                *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
-            }
+        let bar_px = width * bar_h as usize;
+        for (d, p) in buf[..bar_px].iter_mut().zip(self.frame.data().chunks_exact(4)) {
+            *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
         }
         let mut damage = vec![softbuffer::Rect { x: 0, y: 0, width: w, height: NonZeroU32::new(bar_h).unwrap_or(h) }];
         if dt > 0.0 {
@@ -2087,7 +2234,9 @@ fn main() -> wry::Result<()> {
         window,
         toolbar,
         surface,
+        surface_size: (0, 0),
         frame: Pixmap::new(1, 1).expect("1x1 pixmap"),
+        window_title: String::new(),
         next_frame: None,
         pacer,
         mouse: (-1.0, -1.0),

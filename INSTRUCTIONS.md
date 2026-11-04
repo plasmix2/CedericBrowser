@@ -101,6 +101,20 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`agy/perf-improvements`** — Browser-wide UI, rendering, and site-loading performance overhaul (also integrated `f4194fe` from `gemini/picture-in-picture`):
+  - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `src/gfx.rs`, `src/popups.rs`, `src/thumbs.rs`, `src/input.rs`, `src/history.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
+  - **Key improvements & changes:**
+    - **Site-loading & network acceleration (`BROWSER_ARGS`, `SHORTCUT_SCRIPT`, `BRAND_SCRIPT`, `newtab.html`, `input.rs`, `history.rs`):**
+      - Removed `--disable-background-networking` (which disabled Chromium's `LoadingPredictor` and `PreconnectManager`), broken `DnsOverHttps<DoHTrial` fieldtrial params, `--dns-prefetch-disable`, `PostQuantumKyber`, and `StrictOriginIsolation`.
+      - Enabled `NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,BackForwardCache,ParallelDownloading,CanvasOopRasterization,UseEcoQoSForBackgroundProcess` plus `--enable-quic --enable-gpu-rasterization --enable-zero-copy`.
+      - Added `window.__cedericPreconnect` and Chromium `<script type="speculationrules">` (`prefetch` on moderate hover + `prerender` on conservative pointerdown) in `SHORTCUT_SCRIPT`, plus live address-bar preconnect while typing (`Browser::query`), New Tab preconnect for `search.brave.com` and bookmarks, and automatic preconnect for top search results on `search.brave.com`.
+      - Prioritized `tab.view.load_url` before history disk I/O in `navigate_active`, eliminated redundant disk writes on deduplicated history records, and added zero-allocation fast-paths to `input::upgrade_to_https` and `input::is_allowed_navigation`.
+    - **UI & rendering optimizations (`gfx.rs`, `toolbar.rs`, `popups.rs`, `thumbs.rs`, `main.rs`):**
+      - Cached `fontdb::Database` and all 21 vector `Icon` paths in `OnceLock`s; cached search badge `Buffer` on `Toolbar`; replaced `hover_fade: HashMap` with `[f32; 16]`.
+      - Cached `can_back`/`can_forward`, `window_title`, and `surface_size`; restricted `Browser::layout()` to only resize the active tab (plus open DevTools and any background PiP tab); coalesced thumbnail requests in `thumbs.rs`.
+      - Integrated `f4194fe` (address bar Win32 focus transfer on `Hit::Omni` / `Ctrl+L`, `focusin` dismiss listener, incremental `MutationObserver` in `BRAND_SCRIPT`).
+  - **What to preserve when merging:** Keep identical `BROWSER_ARGS` across all WebViews, keep `window.__cedericPreconnect` in `SHORTCUT_SCRIPT`, and keep lazy background-tab resizing in `Browser::layout` / `Browser::show_active`.
+
 - **`gemini/picture-in-picture`** — Merged `origin/main` (native Rust toolbar/popups via `tiny-skia` + `cosmic-text` + `softbuffer`) and combined with Picture-in-Picture mode, Saved Bookmarks, and Theme/Persona switching (`Cederic` Orange default / `Uzaki` Slate Blue):
   - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `src/gfx.rs`, `src/popups.rs`, `src/thumbs.rs`, `src/ui/newtab.html`, `README.md`, `INSTRUCTIONS.md`.
   - **Key structs / enums / functions added or updated:**
