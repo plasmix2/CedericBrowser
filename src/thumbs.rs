@@ -29,7 +29,7 @@ pub enum Request {
     Forget(u32),
 }
 
-pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, String) + Send + 'static) -> mpsc::Sender<Request> {
+pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send + 'static) -> mpsc::Sender<Request> {
     let (tx, rx) = mpsc::channel::<Request>();
     std::thread::spawn(move || {
         let mut targets: HashMap<u32, String> = HashMap::new();
@@ -121,8 +121,8 @@ fn find_target(port: u16, tab: u32) -> Option<String> {
     })
 }
 
-/// A small PNG of what the tab currently shows, as a data URL.
-fn capture(port: u16, target: &str) -> Option<String> {
+/// A small snapshot of what the tab currently shows.
+fn capture(port: u16, target: &str) -> Option<tiny_skia::Pixmap> {
     capture_at(port, target, WIDTH)
 }
 
@@ -130,7 +130,7 @@ fn capture(port: u16, target: &str) -> Option<String> {
 ///
 /// The screenshot is taken at the page's own size and shrunk here: asking the engine for a scaled
 /// `clip` makes it re-render the page at another size, which shows as the page resizing or flashing.
-fn capture_at(port: u16, target: &str, width: f64) -> Option<String> {
+fn capture_at(port: u16, target: &str, width: f64) -> Option<tiny_skia::Pixmap> {
     let mut s = Session::open(port, target)?;
     let r = s.call("Page.captureScreenshot", json!({ "format": "png", "optimizeForSpeed": true }))?;
     let full = tiny_skia::Pixmap::decode_png(&crate::favicons::base64_decode(r["data"].as_str()?)?).ok()?;
@@ -139,31 +139,12 @@ fn capture_at(port: u16, target: &str, width: f64) -> Option<String> {
     let mut small = tiny_skia::Pixmap::new(tw, th)?;
     let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
     small.draw_pixmap(0, 0, full.as_ref(), &paint, tiny_skia::Transform::from_scale(k, k), None);
-    Some(format!("data:image/png;base64,{}", base64_encode(&small.encode_png().ok()?)))
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
-        for i in 0..4 {
-            out.push(if i <= chunk.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
-        }
-    }
-    out
+    Some(small)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn base64_roundtrip() {
-        for s in [&b""[..], b"a", b"ab", b"abc", b"hello world"] {
-            assert_eq!(crate::favicons::base64_decode(&base64_encode(s)).unwrap(), s);
-        }
-    }
 
     /// Drives a running Cederic through its debug port: `CEDERIC_EVAL='<js>' cargo test -- --ignored live_eval`.
     /// Evaluates the JS in every page target and prints the results, then captures tab 1.
@@ -178,20 +159,19 @@ mod tests {
                 .and_then(|mut s| s.call("Runtime.evaluate", json!({ "expression": js, "returnByValue": true, "awaitPromise": true })));
             println!("{id}: {}", r.map(|v| v["result"]["value"].to_string()).unwrap_or_default());
         }
-        // CEDERIC_SHOT=<dir>: also save a full-size PNG (base64) of every page, so a page's own
+        // CEDERIC_SHOT=<dir>: also save a full-size PNG of every page, so a page's own
         // rendering can be inspected without capturing the screen.
         if let Ok(dir) = std::env::var("CEDERIC_SHOT") {
             for id in devtools::page_targets(port).expect("targets") {
                 let Some(img) = capture_at(port, &id, 4000.0) else { continue };
-                let b64 = img.trim_start_matches("data:image/png;base64,");
-                let path = std::path::Path::new(&dir).join(format!("{id}.b64"));
-                std::fs::write(&path, b64).unwrap();
+                let path = std::path::Path::new(&dir).join(format!("{id}.png"));
+                img.save_png(&path).unwrap();
                 println!("saved {}", path.display());
             }
         }
         for tab in 1..=3 {
             let shot = find_target(port, tab).and_then(|id| capture(port, &id));
-            println!("tab {tab} thumbnail: {} bytes", shot.map_or(0, |s| s.len()));
+            println!("tab {tab} thumbnail: {:?}", shot.map(|s| (s.width(), s.height())));
         }
     }
 }

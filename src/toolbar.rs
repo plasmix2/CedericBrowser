@@ -884,8 +884,9 @@ impl Toolbar {
         let dt = now.saturating_duration_since(self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         self.update_hover_card(now);
-        let k = 1.0 - (-dt * 16.0).exp();
-        let kf = 1.0 - (-dt * 12.0).exp();
+        // Rates tuned so motion settles in ~0.2s and hover fades in ~0.12s.
+        let k = 1.0 - (-dt * 26.0).exp();
+        let kf = 1.0 - (-dt * 30.0).exp();
         let mut busy = false;
 
         self.layout();
@@ -938,7 +939,7 @@ impl Toolbar {
             busy = true;
         }
 
-        let mut next: Option<Instant> = busy.then(|| now + Duration::from_millis(16));
+        let mut next: Option<Instant> = busy.then(|| now + crate::pacer::FRAME);
         let mut wake = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
         if let Some((_, since, false)) = self.hover_tab {
             wake(since + if self.card_shown { Duration::ZERO } else { Duration::from_millis(500) });
@@ -1291,4 +1292,26 @@ mod tests {
             pm.save_png(dir.join(format!("{name}.png"))).unwrap();
         }
     }
+
+    /// Times one toolbar frame: `cargo test --release -- --ignored --nocapture bench_frame`.
+    #[test]
+    #[ignore]
+    fn bench_frame() {
+        let s = 2.0;
+        let mut tb = Toolbar::new(true, s, 1280.0);
+        let tabs = (1..=8)
+            .map(|id| TabInfo { id, title: format!("Some page title number {id}"), favicon: String::new(), loading: false })
+            .collect();
+        tb.set_model(Model { tabs, active: 3, url: "https://example.com/some/path".into(), ..Model::default() });
+        let mut pm = Pixmap::new((1280.0 * s) as u32, (HEIGHT * s) as u32).unwrap();
+        let start = Instant::now();
+        for i in 0..120u64 {
+            tb.mouse_move(100.0 + i as f32 * 8.0, 20.0);
+            tb.tick(start + Duration::from_millis(i * 16));
+            tb.render(&mut pm);
+        }
+        let per = start.elapsed() / 120;
+        println!("toolbar frame (tick + render at 2x): {per:?}");
+    }
 }
+

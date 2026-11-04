@@ -6,6 +6,8 @@ mod favicons;
 mod gfx;
 mod history;
 mod input;
+mod pacer;
+mod popups;
 mod suggest;
 mod thumbs;
 mod toolbar;
@@ -19,14 +21,15 @@ use std::{
 };
 
 use history::{HistoryEntry, HistoryStore};
+use popups::{Card, Content, Kind as PopupKind, MenuEntry, Pick, Popups, SuggestEntry};
 use tiny_skia::Pixmap;
 use toolbar::{BRAND_ICON, Toolbar};
 use serde::{Deserialize, Serialize};
 use tao::{
     dpi::{LogicalPosition, LogicalSize},
     event::{ElementState, Event, MouseButton, StartCause, WindowEvent},
-    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget},
-    platform::windows::{WindowBuilderExtWindows, WindowExtWindows},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
+    platform::windows::WindowBuilderExtWindows,
     keyboard::ModifiersState,
     window::{CursorIcon, Theme, Window, WindowBuilder, WindowId},
 };
@@ -43,7 +46,6 @@ const SPLITTER: f64 = 5.0;
 const DEVTOOLS_MIN: f64 = 280.0;
 
 const NEWTAB_HTML: &str = include_str!("ui/newtab.html");
-const POPUP_HTML: &str = include_str!("ui/popup.html");
 
 /// Every WebView sharing a data directory must use identical arguments.
 /// Hardened for Wi-Fi search privacy:
@@ -206,9 +208,6 @@ const FAVICON_SCRIPT: &str = r#"(() => {
 /// Brave Search is shown under Cederic's own name and icon.
 const REAL_SEARCH_HOST: &str = "search.brave.com";
 const SHOWN_SEARCH_HOST: &str = "search.cederic.com";
-/// Where never-hidden popups wait while they are not in use.
-const PARKED: LogicalPosition<f64> = LogicalPosition::new(-32000.0, -32000.0);
-
 type TabId = u32;
 type Rgba = (u8, u8, u8, u8);
 
@@ -216,8 +215,7 @@ enum UserEvent {
     Shortcut(Shortcut),
     NewTab(TabId, NewTabCmd),
     PageMenu(TabId, ContextRequest),
-    Popup(PopupCmd, PopupKind),
-    Thumb(TabId, String),
+    Thumb(TabId, Pixmap),
     UpgradeHttps(TabId, String),
     Title(TabId, String),
     Load(TabId, PageLoadEvent, String),
@@ -228,8 +226,8 @@ enum UserEvent {
     Suggestions(suggest::Response),
     DevtoolsTarget { tab: TabId, old_title: String, url: Option<String> },
     Prewarm,
-    /// Sent shortly after the main window loses focus, once it is known where focus went.
-    FocusCheck,
+    /// Frame tick from the pacer while the UI animates.
+    Frame,
 }
 
 /// What the browser chrome (the native toolbar, menus) asks the browser to do.
@@ -274,14 +272,6 @@ enum NewTabCmd {
     Search { input: String },
     DeleteHistory { id: u64 },
     ClearHistory,
-}
-
-/// Messages from our popup page.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-enum PopupCmd {
-    Pick { index: usize },
-    Close,
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -367,16 +357,11 @@ enum MenuAction {
     ClearHistory,
 }
 
-#[derive(Serialize)]
 struct MenuItem {
     label: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     disabled: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     sep: bool,
-    #[serde(skip)]
     action: Option<MenuAction>,
 }
 
@@ -397,9 +382,9 @@ impl MenuItem {
     }
 }
 
-#[derive(Serialize)]
 struct Suggestion {
-    kind: &'static str,
+    /// Opens a site rather than searching.
+    url: bool,
     text: String,
 }
 
@@ -413,29 +398,13 @@ struct Tab {
     is_newtab: bool,
     /// Still painted in the new-tab page color; switches to white once a real page loads.
     newtab_bg: bool,
-    /// Small screenshot for the hover card, as a data URL.
-    thumb: String,
+    /// Small snapshot of the page for the hover card.
+    thumb: Option<Pixmap>,
 }
 
 #[derive(Serialize)]
 struct NewTabState<'a> {
     history: &'a [HistoryEntry],
-}
-
-/// Popups are shown once at creation without taking focus and then only moved: tao can show a
-/// window without activating it only at creation, and an active window gets the accent border.
-/// They take focus only while being clicked (a window that never takes focus gets no WebView2
-/// mouse input). Hidden ones are parked off-screen.
-struct Popup {
-    window: Window,
-    view: WebView,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PopupKind {
-    Menu,
-    Suggest,
-    Preview,
 }
 
 struct Devtools {
@@ -456,6 +425,7 @@ struct Browser {
     frame: Pixmap,
     /// When the toolbar next needs a frame (animation or timer); `None` when idle.
     next_frame: Option<Instant>,
+    pacer: pacer::Pacer,
     mouse: (f64, f64),
     mods: ModifiersState,
     cursor: CursorIcon,
@@ -475,14 +445,9 @@ struct Browser {
     proxy: EventLoopProxy<UserEvent>,
     quit: bool,
     dark: bool,
-    menu: Popup,
+    popups: Popups,
     menu_actions: Vec<Option<MenuAction>>,
-    menu_open: bool,
-    /// The menu window has focus (it takes it only when clicked).
-    menu_focused: bool,
-    preview: Popup,
     thumbs_tx: Sender<thumbs::Request>,
-    suggest: Popup,
     suggest_tx: Sender<suggest::Request>,
     suggest_seq: u64,
     suggest_query: String,
@@ -599,7 +564,7 @@ impl Browser {
             loading: url.is_some(),
             is_newtab: url.is_none(),
             newtab_bg: url.is_none(),
-            thumb: String::new(),
+            thumb: None,
         })
     }
 
@@ -827,29 +792,13 @@ impl Browser {
         LogicalPosition::new(origin.x + x, origin.y + y)
     }
 
-    fn show_popup(popup: &Popup, script: &str, pos: LogicalPosition<f64>, w: f64, h: f64) {
-        let _ = popup.view.evaluate_script(script);
-        popup.window.set_inner_size(LogicalSize::new(w, h));
-        popup.window.set_outer_position(pos);
-        let _ = popup.view.set_bounds(rect(0.0, 0.0, w, h));
-    }
-
-    fn hide_popup(popup: &Popup) {
-        let _ = popup.view.evaluate_script("window.hideAll && window.hideAll()");
-        popup.window.set_outer_position(PARKED);
-    }
-
-    /// Gives keyboard focus back to the page after a popup was clicked.
+    /// Gives keyboard focus back to the page after a menu closes.
     fn refocus_page(&self) {
-        self.window.set_focus();
         self.with_active(|v| v.focus());
     }
 
     fn close_menu(&mut self) {
-        if self.menu_open {
-            self.menu_open = false;
-            Self::hide_popup(&self.menu);
-        }
+        self.popups.hide(PopupKind::Menu);
     }
 
     /// Shows a menu at a point in the main window's client area.
@@ -859,33 +808,40 @@ impl Browser {
         let size = self.logical_size();
         let x = if x + W > size.width { (x - W).max(0.0) } else { x };
         let y = if y + h > size.height { (size.height - h).max(0.0) } else { y };
-        let Ok(json) = serde_json::to_string(&items) else { return };
-        self.menu_actions = items.into_iter().map(|i| i.action).collect();
+        let mut entries = Vec::with_capacity(items.len());
+        self.menu_actions = items
+            .into_iter()
+            .map(|i| {
+                entries.push(MenuEntry { label: i.label, hint: i.hint, disabled: i.disabled, sep: i.sep });
+                i.action
+            })
+            .collect();
         self.hide_preview();
-        Self::show_popup(&self.menu, &format!("window.showMenu({json})"), self.to_screen(x, y), W, h);
-        self.menu_open = true;
+        let pos = self.to_screen(x, y);
+        self.popups.show(PopupKind::Menu, Content::Menu(entries), pos, W as f32);
     }
 
     /// Hover card under a tab: title, site and (for background tabs) a snapshot of the page.
     fn show_preview(&mut self, id: TabId, x: f64, y: f64) {
-        const W: f64 = 280.0;
-        if self.menu_open {
+        let w = popups::CARD_W as f64;
+        if self.popups.is_open(PopupKind::Menu) {
             return;
         }
         let Some(tab) = self.index_of(id).map(|i| &self.tabs[i]) else { return };
         let active = self.active_tab().map(|t| t.id) == Some(id);
-        let img = if active { "" } else { tab.thumb.as_str() };
         let shown = display_url(&tab.url);
-        let host = host_of(&shown).unwrap_or_default();
-        let title = if tab.title.is_empty() { "New Tab" } else { &tab.title };
-        let card = serde_json::json!({ "title": title, "host": host, "img": img });
-        let h = if img.is_empty() { 62.0 } else { 62.0 + 158.0 };
-        let x = x.clamp(0.0, (self.logical_size().width - W).max(0.0));
-        Self::show_popup(&self.preview, &format!("window.showPreview({card})"), self.to_screen(x, y), W, h);
+        let card = Card {
+            title: if tab.title.is_empty() { "New Tab".into() } else { tab.title.clone() },
+            host: host_of(&shown).unwrap_or_default().to_owned(),
+            img: if active { None } else { tab.thumb.clone() },
+        };
+        let x = x.clamp(0.0, (self.logical_size().width - w).max(0.0));
+        let pos = self.to_screen(x, y);
+        self.popups.show(PopupKind::Preview, Content::Preview(card), pos, w as f32);
     }
 
-    fn hide_preview(&self) {
-        Self::hide_popup(&self.preview);
+    fn hide_preview(&mut self) {
+        self.popups.hide(PopupKind::Preview);
     }
 
     fn tab_menu(&mut self, id: TabId, x: f64, y: f64) {
@@ -1033,7 +989,7 @@ impl Browser {
         let text = text.trim().to_owned();
         if text.is_empty() {
             self.suggestions.clear();
-            Self::hide_popup(&self.suggest);
+            self.popups.hide(PopupKind::Suggest);
             return;
         }
         // Show the typed row instantly, then fill in suggestions when they arrive.
@@ -1043,29 +999,26 @@ impl Browser {
     }
 
     fn set_suggestions(&mut self, items: Vec<String>) {
-        let q = &self.suggest_query;
-        let kind = match input::resolve(&unmask(q)) {
-            Some(url) if !input::is_search(&url) => "url",
-            _ => "search",
-        };
-        let mut list = vec![Suggestion { kind, text: q.clone() }];
+        let q = self.suggest_query.clone();
+        let url = matches!(input::resolve(&unmask(&q)), Some(u) if !input::is_search(&u));
+        let mut list = vec![Suggestion { url, text: q.clone() }];
         list.extend(
             items
                 .into_iter()
-                .filter(|s| !s.eq_ignore_ascii_case(q))
-                .map(|text| Suggestion { kind: "suggest", text }),
+                .filter(|s| !s.eq_ignore_ascii_case(&q))
+                .map(|text| Suggestion { url: false, text }),
         );
-        let Ok(json) = serde_json::to_string(&list) else { return };
         self.toolbar.set_suggestions(list.iter().map(|s| s.text.clone()).collect());
         let (x, y, w) = self.suggest_anchor;
-        let h = 12.0 + 36.0 * list.len() as f64;
-        Self::show_popup(&self.suggest, &format!("window.showSuggest({json})"), self.to_screen(x, y), w, h);
+        let entries = list.iter().map(|s| SuggestEntry { text: s.text.clone(), url: s.url }).collect();
+        let pos = self.to_screen(x, y);
+        self.popups.show(PopupKind::Suggest, Content::Suggest { items: entries, query: q }, pos, w as f32);
         self.suggestions = list;
     }
 
     fn close_suggest(&mut self) {
         self.suggest_seq += 1;
-        Self::hide_popup(&self.suggest);
+        self.popups.hide(PopupKind::Suggest);
     }
 
     // ---------- DevTools ----------
@@ -1205,7 +1158,7 @@ impl Browser {
             ChromeCmd::Dismiss => self.close_menu(),
             ChromeCmd::Query { text, x, y, w } => self.query(text, x, y, w),
             ChromeCmd::SuggestSelect { index } => {
-                let _ = self.suggest.view.evaluate_script(&format!("window.select({index})"));
+                self.popups.select(PopupKind::Suggest, index);
             }
             ChromeCmd::SuggestClose => self.close_suggest(),
             ChromeCmd::Back => self.with_active(|v| v.go_back()),
@@ -1229,22 +1182,16 @@ impl Browser {
         }
     }
 
-    fn handle_popup(&mut self, cmd: PopupCmd, kind: PopupKind) {
-        match (cmd, kind) {
-            (_, PopupKind::Preview) => {}
-            (PopupCmd::Close, PopupKind::Menu) => {
-                self.close_menu();
-                self.refocus_page();
-            }
-            (PopupCmd::Close, PopupKind::Suggest) => self.close_suggest(),
-            (PopupCmd::Pick { index }, PopupKind::Menu) => {
+    fn handle_pick(&mut self, pick: Pick) {
+        match pick {
+            Pick::Menu(index) => {
                 self.close_menu();
                 self.refocus_page();
                 if let Some(Some(action)) = self.menu_actions.get(index).cloned() {
                     self.run_menu_action(action);
                 }
             }
-            (PopupCmd::Pick { index }, PopupKind::Suggest) => {
+            Pick::Suggest(index) => {
                 if let Some(text) = self.suggestions.get(index).map(|s| s.text.clone()) {
                     self.toolbar.blur_address();
                     self.navigate_active(&text);
@@ -1319,14 +1266,13 @@ impl Browser {
             UserEvent::Shortcut(s) => self.handle_shortcut(s),
             UserEvent::NewTab(id, cmd) => self.handle_newtab(id, cmd),
             UserEvent::PageMenu(id, r) => self.page_menu(id, r),
-            UserEvent::Popup(cmd, kind) => self.handle_popup(cmd, kind),
             UserEvent::IconLoaded(url, img) => {
                 self.toolbar.icon_loaded(url, img);
                 self.window.request_redraw();
             }
             UserEvent::Thumb(id, img) => {
                 if let Some(i) = self.index_of(id) {
-                    self.tabs[i].thumb = img;
+                    self.tabs[i].thumb = Some(img);
                 }
             }
             UserEvent::UpgradeHttps(id, https_url) => {
@@ -1354,11 +1300,7 @@ impl Browser {
                 }
                 let _ = self.open_tab(Some(target), Some(self.active + 1), true);
             }
-            UserEvent::FocusCheck => {
-                if !self.menu_focused {
-                    self.close_menu();
-                }
-            }
+            UserEvent::Frame => self.window.request_redraw(),
             UserEvent::Prewarm => {
                 if self.spare.is_none() {
                     self.spare = self.build_tab(None).ok();
@@ -1433,17 +1375,13 @@ impl Browser {
     }
 
     fn handle_window(&mut self, id: WindowId, event: WindowEvent) {
-        if id != self.window.id() {
-            // Popups are shown without focus and only take it while being clicked; taking it back
-            // here would cancel the click. The menu closes once it loses focus again.
-            if id == self.menu.window.id()
-                && let WindowEvent::Focused(focused) = event
-            {
-                self.menu_focused = focused;
-                if !focused {
-                    self.close_menu();
-                }
+        if let Some(kind) = self.popups.owns(id) {
+            if let Some(pick) = self.popups.window_event(kind, &event) {
+                self.handle_pick(pick);
             }
+            return;
+        }
+        if id != self.window.id() {
             return;
         }
         match event {
@@ -1466,17 +1404,14 @@ impl Browser {
                 self.hide_preview();
             }
             WindowEvent::Focused(false) => {
-                // Clicking the menu also takes focus from here; only close it if focus went elsewhere.
+                // Popups never take focus, so losing it means the user switched away.
+                self.close_menu();
                 self.hide_preview();
-                let proxy = self.proxy.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                    let _ = proxy.send_event(UserEvent::FocusCheck);
-                });
             }
             WindowEvent::CloseRequested => self.quit = true,
             WindowEvent::ThemeChanged(theme) => {
                 self.toolbar.set_dark(theme == Theme::Dark);
+                self.popups.set_dark(theme == Theme::Dark);
                 self.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1637,45 +1572,6 @@ fn data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Cederic")
 }
 
-/// A borderless owned popup window (menus, suggestions) hosting our popup page. Windows 11 gives
-/// it a native drop shadow and rounded corners.
-fn build_popup(
-    target: &EventLoopWindowTarget<UserEvent>,
-    owner: &Window,
-    context: &mut WebContext,
-    proxy: EventLoopProxy<UserEvent>,
-    kind: PopupKind,
-    dark: bool,
-) -> wry::Result<Popup> {
-    let card: Rgba = if dark { (43, 44, 50, 255) } else { (255, 255, 255, 255) };
-    let window = WindowBuilder::new()
-        .with_decorations(false)
-        .with_undecorated_shadow(true)
-        .with_background_color(card)
-        .with_resizable(false)
-        .with_visible(true)
-        .with_focused(false)
-        .with_position(PARKED)
-        .with_skip_taskbar(true)
-        .with_owner_window(owner.hwnd())
-        .with_inner_size(LogicalSize::new(10.0, 10.0))
-        .build(target)
-        .expect("failed to create popup window");
-    let view = WebViewBuilder::new_with_web_context(context)
-        .with_html(POPUP_HTML)
-        .with_background_color(card)
-        .with_additional_browser_args(BROWSER_ARGS)
-        .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
-        .with_hotkeys_zoom(false)
-        .with_ipc_handler(move |req| {
-            if let Ok(cmd) = serde_json::from_str::<PopupCmd>(req.body()) {
-                let _ = proxy.send_event(UserEvent::Popup(cmd, kind));
-            }
-        })
-        .build(&window)?;
-    Ok(Popup { window, view })
-}
-
 fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -1697,7 +1593,7 @@ fn main() -> wry::Result<()> {
 
     let dir = data_dir();
     let history = HistoryStore::open(&dir);
-    let mut context = WebContext::new(Some(dir.clone()));
+    let context = WebContext::new(Some(dir.clone()));
 
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
@@ -1705,13 +1601,16 @@ fn main() -> wry::Result<()> {
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
-    let menu = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Menu, dark)?;
-    let suggest = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Suggest, dark)?;
-    let preview = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Preview, dark)?;
+    let popups = Popups::new(&event_loop, &window, dark);
 
     let p_thumb = proxy.clone();
     let thumbs_tx = thumbs::spawn(dir.clone(), move |tab, img| {
         let _ = p_thumb.send_event(UserEvent::Thumb(tab, img));
+    });
+
+    let p_frame = proxy.clone();
+    let pacer = pacer::Pacer::spawn(move || {
+        let _ = p_frame.send_event(UserEvent::Frame);
     });
 
     let p_icon = proxy.clone();
@@ -1732,6 +1631,7 @@ fn main() -> wry::Result<()> {
         surface,
         frame: Pixmap::new(1, 1).expect("1x1 pixmap"),
         next_frame: None,
+        pacer,
         mouse: (-1.0, -1.0),
         mods: ModifiersState::empty(),
         cursor: CursorIcon::Default,
@@ -1748,13 +1648,9 @@ fn main() -> wry::Result<()> {
         proxy,
         quit: false,
         dark,
-        menu,
+        popups,
         menu_actions: Vec::new(),
-        menu_open: false,
-        menu_focused: false,
-        preview,
         thumbs_tx,
-        suggest,
         suggest_tx,
         suggest_seq: 0,
         suggest_query: String::new(),
@@ -1779,12 +1675,26 @@ fn main() -> wry::Result<()> {
             }
             Event::WindowEvent { window_id, event, .. } => browser.handle_window(window_id, event),
             Event::RedrawRequested(id) if id == browser.window.id() => browser.redraw(),
+            Event::RedrawRequested(id) => {
+                if let Some(kind) = browser.popups.owns(id) {
+                    browser.popups.redraw(kind);
+                }
+            }
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => browser.window.request_redraw(),
             _ => {}
         }
-        *control_flow = match browser.next_frame {
-            Some(t) => ControlFlow::WaitUntil(t),
-            None => ControlFlow::Wait,
+        // Animations are driven by the pacer (accurate frame timing); only slow timers such as the
+        // caret blink or the hover-card delay use the event loop's own timeout.
+        let now = Instant::now();
+        let next = match (browser.next_frame, browser.popups.tick(now)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let animating = next.is_some_and(|t| t <= now + pacer::FRAME * 3);
+        browser.pacer.set(animating);
+        *control_flow = match next {
+            Some(t) if !animating => ControlFlow::WaitUntil(t),
+            _ => ControlFlow::Wait,
         };
         if browser.quit {
             *control_flow = ControlFlow::Exit;
