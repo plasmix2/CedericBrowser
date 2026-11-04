@@ -133,7 +133,7 @@ pub struct Toolbar {
     mouse: (f32, f32),
     hover: Hit,
     pressed: Option<Hit>,
-    hover_fade: HashMap<u8, f32>,
+    hover_fade: [f32; 16],
     drag: Option<Drag>,
     last_click: (Instant, f32, f32, u32),
     progress: f32,
@@ -153,6 +153,7 @@ pub struct Toolbar {
     sidx: usize,
     blink_from: Instant,
     pretty: Option<(String, Buffer)>,
+    badge: Option<(Brand, Buffer, f32)>,
     placeholder: Buffer,
     clipboard: Option<arboard::Clipboard>,
     // hover cards
@@ -186,7 +187,7 @@ fn approach01(v: &mut f32, target: f32, k: f32) -> bool {
     }
 }
 
-fn hit_key(h: Hit) -> u8 {
+fn hit_key(h: Hit) -> usize {
     match h {
         Hit::NewTab => 1,
         Hit::Min => 2,
@@ -231,7 +232,7 @@ impl Toolbar {
             mouse: (-1.0, -1.0),
             hover: Hit::None,
             pressed: None,
-            hover_fade: HashMap::new(),
+            hover_fade: [0.0; 16],
             drag: None,
             last_click: (now, 0.0, 0.0, 0),
             progress: 0.0,
@@ -250,6 +251,7 @@ impl Toolbar {
             sidx: 0,
             blink_from: now,
             pretty: None,
+            badge: None,
             placeholder,
             clipboard: None,
             hover_tab: None,
@@ -275,6 +277,7 @@ impl Toolbar {
                 v.title = None;
             }
             self.pretty = None;
+            self.badge = None;
             self.placeholder = self.fonts.line("Search or type a URL", URL_FONT, Weight::NORMAL, scale);
             let text = self.text();
             self.editor = Editor::new(self.fonts.line("", URL_FONT, Weight::NORMAL, scale));
@@ -391,6 +394,10 @@ impl Toolbar {
             self.sugg.clear();
             self.blink_from = Instant::now();
         }
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.editing
     }
 
     pub fn blur_address(&mut self) {
@@ -607,9 +614,9 @@ impl Toolbar {
             }
             (MouseButton::Left, Hit::Omni) => {
                 let n = self.click_count(x, y);
+                self.cmds.push(ChromeCmd::FocusChrome);
                 if !self.editing {
                     self.focus_address();
-                    self.cmds.push(ChromeCmd::FocusChrome);
                 } else {
                     let (ax, ay) = self.editor_point(x);
                     let action = match n {
@@ -857,6 +864,7 @@ impl Toolbar {
         if ctrl && ch.as_deref() == Some("l") {
             self.focus_address();
             self.select_all();
+            self.cmds.push(ChromeCmd::FocusChrome);
             return;
         }
         if !self.editing {
@@ -870,8 +878,7 @@ impl Toolbar {
             Key::Enter => {
                 let input = self.text();
                 if !input.trim().is_empty() {
-                    self.editing = false;
-                    self.sugg.clear();
+                    self.blur_address();
                     self.cmds.push(ChromeCmd::Navigate { input });
                 }
             }
@@ -978,8 +985,7 @@ impl Toolbar {
             Hit::Omni, Hit::Star, Hit::Bookmarks, Hit::Pip, Hit::History, Hit::Theme, Hit::Devtools,
         ] {
             let target = if self.hover == h { 1.0 } else { 0.0 };
-            let f = self.hover_fade.entry(hit_key(h)).or_insert(0.0);
-            busy |= approach01(f, target, kf);
+            busy |= approach01(&mut self.hover_fade[hit_key(h)], target, kf);
         }
 
         busy |= approach01(&mut self.load_morph, if self.model.loading { 1.0 } else { 0.0 }, kf);
@@ -1102,7 +1108,7 @@ impl Toolbar {
     }
 
     fn fade(&self, h: Hit) -> f32 {
-        self.hover_fade.get(&hit_key(h)).copied().unwrap_or(0.0)
+        self.hover_fade[hit_key(h)]
     }
 
     fn button_bg(&self, c: &mut Canvas, r: R, h: Hit, radius: f32, th: &Theme) {
@@ -1182,9 +1188,15 @@ impl Toolbar {
             c.spinner(icon_x + 8.0, cy, 6.0, self.spin, th.accent.with_alpha(alpha));
         } else if favicon == BRAND_ICON {
             c.rrect(icon_x, cy - 8.0, 16.0, 16.0, [4.0; 4], th.accent.mix(th.accent2, 0.3).with_alpha(alpha));
-            let mut b = self.fonts.line(self.model.brand.badge_letter(), 11.0, Weight::BOLD, self.s);
-            let bw = text_width(&b, self.s);
-            c.text(&mut self.fonts, &mut b, icon_x + (16.0 - bw) / 2.0, cy - 7.5, Rgba(255, 255, 255, 255).with_alpha(alpha), f32::MAX, 0.0);
+            let brand = self.model.brand;
+            if self.badge.as_ref().is_none_or(|(b, _, _)| *b != brand) {
+                let buf = self.fonts.line(brand.badge_letter(), 11.0, Weight::BOLD, self.s);
+                let bw = text_width(&buf, self.s);
+                self.badge = Some((brand, buf, bw));
+            }
+            if let Some((_, buf, bw)) = &mut self.badge {
+                c.text(&mut self.fonts, buf, icon_x + (16.0 - *bw) / 2.0, cy - 7.5, Rgba(255, 255, 255, 255).with_alpha(alpha), f32::MAX, 0.0);
+            }
         } else if let Some(Some(img)) = self.icons.get(&favicon) {
             c.image(img, icon_x, cy - 8.0, 16.0, 16.0, alpha);
         } else {

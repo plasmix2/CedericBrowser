@@ -105,6 +105,9 @@ pub fn resolve_with_info(input: &str) -> Option<ResolvedInput> {
 
 /// If `url` is a non-local `http://` URL, returns its `https://` equivalent for automatic upgrade.
 pub fn upgrade_to_https(url: &str) -> Option<String> {
+    if !url.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")) {
+        return None;
+    }
     let mut parsed = Url::parse(url).ok()?;
     if parsed.scheme() != "http" {
         return None;
@@ -119,7 +122,11 @@ pub fn upgrade_to_https(url: &str) -> Option<String> {
 
 /// Determines whether a WebView navigation target scheme is safe to load.
 pub fn is_allowed_navigation(url: &str) -> bool {
-    if url == "about:blank" || url.starts_with("data:text/html") {
+    if url.starts_with("https://")
+        || url.starts_with("http://")
+        || url == "about:blank"
+        || url.starts_with("data:text/html")
+    {
         return true;
     }
     let Ok(parsed) = Url::parse(url) else {
