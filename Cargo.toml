@@ -1,0 +1,24 @@
+[package]
+name = "cederic"
+version = "0.1.0"
+edition = "2024"
+description = "A lean, memory-safe browser shell written in Rust"
+
+[dependencies]
+arboard = { version = "3.7.0", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tao = "0.37.2"
+ureq = { version = "3.5.1", default-features = false, features = ["native-tls"] }
+url = "2.5.8"
+wry = { version = "0.57.1", features = ["devtools"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"

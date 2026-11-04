@@ -1,0 +1,258 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>New Tab</title>
+<style>
+  :root {
+    --bg: #1d1e22; --fg: #ececf0; --dim: #8d909a; --field: #26272d; --card: #24252b;
+    --card-hover: #2b2d34; --border: #353740; --accent: #ff6a3d;
+    --secure: #2fd180; --secure-bg: rgba(47, 209, 128, .12);
+    --ease: cubic-bezier(.2, .8, .2, 1);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f4f6; --fg: #1d1e22; --dim: #6b6f78; --field: #fff; --card: #ffffff;
+      --card-hover: #f0f1f5; --border: #d4d6dc;
+      --secure: #139a56; --secure-bg: rgba(19, 154, 86, .12);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden;
+    font: 14px "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; user-select: none; }
+  body::before { content: ""; position: fixed; inset: -20%; pointer-events: none; opacity: .55;
+    background: radial-gradient(40% 35% at 30% 20%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 70%),
+      radial-gradient(35% 30% at 75% 75%, rgba(47, 209, 128, .14), transparent 70%);
+    animation: drift 18s ease-in-out infinite alternate; }
+  @keyframes drift { to { transform: translate(4%, -3%) scale(1.08); } }
+
+  main { position: relative; min-height: 100%; max-width: 720px; margin: 0 auto;
+    display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+    gap: 20px; padding: 52px 20px 36px; }
+  main > * { animation: rise .45s var(--ease) both; }
+  main > :nth-child(2) { animation-delay: .04s; }
+  main > :nth-child(3) { animation-delay: .08s; }
+  main > :nth-child(4) { animation-delay: .12s; }
+  @keyframes rise { from { opacity: 0; transform: translateY(12px) scale(.99); } }
+
+  .hero { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; }
+  h1 { margin: 0; font: 650 46px "Segoe UI Variable Display", "Segoe UI", system-ui; letter-spacing: -1.5px; }
+  h1 span { color: var(--accent); }
+
+  .shield-pill { display: inline-flex; align-items: center; gap: 7px; padding: 5px 13px;
+    border-radius: 99px; background: var(--secure-bg); color: var(--secure);
+    border: 1px solid color-mix(in srgb, var(--secure) 30%, transparent);
+    font-size: 12px; font-weight: 500; }
+  .shield-pill svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; }
+
+  form { position: relative; width: 100%; }
+  form svg { position: absolute; left: 20px; top: 50%; translate: 0 -50%; width: 18px; height: 18px;
+    fill: none; stroke: var(--dim); stroke-width: 2; stroke-linecap: round; transition: stroke .2s; pointer-events: none; }
+  #q { width: 100%; height: 52px; padding: 0 22px 0 52px; border: 1px solid var(--border); border-radius: 26px;
+    background: var(--field); color: var(--fg); font: 15px inherit; outline: none; user-select: text;
+    box-shadow: 0 8px 30px rgba(0,0,0,.16);
+    transition: border-color .2s, box-shadow .3s var(--ease), transform .3s var(--ease); }
+  #q:focus { border-color: var(--accent); transform: translateY(-1px);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent), 0 12px 36px rgba(0,0,0,.22); }
+  form:focus-within svg { stroke: var(--accent); }
+
+  /* ---------- Search History & Moments Vault ---------- */
+  .vault { width: 100%; background: color-mix(in srgb, var(--card) 88%, transparent);
+    backdrop-filter: blur(12px); border: 1px solid var(--border); border-radius: 16px;
+    padding: 16px; display: flex; flex-direction: column; gap: 12px;
+    box-shadow: 0 10px 32px rgba(0,0,0,.14); }
+  .vault-hdr { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .vault-title { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13.5px; }
+  .vault-title svg { width: 16px; height: 16px; stroke: var(--accent); fill: none; stroke-width: 2; }
+  .vault-sub { font-size: 11.5px; color: var(--dim); font-weight: 400; }
+  .vault-controls { display: flex; align-items: center; gap: 8px; }
+  #filter { height: 30px; width: 180px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--field); color: var(--fg); font: 12px inherit; outline: none; user-select: text; }
+  #filter:focus { border-color: var(--accent); }
+  .btn-clear { height: 30px; padding: 0 11px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--field); color: var(--dim); font: 12px inherit; font-weight: 500; cursor: pointer;
+    transition: background-color .15s, color .15s, border-color .15s; }
+  .btn-clear:hover { background: rgba(232, 17, 35, .14); color: #ff6b78; border-color: rgba(232, 17, 35, .4); }
+
+  #history-list { display: flex; flex-direction: column; gap: 6px; max-height: 280px; overflow-y: auto; padding-right: 2px; }
+  .item { display: flex; align-items: center; gap: 11px; padding: 9px 12px; border-radius: 10px;
+    background: var(--field); border: 1px solid transparent; cursor: pointer;
+    transition: background-color .15s, border-color .15s, transform .15s; }
+  .item:hover { background: var(--card-hover); border-color: var(--border); }
+  .item-icon { width: 28px; height: 28px; border-radius: 8px; background: var(--secure-bg); color: var(--secure);
+    display: grid; place-items: center; flex: none; }
+  .item-icon svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; }
+  .item-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .item-top { display: flex; align-items: center; gap: 8px; }
+  .item-query { font-weight: 500; font-size: 13.5px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item-engine { font-size: 10.5px; padding: 1px 6px; border-radius: 5px; background: var(--bg); color: var(--dim); flex: none; }
+  .item-moment { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--dim); }
+  .item-rel { color: var(--accent); font-weight: 500; }
+  .item-del { width: 26px; height: 26px; border-radius: 7px; border: 0; background: none; color: var(--dim);
+    display: grid; place-items: center; cursor: pointer; opacity: .65;
+    transition: opacity .15s, background-color .15s, color .15s; }
+  .item-del:hover { opacity: 1; background: rgba(232, 17, 35, .16); color: #ff6b78; }
+  .item-del svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; }
+
+  .empty { padding: 24px 12px; text-align: center; color: var(--dim); font-size: 12.5px; line-height: 1.5; }
+
+  .shortcuts { margin: 0; color: var(--dim); font-size: 12px; text-align: center; }
+  kbd { font: inherit; padding: 1px 6px; border: 1px solid var(--border); border-radius: 5px; background: var(--field); }
+  @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="hero">
+    <h1>Cederic<span>.</span></h1>
+    <div class="shield-pill" title="DNS-over-HTTPS + TLS 1.3 + Encrypted Client Hello + ChaCha20-Poly1305 Vault">
+      <svg viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 5-3.5 8.5-7 9-3.5-.5-7-4-7-9V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg>
+      <span>Wi-Fi Cloak Active · Searches &amp; DNS Encrypted</span>
+    </div>
+  </div>
+
+  <form id="search-form">
+    <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+    <input id="q" name="q" placeholder="Search privately with Brave or enter a URL..." autocomplete="off" autofocus>
+  </form>
+
+  <section class="vault">
+    <div class="vault-hdr">
+      <div class="vault-title">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+        <span>Saved Search History &amp; Moments</span>
+        <span class="vault-sub" id="vault-count">(Encrypted on disk)</span>
+      </div>
+      <div class="vault-controls">
+        <input id="filter" placeholder="Filter history..." autocomplete="off" spellcheck="false">
+        <button type="button" class="btn-clear" id="clear-btn">Clear All</button>
+      </div>
+    </div>
+    <div id="history-list"></div>
+  </section>
+
+  <p class="shortcuts">
+    <kbd>Ctrl T</kbd> new tab &nbsp; <kbd>Ctrl L</kbd> address bar &nbsp; <kbd>Ctrl H</kbd> search history &nbsp; <kbd>Ctrl Tab</kbd> switch &nbsp; <kbd>F12</kbd> dev tools
+  </p>
+</main>
+<script>
+  const send = (obj) => window.ipc && window.ipc.postMessage(JSON.stringify(obj));
+  const listEl = document.getElementById('history-list');
+  const filterEl = document.getElementById('filter');
+  const countEl = document.getElementById('vault-count');
+  let historyItems = [];
+
+  const ICON_SEARCH = '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>';
+  const ICON_LOCK = '<svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
+  const ICON_X = '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+
+  function formatRelative(ms) {
+    const diffSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+    if (diffSec < 5) return 'Just now';
+    if (diffSec < 60) return diffSec + 's ago';
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return diffMin + 'm ago';
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return diffHr + 'h ago';
+    return Math.floor(diffHr / 24) + 'd ago';
+  }
+
+  function formatMoment(ms, fallback) {
+    if (!ms) return fallback || '';
+    try {
+      const d = new Date(ms);
+      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) +
+        ' at ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    } catch (_) {
+      return fallback || '';
+    }
+  }
+
+  function renderList() {
+    const q = filterEl.value.trim().toLowerCase();
+    const filtered = historyItems.filter((item) =>
+      !q || item.query.toLowerCase().includes(q) || item.url.toLowerCase().includes(q)
+    );
+    countEl.textContent = historyItems.length
+      ? `(${historyItems.length} encrypted ${historyItems.length === 1 ? 'entry' : 'entries'})`
+      : '(Encrypted on disk)';
+
+    listEl.innerHTML = '';
+    if (!filtered.length) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = q
+        ? 'No saved searches match your filter.'
+        : 'Your searches and the exact moment you make them are automatically encrypted (ChaCha20-Poly1305) and saved here.';
+      listEl.appendChild(empty);
+      return;
+    }
+
+    for (const item of filtered) {
+      const row = document.createElement('div');
+      row.className = 'item';
+      row.title = item.url;
+
+      const ico = document.createElement('div');
+      ico.className = 'item-icon';
+      ico.innerHTML = item.is_search ? ICON_SEARCH : ICON_LOCK;
+
+      const body = document.createElement('div');
+      body.className = 'item-body';
+
+      const top = document.createElement('div');
+      top.className = 'item-top';
+      const qSpan = document.createElement('span');
+      qSpan.className = 'item-query';
+      qSpan.textContent = item.query;
+      const engSpan = document.createElement('span');
+      engSpan.className = 'item-engine';
+      engSpan.textContent = item.engine;
+      top.append(qSpan, engSpan);
+
+      const mom = document.createElement('div');
+      mom.className = 'item-moment';
+      const rel = document.createElement('span');
+      rel.className = 'item-rel';
+      rel.textContent = formatRelative(item.timestamp_ms);
+      const exact = document.createElement('span');
+      exact.textContent = '· ' + formatMoment(item.timestamp_ms, item.moment) + ' (' + item.moment + ')';
+      mom.append(rel, exact);
+
+      body.append(top, mom);
+
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'item-del';
+      del.title = 'Remove this search from history';
+      del.innerHTML = ICON_X;
+      del.onclick = (e) => {
+        e.stopPropagation();
+        send({ nt: 'delete_history', id: item.id });
+      };
+
+      row.onclick = () => send({ nt: 'search', input: item.url });
+      row.append(ico, body, del);
+      listEl.appendChild(row);
+    }
+  }
+
+  window.renderNewTab = (data) => {
+    historyItems = (data && data.history) || [];
+    renderList();
+  };
+
+  document.getElementById('search-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const val = document.getElementById('q').value.trim();
+    if (val) send({ nt: 'search', input: val });
+  });
+
+  filterEl.addEventListener('input', renderList);
+  document.getElementById('clear-btn').addEventListener('click', () => send({ nt: 'clear_history' }));
+  setInterval(renderList, 5000);
+  renderList();
+  send({ nt: 'ready' });
+</script>
+</body>
+</html>
