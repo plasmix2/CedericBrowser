@@ -161,8 +161,9 @@ const SHORTCUT_SCRIPT: &str = r#"
     }
     if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); }
   }, true);
-  // Popups never take focus, so a click in the page is what closes an open menu.
+  // Popups never take focus, so a click or focus inside the page is what closes an open menu / address bar edit.
   window.addEventListener('pointerdown', () => window.ipc.postMessage('dismiss'), true);
+  window.addEventListener('focusin', () => window.ipc.postMessage('dismiss'), true);
 
   // Bubble phase: pages with their own context menu call preventDefault first and keep it.
   // Editable fields keep the engine's menu so cut/paste/spellcheck work.
@@ -204,20 +205,27 @@ const BRAND_SCRIPT: &str = r#"
   if (location.hostname !== 'search.brave.com') return;
   const style = document.createElement('style');
   let brandName = 'Cederic';
-  const re = /\b(Brave|Cederic|Uzaki)\b/;
   const fix = (s) => s.replace(/\b(Brave|Cederic|Uzaki)\b/g, brandName);
   const fixText = (n) => {
     const p = n.parentElement;
-    if (p && !/^(SCRIPT|STYLE|TEXTAREA)$/.test(p.tagName) && re.test(n.data)) n.data = fix(n.data);
+    if (p && !/^(SCRIPT|STYLE|TEXTAREA)$/.test(p.tagName) && n.data) {
+      const next = fix(n.data);
+      if (next !== n.data) n.data = next;
+    }
   };
   const scrub = (root) => {
     if (!root) return;
     const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     for (let n; (n = walk.nextNode());) fixText(n);
-    for (const el of root.querySelectorAll('[placeholder], [title], [aria-label], [alt]')) {
-      for (const a of ['placeholder', 'title', 'aria-label', 'alt']) {
-        const v = el.getAttribute(a);
-        if (v && re.test(v)) el.setAttribute(a, fix(v));
+    if (root.querySelectorAll) {
+      for (const el of root.querySelectorAll('[placeholder], [title], [aria-label], [alt]')) {
+        for (const a of ['placeholder', 'title', 'aria-label', 'alt']) {
+          const v = el.getAttribute(a);
+          if (v) {
+            const next = fix(v);
+            if (next !== v) el.setAttribute(a, next);
+          }
+        }
       }
     }
   };
@@ -242,7 +250,10 @@ const BRAND_SCRIPT: &str = r#"
         -webkit-background-clip: border-box; background-clip: border-box; color: #fff; font-size: 16px;
         letter-spacing: 0; padding: 0; }`;
     if (document.body) scrub(document.body);
-    if (document.title) document.title = fix(document.title);
+    if (document.title) {
+      const next = fix(document.title);
+      if (next !== document.title) document.title = next;
+    }
   };
   window.__cedericSetBrand(window.__cedericBrand || 'cederic');
   const attach = () => {

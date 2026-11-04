@@ -607,9 +607,9 @@ impl Toolbar {
             }
             (MouseButton::Left, Hit::Omni) => {
                 let n = self.click_count(x, y);
+                self.cmds.push(ChromeCmd::FocusChrome);
                 if !self.editing {
                     self.focus_address();
-                    self.cmds.push(ChromeCmd::FocusChrome);
                 } else {
                     let (ax, ay) = self.editor_point(x);
                     let action = match n {
@@ -857,6 +857,7 @@ impl Toolbar {
         if ctrl && ch.as_deref() == Some("l") {
             self.focus_address();
             self.select_all();
+            self.cmds.push(ChromeCmd::FocusChrome);
             return;
         }
         if !self.editing {
@@ -870,8 +871,7 @@ impl Toolbar {
             Key::Enter => {
                 let input = self.text();
                 if !input.trim().is_empty() {
-                    self.editing = false;
-                    self.sugg.clear();
+                    self.blur_address();
                     self.cmds.push(ChromeCmd::Navigate { input });
                 }
             }
