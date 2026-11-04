@@ -104,7 +104,7 @@ Note that building replaces `target/release/cederic.exe`, so any running Cederic
 
 - **Web content is untrusted.** The content IPC channel only accepts the fixed `Shortcut` strings and a
   validated `ContextRequest`. Never let content pages trigger anything else, and validate any new field.
-- Only `chrome.html` and `popup.html` (our own pages) may send `ChromeCmd` / `PopupCmd`.
+- `ChromeCmd` comes only from the native toolbar and menus, and `PopupCmd` only from `popup.html` (our own page).
 - Don't add `unsafe` code; it is forbidden by the lint in `Cargo.toml`.
 - Don't hand-write new cryptography. Use a well-reviewed crate. (`src/crypto.rs` is hand-written; replacing
   it with the `chacha20poly1305` and `sha2` crates is a welcome change.)
