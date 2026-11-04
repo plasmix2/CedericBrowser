@@ -101,6 +101,13 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`agy/newtab-autotype`** — Instant auto-typing in the address bar on New Tab open and focus lock:
+  - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `INSTRUCTIONS.md`.
+  - **Key changes:**
+    - Stopped calling `tab.view.focus()` when `tab.is_newtab` is true in `Browser::show_active()` (which was queuing an async WebView2 `MoveFocus` that stole Win32 keyboard focus back from the parent window right after `focus_address()`).
+    - Added `Browser::ensure_chrome_focus()` and called it on `focus_address`, `ChromeCmd::FocusChrome`, `UserEvent::Prewarm`, `NewTabCmd::Ready`, `UserEvent::Load` (for active newtab), and `WindowEvent::Focused(true)`.
+    - Added `NewTabCmd::AutoKey { key }` in `SHORTCUT_SCRIPT` and `Toolbar::auto_key(&mut self, key: &str)` so any printable key, `Backspace`, or `Enter` pressed on a New Tab (when not inside an `<input>`) is immediately fed into the address bar and transfers Win32 focus.
+
 - **`agy/perf-improvements`** — Browser-wide UI, rendering, and site-loading performance overhaul (also integrated `f4194fe` from `gemini/picture-in-picture`):
   - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `src/gfx.rs`, `src/popups.rs`, `src/thumbs.rs`, `src/input.rs`, `src/history.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
   - **Key improvements & changes:**
