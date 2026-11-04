@@ -642,39 +642,102 @@ struct PrefsData {
 
 struct Prefs {
     path: PathBuf,
-    bg_path: PathBuf,
-    strip_path: PathBuf,
+    data_dir: PathBuf,
     brand: Brand,
     bookmarks: Vec<Bookmark>,
-    background: Option<String>,
-    bg_strip: Option<Pixmap>,
+    bg_cederic: Option<String>,
+    strip_cederic: Option<Pixmap>,
+    bg_uzaki: Option<String>,
+    strip_uzaki: Option<Pixmap>,
 }
 
 impl Prefs {
     fn open(data_dir: &std::path::Path) -> Self {
         let path = data_dir.join("prefs.json");
-        let bg_path = data_dir.join("background.txt");
-        let strip_path = data_dir.join("background_strip.png");
+        let legacy_bg_path = data_dir.join("background.txt");
+        let legacy_strip_path = data_dir.join("background_strip.png");
+        let cederic_bg_path = data_dir.join("background_cederic.txt");
+        let cederic_strip_path = data_dir.join("background_strip_cederic.png");
+
+        if legacy_bg_path.exists() && !cederic_bg_path.exists() {
+            let _ = std::fs::rename(&legacy_bg_path, &cederic_bg_path);
+        }
+        if legacy_strip_path.exists() && !cederic_strip_path.exists() {
+            let _ = std::fs::rename(&legacy_strip_path, &cederic_strip_path);
+        }
+
+        let uzaki_bg_path = data_dir.join("background_uzaki.txt");
+        let uzaki_strip_path = data_dir.join("background_strip_uzaki.png");
+
         let data: PrefsData = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        let background = std::fs::read_to_string(&bg_path)
+
+        let bg_cederic = std::fs::read_to_string(&cederic_bg_path)
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
-        let bg_strip = std::fs::read(&strip_path)
+        let strip_cederic = std::fs::read(&cederic_strip_path)
             .ok()
             .and_then(|b| Pixmap::decode_png(&b).ok());
+
+        let bg_uzaki = std::fs::read_to_string(&uzaki_bg_path)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let strip_uzaki = std::fs::read(&uzaki_strip_path)
+            .ok()
+            .and_then(|b| Pixmap::decode_png(&b).ok());
+
         Self {
             path,
-            bg_path,
-            strip_path,
+            data_dir: data_dir.to_path_buf(),
             brand: data.brand,
             bookmarks: data.bookmarks,
-            background,
-            bg_strip,
+            bg_cederic,
+            strip_cederic,
+            bg_uzaki,
+            strip_uzaki,
         }
+    }
+
+    fn background(&self) -> Option<&str> {
+        self.background_for(self.brand)
+    }
+
+    fn background_for(&self, brand: Brand) -> Option<&str> {
+        match brand {
+            Brand::Cederic => self.bg_cederic.as_deref(),
+            Brand::Uzaki => self.bg_uzaki.as_deref(),
+        }
+    }
+
+    fn bg_strip(&self) -> Option<Pixmap> {
+        self.bg_strip_for(self.brand)
+    }
+
+    fn bg_strip_for(&self, brand: Brand) -> Option<Pixmap> {
+        match brand {
+            Brand::Cederic => self.strip_cederic.clone(),
+            Brand::Uzaki => self.strip_uzaki.clone(),
+        }
+    }
+
+    fn bg_path(&self, brand: Brand) -> PathBuf {
+        let suffix = match brand {
+            Brand::Cederic => "cederic",
+            Brand::Uzaki => "uzaki",
+        };
+        self.data_dir.join(format!("background_{suffix}.txt"))
+    }
+
+    fn strip_path(&self, brand: Brand) -> PathBuf {
+        let suffix = match brand {
+            Brand::Cederic => "cederic",
+            Brand::Uzaki => "uzaki",
+        };
+        self.data_dir.join(format!("background_strip_{suffix}.png"))
     }
 
     fn save(&self) {
@@ -690,33 +753,55 @@ impl Prefs {
         }
     }
 
-    fn set_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
+    fn set_background(&mut self, brand: Brand, data: Option<String>, strip_png: Option<&str>) {
+        let bg_path = self.bg_path(brand);
+        let strip_path = self.strip_path(brand);
         let clean = data
             .map(|s| s.trim().to_owned())
             .filter(|s| s.starts_with("data:image/") || s.starts_with("https://") || s.starts_with("http://"));
+
         if let Some(bg) = clean {
-            if let Some(p) = self.bg_path.parent() {
+            if let Some(p) = bg_path.parent() {
                 let _ = std::fs::create_dir_all(p);
             }
-            let _ = std::fs::write(&self.bg_path, &bg);
-            self.background = Some(bg);
-            if let Some(b64) = strip_png.map(str::trim).filter(|s| !s.is_empty()) {
+            let _ = std::fs::write(&bg_path, &bg);
+            let strip_pm = if let Some(b64) = strip_png.map(str::trim).filter(|s| !s.is_empty()) {
                 let raw = b64.strip_prefix("data:image/png;base64,").unwrap_or(b64);
                 if let Some(bytes) = favicons::base64_decode(raw)
                     && let Ok(pm) = Pixmap::decode_png(&bytes)
                 {
-                    let _ = std::fs::write(&self.strip_path, &bytes);
-                    self.bg_strip = Some(pm);
+                    let _ = std::fs::write(&strip_path, &bytes);
+                    Some(pm)
+                } else {
+                    None
                 }
             } else {
-                let _ = std::fs::remove_file(&self.strip_path);
-                self.bg_strip = None;
+                let _ = std::fs::remove_file(&strip_path);
+                None
+            };
+            match brand {
+                Brand::Cederic => {
+                    self.bg_cederic = Some(bg);
+                    self.strip_cederic = strip_pm;
+                }
+                Brand::Uzaki => {
+                    self.bg_uzaki = Some(bg);
+                    self.strip_uzaki = strip_pm;
+                }
             }
         } else {
-            let _ = std::fs::remove_file(&self.bg_path);
-            let _ = std::fs::remove_file(&self.strip_path);
-            self.background = None;
-            self.bg_strip = None;
+            let _ = std::fs::remove_file(&bg_path);
+            let _ = std::fs::remove_file(&strip_path);
+            match brand {
+                Brand::Cederic => {
+                    self.bg_cederic = None;
+                    self.strip_cederic = None;
+                }
+                Brand::Uzaki => {
+                    self.bg_uzaki = None;
+                    self.strip_uzaki = None;
+                }
+            }
         }
     }
 
@@ -1171,7 +1256,7 @@ impl Browser {
             brand: prefs.brand,
             bookmarks: &prefs.bookmarks,
             history: history.entries(),
-            background: prefs.background.as_deref(),
+            background: prefs.background(),
             logo: format!("data:image/png;base64,{}", base64_encode(include_bytes!("ui/logo_64.png"))),
         };
         if let Ok(json) = serde_json::to_string(&state) {
@@ -1429,21 +1514,27 @@ impl Browser {
         let cur = self.prefs.brand;
         let c_check = if cur == Brand::Cederic { "✓  Cederic (Orange)" } else { "   Cederic (Orange)" };
         let u_check = if cur == Brand::Uzaki { "✓  Uzaki (Slate Blue)" } else { "   Uzaki (Slate Blue)" };
-        let has_bg = self.prefs.background.is_some();
-        let bg_label = if has_bg { "Change background image…" } else { "Set background image…" };
+        let has_bg = self.prefs.background().is_some();
+        let bg_label = if has_bg {
+            format!("Change {} background image…", cur.name())
+        } else {
+            format!("Set {} background image…", cur.name())
+        };
+        let rm_label = format!("Remove {} background image", cur.name());
         let items = vec![
             MenuItem::new(c_check, MenuAction::SetBrand(Brand::Cederic)).hint("Default"),
             MenuItem::new(u_check, MenuAction::SetBrand(Brand::Uzaki)).hint("Slate Blue"),
             MenuItem::sep(),
             MenuItem::new(bg_label, MenuAction::ChooseBackground),
-            MenuItem::new("Remove background image", MenuAction::ClearBackground).enabled(has_bg),
+            MenuItem::new(rm_label, MenuAction::ClearBackground).enabled(has_bg),
         ];
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
     fn apply_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
-        self.prefs.set_background(data, strip_png);
-        self.toolbar.set_background(self.prefs.bg_strip.clone());
+        let brand = self.prefs.brand;
+        self.prefs.set_background(brand, data, strip_png);
+        self.toolbar.set_background(self.prefs.bg_strip());
         self.sync_all_newtabs();
         self.sync_ui();
     }
@@ -1460,6 +1551,7 @@ impl Browser {
         self.prefs.brand = brand;
         self.prefs.save();
         self.toolbar.set_theme(self.dark, brand);
+        self.toolbar.set_background(self.prefs.bg_strip());
         self.popups.set_theme(self.dark, brand);
         let bg = self.newtab_color();
         let brand_key = if brand == Brand::Uzaki { "uzaki" } else { "cederic" };
@@ -2428,7 +2520,7 @@ fn main() -> wry::Result<()> {
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
     let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
-    toolbar.set_background(prefs.bg_strip.clone());
+    toolbar.set_background(prefs.bg_strip());
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
@@ -2592,5 +2684,48 @@ mod tests {
         assert!(matches!(Shortcut::parse("bookmarks"), Some(Shortcut::Bookmarks)));
         assert!(matches!(Shortcut::parse("fullscreen"), Some(Shortcut::Fullscreen)));
         assert!(matches!(Shortcut::parse("escape"), Some(Shortcut::Escape)));
+    }
+
+    #[test]
+    fn prefs_per_persona_custom_background() {
+        let dir = std::env::temp_dir().join(format!(
+            "cederic_bg_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut prefs = Prefs::open(&dir);
+        assert_eq!(prefs.brand, Brand::Cederic);
+        assert_eq!(prefs.background(), None);
+
+        // Set Cederic background
+        prefs.set_background(Brand::Cederic, Some("https://example.com/cederic.jpg".into()), None);
+        assert_eq!(prefs.background(), Some("https://example.com/cederic.jpg"));
+
+        // Switch to Uzaki: should not have a background yet
+        prefs.brand = Brand::Uzaki;
+        assert_eq!(prefs.background(), None);
+
+        // Set Uzaki background
+        prefs.set_background(Brand::Uzaki, Some("https://example.com/uzaki.png".into()), None);
+        assert_eq!(prefs.background(), Some("https://example.com/uzaki.png"));
+
+        // Switch back to Cederic: should still have Cederic background
+        prefs.brand = Brand::Cederic;
+        assert_eq!(prefs.background(), Some("https://example.com/cederic.jpg"));
+
+        // Reload prefs from disk: both backgrounds must be preserved
+        let reloaded = Prefs::open(&dir);
+        assert_eq!(reloaded.background_for(Brand::Cederic), Some("https://example.com/cederic.jpg"));
+        assert_eq!(reloaded.background_for(Brand::Uzaki), Some("https://example.com/uzaki.png"));
+
+        // Clear Uzaki background: Cederic must remain untouched
+        let mut reloaded = reloaded;
+        reloaded.set_background(Brand::Uzaki, None, None);
+        assert_eq!(reloaded.background_for(Brand::Uzaki), None);
+        assert_eq!(reloaded.background_for(Brand::Cederic), Some("https://example.com/cederic.jpg"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

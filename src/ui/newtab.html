@@ -212,8 +212,8 @@
   window.renderNewTab = (s) => {
     curBrand = s.brand || 'cederic';
     document.documentElement.dataset.brand = curBrand;
-    const name = curBrand === 'uzaki' ? 'Uzaki' : 'Cederic';
-    document.getElementById('brand-name').textContent = name;
+    const brandTitle = curBrand === 'uzaki' ? 'Uzaki' : 'Cederic';
+    document.getElementById('brand-name').textContent = brandTitle;
     document.getElementById('theme-lbl').textContent = curBrand === 'uzaki' ? 'Persona: Uzaki (Slate Blue)' : 'Persona: Cederic';
     if (s.logo) {
       const logoEl = document.getElementById('app-logo');
@@ -226,12 +226,14 @@
       const bgEl = document.getElementById('bg');
       bgEl.style.backgroundImage = bg ? `url(${JSON.stringify(bg)})` : '';
     }
+    document.getElementById('bg-btn').title = `Choose a ${brandTitle} background image from your computer (or drag & drop an image anywhere)`;
+    document.getElementById('bg-clear').title = `Remove ${brandTitle} background image`;
     if (bg) {
       document.documentElement.dataset.hasBg = '1';
-      document.getElementById('bg-lbl').textContent = 'Change Background';
+      document.getElementById('bg-lbl').textContent = `Change ${brandTitle} Background`;
     } else {
       delete document.documentElement.dataset.hasBg;
-      document.getElementById('bg-lbl').textContent = 'Background';
+      document.getElementById('bg-lbl').textContent = `${brandTitle} Background`;
     }
     const box = document.getElementById('bms');
     box.textContent = '';

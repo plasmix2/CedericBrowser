@@ -101,6 +101,15 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`gemini/picture-in-picture`** — Implemented independent per-persona custom background images:
+  - **Files changed:** `src/main.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
+  - **Key additions:**
+    - Per-persona background storage (`background_cederic.txt`, `background_strip_cederic.png`, `background_uzaki.txt`, `background_strip_uzaki.png`) with automatic migration from legacy single-background files.
+    - `Prefs::background_for(brand)` and `Prefs::bg_strip_for(brand)` to separate wallpaper and blurred toolbar strip per persona (`Cederic` vs `Uzaki`).
+    - Switching persona instantly switches both the active newtab background wallpaper and the native toolbar background strip.
+    - Updated Palette theme dropdown menu and New Tab page button/tooltip labels to dynamically indicate and control the active persona's background (`Cederic Background` vs `Uzaki Background`).
+    - Added unit test `prefs_per_persona_custom_background` verifying independent storage, retrieval, persistence, and persona-switching isolation.
+
 - **`gemini/picture-in-picture`** — Implemented borderless Full Screen mode (F11, Escape, right-click menu, and HTML5 video / YouTube fullscreen):
   - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `INSTRUCTIONS.md`.
   - **Key additions:**
