@@ -2,21 +2,33 @@
 
 mod crypto;
 mod devtools;
+mod favicons;
+mod gfx;
 mod history;
 mod input;
 mod suggest;
 mod thumbs;
+mod toolbar;
 
-use std::{path::PathBuf, sync::mpsc::Sender};
+use std::{
+    num::NonZeroU32,
+    path::PathBuf,
+    rc::Rc,
+    sync::mpsc::Sender,
+    time::Instant,
+};
 
 use history::{HistoryEntry, HistoryStore};
+use tiny_skia::Pixmap;
+use toolbar::{BRAND_ICON, Toolbar};
 use serde::{Deserialize, Serialize};
 use tao::{
     dpi::{LogicalPosition, LogicalSize},
-    event::{ElementState, Event, MouseButton, WindowEvent},
+    event::{ElementState, Event, MouseButton, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget},
     platform::windows::{WindowBuilderExtWindows, WindowExtWindows},
-    window::{CursorIcon, ResizeDirection, Theme, Window, WindowBuilder, WindowId},
+    keyboard::ModifiersState,
+    window::{CursorIcon, Theme, Window, WindowBuilder, WindowId},
 };
 use wry::{
     BackgroundThrottlingPolicy, MemoryUsageLevel, NewWindowResponse, PageLoadEvent,
@@ -24,13 +36,12 @@ use wry::{
     WebViewBuilderExtWindows, WebViewExtWindows,
 };
 
-/// Base height of the tab strip + toolbar, in logical pixels.
-const CHROME_HEIGHT: f64 = 84.0;
+/// Height of the native tab strip + toolbar, in logical pixels.
+const CHROME_HEIGHT: f64 = toolbar::HEIGHT as f64;
 /// Width of the draggable gap between the page and the DevTools pane.
 const SPLITTER: f64 = 5.0;
 const DEVTOOLS_MIN: f64 = 280.0;
 
-const CHROME_HTML: &str = include_str!("ui/chrome.html");
 const NEWTAB_HTML: &str = include_str!("ui/newtab.html");
 const POPUP_HTML: &str = include_str!("ui/popup.html");
 
@@ -183,21 +194,18 @@ window.addEventListener('keydown', (e) => {
 }, true);
 "#;
 
-/// Finds the page's favicon; runs in the content page after it loads.
+/// Finds the page's favicon; runs in the content page after it loads. The tab strip can decode
+/// PNG and ICO, so those are preferred over SVG, with the site's /favicon.ico as the fallback.
 const FAVICON_SCRIPT: &str = r#"(() => {
-  const l = document.querySelector('link[rel~="icon"], link[rel="shortcut icon"], link[rel="apple-touch-icon"]');
-  return l ? l.href : (location.protocol.startsWith('http') ? location.origin + '/favicon.ico' : '');
+  const links = [...document.querySelectorAll('link[rel~="icon"], link[rel="shortcut icon"], link[rel="apple-touch-icon"]')];
+  const raster = links.find((l) => !/svg/i.test(l.type) && !/\.svg(\?|#|$)/i.test(l.href));
+  if (raster) return raster.href;
+  return location.protocol.startsWith('http') ? location.origin + '/favicon.ico' : '';
 })()"#;
 
 /// Brave Search is shown under Cederic's own name and icon.
 const REAL_SEARCH_HOST: &str = "search.brave.com";
 const SHOWN_SEARCH_HOST: &str = "search.cederic.com";
-const CEDERIC_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E\
-%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ff6a3d'/%3E\
-%3Cstop offset='1' stop-color='%23ffb03d'/%3E%3C/linearGradient%3E%3C/defs%3E\
-%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Ctext x='16' y='23' font-family='Segoe UI,sans-serif' \
-font-size='20' font-weight='700' fill='white' text-anchor='middle'%3EC%3C/text%3E%3C/svg%3E";
-
 /// Where never-hidden popups wait while they are not in use.
 const PARKED: LogicalPosition<f64> = LogicalPosition::new(-32000.0, -32000.0);
 
@@ -205,7 +213,6 @@ type TabId = u32;
 type Rgba = (u8, u8, u8, u8);
 
 enum UserEvent {
-    Chrome(ChromeCmd),
     Shortcut(Shortcut),
     NewTab(TabId, NewTabCmd),
     PageMenu(TabId, ContextRequest),
@@ -215,6 +222,8 @@ enum UserEvent {
     Title(TabId, String),
     Load(TabId, PageLoadEvent, String),
     Favicon(TabId, String),
+    /// A favicon was fetched and decoded (or failed to) for the tab strip.
+    IconLoaded(String, Option<Pixmap>),
     OpenInNewTab(String),
     Suggestions(suggest::Response),
     DevtoolsTarget { tab: TabId, old_title: String, url: Option<String> },
@@ -223,14 +232,15 @@ enum UserEvent {
     FocusCheck,
 }
 
-/// Messages from the browser UI (trusted, our own HTML).
-#[derive(Debug, Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
+/// What the browser chrome (the native toolbar, menus) asks the browser to do.
+#[derive(Debug)]
 enum ChromeCmd {
     Navigate { input: String },
     NewTab,
     CloseTab { id: TabId },
     Switch { id: TabId },
+    NextTab,
+    PrevTab,
     MoveTab { id: TabId, to: usize },
     TabMenu { id: TabId, x: f64, y: f64 },
     HistoryMenu { x: f64, y: f64 },
@@ -240,19 +250,19 @@ enum ChromeCmd {
     Query { text: String, x: f64, y: f64, w: f64 },
     SuggestSelect { index: usize },
     SuggestClose,
+    /// The address bar took keyboard focus: move it from the page to the browser window.
+    FocusChrome,
+    /// Editing ended without navigating: give keyboard focus back to the page.
+    FocusPage,
     Back,
     Forward,
     Reload,
     Stop,
     Devtools,
-    Ready,
     Minimize,
     Maximize,
     CloseWindow,
     Drag,
-    ResizeTop,
-    SetPanel { height: f64 },
-    DeleteHistory { id: u64 },
     ClearHistory,
 }
 
@@ -408,28 +418,6 @@ struct Tab {
 }
 
 #[derive(Serialize)]
-struct TabState<'a> {
-    id: TabId,
-    title: &'a str,
-    favicon: &'a str,
-    loading: bool,
-}
-
-#[derive(Serialize)]
-struct UiState<'a> {
-    tabs: Vec<TabState<'a>>,
-    active: TabId,
-    url: &'a str,
-    can_back: bool,
-    can_forward: bool,
-    loading: bool,
-    maximized: bool,
-    devtools: bool,
-    history: &'a [HistoryEntry],
-    https_upgrades: u64,
-}
-
-#[derive(Serialize)]
 struct NewTabState<'a> {
     history: &'a [HistoryEntry],
 }
@@ -461,14 +449,22 @@ struct Devtools {
 }
 
 struct Browser {
-    window: Window,
-    chrome: WebView,
+    window: Rc<Window>,
+    toolbar: Toolbar,
+    /// Paints the toolbar strip of the main window (pages are separate child windows on top).
+    surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+    frame: Pixmap,
+    /// When the toolbar next needs a frame (animation or timer); `None` when idle.
+    next_frame: Option<Instant>,
+    mouse: (f64, f64),
+    mods: ModifiersState,
+    cursor: CursorIcon,
+    icons_tx: Sender<String>,
     tabs: Vec<Tab>,
     /// A hidden, already-rendered new tab so Ctrl+T appears instantly.
     spare: Option<Tab>,
     active: usize,
     next_id: TabId,
-    panel_height: f64,
     history: HistoryStore,
     https_upgrades: u64,
     context: WebContext,
@@ -499,11 +495,7 @@ impl Browser {
     }
 
     fn top_bar_height(&self) -> f64 {
-        CHROME_HEIGHT + self.panel_height
-    }
-
-    fn chrome_bounds(&self) -> Rect {
-        rect(0.0, 0.0, self.logical_size().width, self.top_bar_height())
+        CHROME_HEIGHT
     }
 
     fn devtools_width(&self) -> f64 {
@@ -749,9 +741,11 @@ impl Browser {
         self.tabs.get(self.active)
     }
 
-    fn focus_address(&self) {
-        let _ = self.chrome.focus();
-        let _ = self.chrome.evaluate_script("window.focusAddress && window.focusAddress()");
+    fn focus_address(&mut self) {
+        self.toolbar.focus_address();
+        self.with_active(|v| v.focus_parent());
+        self.window.set_focus();
+        self.window.request_redraw();
     }
 
     fn push_newtab_state(view: &WebView, history: &HistoryStore) {
@@ -761,37 +755,43 @@ impl Browser {
         }
     }
 
-    fn sync_ui(&self) {
+    fn sync_ui(&mut self) {
         let Some(tab) = self.active_tab() else { return };
-        let url = display_url(&tab.url);
-        let state = UiState {
+        let model = toolbar::Model {
             tabs: self
                 .tabs
                 .iter()
-                .map(|t| TabState { id: t.id, title: &t.title, favicon: &t.favicon, loading: t.loading })
+                .map(|t| toolbar::TabInfo {
+                    id: t.id,
+                    title: t.title.clone(),
+                    favicon: t.favicon.clone(),
+                    loading: t.loading,
+                })
                 .collect(),
             active: tab.id,
-            url: &url,
+            url: display_url(&tab.url),
             can_back: tab.view.can_go_back().unwrap_or(false),
             can_forward: tab.view.can_go_forward().unwrap_or(false),
             loading: tab.loading,
             maximized: self.window.is_maximized(),
             devtools: self.devtools.open,
-            history: self.history.entries(),
-            https_upgrades: self.https_upgrades,
         };
-        if let Ok(json) = serde_json::to_string(&state) {
-            let _ = self.chrome.evaluate_script(&format!("window.render && window.render({json})"));
-        }
         if tab.is_newtab {
             Self::push_newtab_state(&tab.view, &self.history);
         }
         let title = if tab.title.is_empty() { "Cederic" } else { &tab.title };
         self.window.set_title(&format!("{title} - Cederic"));
+        self.toolbar.set_model(model);
+        for url in self.toolbar.take_icon_requests() {
+            let _ = self.icons_tx.send(url);
+        }
+        self.window.request_redraw();
     }
 
-    fn layout(&self) {
-        let _ = self.chrome.set_bounds(self.chrome_bounds());
+    fn layout(&mut self) {
+        let scale = self.window.scale_factor() as f32;
+        self.toolbar.set_size(scale, self.logical_size().width as f32);
+        self.window.request_redraw();
         let bounds = self.content_bounds();
         for tab in self.tabs.iter().chain(&self.spare) {
             let _ = tab.view.set_bounds(bounds);
@@ -1053,7 +1053,7 @@ impl Browser {
                 .map(|text| Suggestion { kind: "suggest", text }),
         );
         let Ok(json) = serde_json::to_string(&list) else { return };
-        let _ = self.chrome.evaluate_script(&format!("window.setSuggestions && window.setSuggestions({json})"));
+        self.toolbar.set_suggestions(list.iter().map(|s| s.text.clone()).collect());
         let (x, y, w) = self.suggest_anchor;
         let h = 12.0 + 36.0 * list.len() as f64;
         Self::show_popup(&self.suggest, &format!("window.showSuggest({json})"), self.to_screen(x, y), w, h);
@@ -1173,7 +1173,6 @@ impl Browser {
 
     fn handle_chrome(&mut self, cmd: ChromeCmd) {
         match cmd {
-            ChromeCmd::Ready => self.sync_ui(),
             ChromeCmd::Navigate { input } => self.navigate_active(&input),
             ChromeCmd::NewTab => {
                 let _ = self.open_tab(None, None, true);
@@ -1188,6 +1187,13 @@ impl Browser {
                     self.switch_to(i);
                 }
             }
+            ChromeCmd::NextTab => self.handle_shortcut(Shortcut::NextTab),
+            ChromeCmd::PrevTab => self.handle_shortcut(Shortcut::PrevTab),
+            ChromeCmd::FocusChrome => {
+                self.with_active(|v| v.focus_parent());
+                self.window.set_focus();
+            }
+            ChromeCmd::FocusPage => self.with_active(|v| v.focus()),
             ChromeCmd::MoveTab { id, to } => self.move_tab(id, to),
             ChromeCmd::TabMenu { id, x, y } => self.tab_menu(id, x, y),
             ChromeCmd::HistoryMenu { x, y } => self.history_menu(x, y),
@@ -1209,21 +1215,6 @@ impl Browser {
             ChromeCmd::CloseWindow => self.quit = true,
             ChromeCmd::Drag => {
                 let _ = self.window.drag_window();
-            }
-            ChromeCmd::ResizeTop => {
-                let _ = self.window.drag_resize_window(ResizeDirection::North);
-            }
-            ChromeCmd::SetPanel { height } => {
-                let clamped = height.clamp(0.0, 480.0);
-                if (self.panel_height - clamped).abs() > 0.5 {
-                    self.panel_height = clamped;
-                    self.layout();
-                }
-            }
-            ChromeCmd::DeleteHistory { id } => {
-                if self.history.remove(id) {
-                    self.sync_ui();
-                }
             }
             ChromeCmd::ClearHistory => {
                 self.history.clear();
@@ -1252,8 +1243,7 @@ impl Browser {
             }
             (PopupCmd::Pick { index }, PopupKind::Suggest) => {
                 if let Some(text) = self.suggestions.get(index).map(|s| s.text.clone()) {
-                    let _ = self.chrome.evaluate_script("window.blurAddress && window.blurAddress()");
-                    self.window.set_focus();
+                    self.toolbar.blur_address();
                     self.navigate_active(&text);
                 }
             }
@@ -1267,7 +1257,8 @@ impl Browser {
             Shortcut::CloseTab => self.close_tab(self.active),
             Shortcut::FocusAddress => self.focus_address(),
             Shortcut::History => {
-                let _ = self.chrome.evaluate_script("window.openHistory && window.openHistory()");
+                let (x, y) = self.toolbar.history_anchor();
+                self.history_menu(x as f64, y as f64);
             }
             Shortcut::Reload => self.handle_chrome(ChromeCmd::Reload),
             Shortcut::NextTab => self.switch_to((self.active + 1) % n),
@@ -1275,7 +1266,12 @@ impl Browser {
             Shortcut::Back => self.handle_chrome(ChromeCmd::Back),
             Shortcut::Forward => self.handle_chrome(ChromeCmd::Forward),
             Shortcut::Devtools => self.toggle_devtools(),
-            Shortcut::Dismiss => self.close_menu(),
+            Shortcut::Dismiss => {
+                // A click or Escape in the page: close menus and stop editing the address bar.
+                self.close_menu();
+                self.toolbar.blur_address();
+                self.window.request_redraw();
+            }
         }
     }
 
@@ -1317,11 +1313,14 @@ impl Browser {
 
     fn handle(&mut self, ev: UserEvent) {
         match ev {
-            UserEvent::Chrome(cmd) => self.handle_chrome(cmd),
             UserEvent::Shortcut(s) => self.handle_shortcut(s),
             UserEvent::NewTab(id, cmd) => self.handle_newtab(id, cmd),
             UserEvent::PageMenu(id, r) => self.page_menu(id, r),
             UserEvent::Popup(cmd, kind) => self.handle_popup(cmd, kind),
+            UserEvent::IconLoaded(url, img) => {
+                self.toolbar.icon_loaded(url, img);
+                self.window.request_redraw();
+            }
             UserEvent::Thumb(id, img) => {
                 if let Some(i) = self.index_of(id) {
                     self.tabs[i].thumb = img;
@@ -1386,7 +1385,7 @@ impl Browser {
             UserEvent::Favicon(id, icon) => {
                 if let Some(i) = self.index_of(id) {
                     let t = &mut self.tabs[i];
-                    t.favicon = if host_of(&t.url) == Some(REAL_SEARCH_HOST) { CEDERIC_ICON.into() } else { icon };
+                    t.favicon = if host_of(&t.url) == Some(REAL_SEARCH_HOST) { BRAND_ICON.into() } else { icon };
                     self.sync_ui();
                 }
             }
@@ -1407,7 +1406,7 @@ impl Browser {
                 }
                 if started && host_of(&url) != host_of(&tab.url) {
                     tab.favicon = if host_of(&url) == Some(REAL_SEARCH_HOST) {
-                        CEDERIC_ICON.into()
+                        BRAND_ICON.into()
                     } else {
                         String::new()
                     };
@@ -1467,15 +1466,115 @@ impl Browser {
                 });
             }
             WindowEvent::CloseRequested => self.quit = true,
+            WindowEvent::ThemeChanged(theme) => {
+                self.toolbar.set_dark(theme == Theme::Dark);
+                self.window.request_redraw();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f64>(self.window.scale_factor());
-                self.on_cursor(p.x, p.y);
+                self.mouse = (p.x, p.y);
+                if p.y < CHROME_HEIGHT || self.toolbar.captures_mouse() {
+                    let icon = self.toolbar.mouse_move(p.x as f32, p.y as f32);
+                    self.set_cursor(icon);
+                    self.devtools.hover = false;
+                    self.window.request_redraw();
+                } else {
+                    self.toolbar.mouse_left();
+                    self.on_cursor(p.x, p.y);
+                }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
+            WindowEvent::CursorLeft { .. } => {
+                self.toolbar.mouse_left();
+                self.window.request_redraw();
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
+                match state {
+                    ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
+                    ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => {
+                        self.toolbar.mouse_up(button, x, y)
+                    }
+                    _ => {}
+                }
+                if button == MouseButton::Left {
+                    self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
+                }
+                self.window.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(m) => self.mods = m,
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.toolbar.key(&event, self.mods);
+                self.window.request_redraw();
+            }
+            WindowEvent::ReceivedImeText(text) => {
+                self.toolbar.ime(&text);
+                self.window.request_redraw();
             }
             _ => {}
         }
+        self.flush_toolbar();
+    }
+
+    fn set_cursor(&mut self, icon: CursorIcon) {
+        if icon != self.cursor {
+            self.cursor = icon;
+            self.window.set_cursor_icon(icon);
+        }
+    }
+
+    /// Runs what the toolbar asked for since the last event.
+    fn flush_toolbar(&mut self) {
+        let cmds = std::mem::take(&mut self.toolbar.cmds);
+        for cmd in cmds {
+            self.handle_chrome(cmd);
+        }
+        if let Some((x, y)) = self.toolbar.caret() {
+            self.window.set_ime_position(LogicalPosition::new(x as f64, y as f64));
+        }
+    }
+
+    /// Draws the toolbar and shows it. Only the toolbar strip (and the gap beside the DevTools
+    /// pane) is put on screen: the rest of the window is covered by page windows, and painting
+    /// under them would flicker.
+    fn redraw(&mut self) {
+        let now = Instant::now();
+        self.next_frame = self.toolbar.tick(now);
+        self.flush_toolbar();
+        let size = self.window.inner_size();
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
+        let scale = self.window.scale_factor();
+        let bar_h = ((CHROME_HEIGHT * scale).round() as u32).min(h.get()).max(1);
+        if self.frame.width() != w.get() || self.frame.height() != bar_h {
+            let Some(pm) = Pixmap::new(w.get(), bar_h) else { return };
+            self.frame = pm;
+        }
+        self.toolbar.render(&mut self.frame);
+        let dt = self.devtools_width();
+        let logical_w = self.logical_size().width;
+        if self.surface.resize(w, h).is_err() {
+            return;
+        }
+        let Ok(mut buf) = self.surface.buffer_mut() else { return };
+        let width = w.get() as usize;
+        for (dst, src) in buf.chunks_exact_mut(width).zip(self.frame.data().chunks_exact(width * 4)) {
+            for (d, p) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+            }
+        }
+        let mut damage = vec![softbuffer::Rect { x: 0, y: 0, width: w, height: NonZeroU32::new(bar_h).unwrap_or(h) }];
+        if dt > 0.0 {
+            // The bare strip between page and DevTools is the splitter.
+            let x0 = ((logical_w - dt - SPLITTER) * scale).floor().max(0.0) as u32;
+            let gap = ((SPLITTER * scale).ceil() as u32 + 1).min(w.get().saturating_sub(x0));
+            let color = if self.dark { 0x18191d } else { 0xdfe1e6 };
+            for row in bar_h as usize..h.get() as usize {
+                buf[row * width + x0 as usize..row * width + (x0 + gap) as usize].fill(color);
+            }
+            if let (Some(gw), Some(gh)) = (NonZeroU32::new(gap), NonZeroU32::new(h.get() - bar_h)) {
+                damage.push(softbuffer::Rect { x: x0, y: bar_h, width: gw, height: gh });
+            }
+        }
+        let _ = buf.present_with_damage(&damage);
     }
 }
 
@@ -1572,14 +1671,16 @@ fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let window = WindowBuilder::new()
+    let window = Rc::new(
+        WindowBuilder::new()
         .with_title("Cederic")
         .with_decorations(false)
         .with_undecorated_shadow(true)
         .with_inner_size(LogicalSize::new(1280.0, 820.0))
         .with_min_inner_size(LogicalSize::new(480.0, 320.0))
         .build(&event_loop)
-        .expect("failed to create window");
+        .expect("failed to create window"),
+    );
     let dark = window.theme() == Theme::Dark;
     let frame: Rgba = if dark { (24, 25, 29, 255) } else { (223, 225, 230, 255) };
     window.set_background_color(Some(frame));
@@ -1588,22 +1689,11 @@ fn main() -> wry::Result<()> {
     let history = HistoryStore::open(&dir);
     let mut context = WebContext::new(Some(dir.clone()));
 
-    let p_chrome = proxy.clone();
-    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
-    let chrome = WebViewBuilder::new_with_web_context(&mut context)
-        .with_bounds(rect(0.0, 0.0, size.width, CHROME_HEIGHT))
-        .with_html(CHROME_HTML)
-        .with_background_color(frame)
-        .with_additional_browser_args(BROWSER_ARGS)
-        .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
-        .with_devtools(cfg!(debug_assertions))
-        .with_hotkeys_zoom(false)
-        .with_ipc_handler(move |req| {
-            if let Ok(cmd) = serde_json::from_str::<ChromeCmd>(req.body()) {
-                let _ = p_chrome.send_event(UserEvent::Chrome(cmd));
-            }
-        })
-        .build_as_child(&window)?;
+    let scale = window.scale_factor();
+    let size = window.inner_size().to_logical::<f64>(scale);
+    let toolbar = Toolbar::new(dark, scale as f32, size.width as f32);
+    let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
+    let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
     let menu = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Menu, dark)?;
     let suggest = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Suggest, dark)?;
@@ -1612,6 +1702,11 @@ fn main() -> wry::Result<()> {
     let p_thumb = proxy.clone();
     let thumbs_tx = thumbs::spawn(dir.clone(), move |tab, img| {
         let _ = p_thumb.send_event(UserEvent::Thumb(tab, img));
+    });
+
+    let p_icon = proxy.clone();
+    let icons_tx = favicons::spawn(move |url, img| {
+        let _ = p_icon.send_event(UserEvent::IconLoaded(url, img));
     });
 
     let p_suggest = proxy.clone();
@@ -1623,12 +1718,18 @@ fn main() -> wry::Result<()> {
 
     let mut browser = Browser {
         window,
-        chrome,
+        toolbar,
+        surface,
+        frame: Pixmap::new(1, 1).expect("1x1 pixmap"),
+        next_frame: None,
+        mouse: (-1.0, -1.0),
+        mods: ModifiersState::empty(),
+        cursor: CursorIcon::Default,
+        icons_tx,
         tabs: Vec::new(),
         spare: None,
         active: 0,
         next_id: 1,
-        panel_height: 0.0,
         history,
         https_upgrades: 0,
         context,
@@ -1657,14 +1758,23 @@ fn main() -> wry::Result<()> {
         Some(resolved.url)
     });
     browser.open_tab(start, None, true)?;
+    browser.layout();
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
         match event {
-            Event::UserEvent(ev) => browser.handle(ev),
+            Event::UserEvent(ev) => {
+                browser.handle(ev);
+                browser.flush_toolbar();
+            }
             Event::WindowEvent { window_id, event, .. } => browser.handle_window(window_id, event),
+            Event::RedrawRequested(id) if id == browser.window.id() => browser.redraw(),
+            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => browser.window.request_redraw(),
             _ => {}
         }
+        *control_flow = match browser.next_frame {
+            Some(t) => ControlFlow::WaitUntil(t),
+            None => ControlFlow::Wait,
+        };
         if browser.quit {
             *control_flow = ControlFlow::Exit;
         }

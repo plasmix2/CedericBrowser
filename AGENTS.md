@@ -32,9 +32,12 @@ from happening again.
 
 ## Project overview
 
-Cederic is a Windows browser written in Rust. The window and all browser logic are Rust (`unsafe` is
-forbidden in `Cargo.toml`); web pages are rendered by the system's WebView2 engine through
-[wry](https://github.com/tauri-apps/wry) and [tao](https://github.com/tauri-apps/tao).
+Cederic is a Windows browser written in Rust. The window, the browser UI and all browser logic are
+Rust (`unsafe` is forbidden in `Cargo.toml`); only web pages are rendered by the system's WebView2
+engine, through [wry](https://github.com/tauri-apps/wry) and [tao](https://github.com/tauri-apps/tao).
+The tab strip and toolbar are **not** HTML: they are drawn by our own code with
+[tiny-skia](https://github.com/linebender/tiny-skia) and [cosmic-text](https://github.com/pop-os/cosmic-text)
+and shown with [softbuffer](https://github.com/rust-windowing/softbuffer).
 
 ```
 cargo run --release                      # opens a new tab
@@ -47,12 +50,14 @@ Note that building replaces `target/release/cederic.exe`, so any running Cederic
 | File | What it does |
 |---|---|
 | `src/main.rs` | Window, tabs, popups (menus, suggestions, hover cards), DevTools pane, event loop |
+| `src/toolbar.rs` | Native tab strip, window controls, buttons and address bar: layout, input, animation, drawing |
+| `src/gfx.rs` | Drawing helpers for the native UI: shapes, vector icons, text, theme colors |
+| `src/favicons.rs` | Fetches and decodes tab favicons (PNG/ICO) for the native tab strip |
 | `src/input.rs` | Address-bar input → URL or search; HTTPS upgrades; search-query extraction |
 | `src/suggest.rs` | Search suggestions, fetched on a background thread |
 | `src/devtools.rs` | Finds tabs on the loopback DevTools port for the docked DevTools pane |
 | `src/thumbs.rs` | Tab snapshots for hover cards, over the same DevTools port |
 | `src/history.rs`, `src/crypto.rs` | Search history, encrypted on disk |
-| `src/ui/chrome.html` | Tab strip and toolbar (one WebView across the top) |
 | `src/ui/popup.html` | Menus, suggestion dropdown and tab hover cards |
 | `src/ui/newtab.html` | New-tab page |
 
@@ -69,6 +74,16 @@ Note that building replaces `target/release/cederic.exe`, so any running Cederic
 - Brave Search shown as **Cederic Search**: no Brave logos, name, or favicon visible (see `BRAND_SCRIPT`).
 
 ## Things that look wrong but are deliberate
+
+- **The toolbar is painted straight onto the main window, and only the toolbar strip (plus the gap
+  beside the DevTools pane) is ever presented** (`present_with_damage` in `Browser::redraw`). Pages are
+  child windows on top, and the main window does not clip its children, so painting the whole window
+  would flicker over the pages. Don't present the full buffer.
+- **The event loop sleeps when nothing moves.** `Toolbar::tick` says when the next frame is needed
+  (animations, hover-card timers, caret blink) and returns `None` when idle; keep it that way so the
+  browser uses no CPU while you read a page.
+- **Tabs are shown before the old one is hidden or closed** (`switch_to`, `open_tab`, `close_tab`).
+  Reversing the order makes the bare window flash between tabs.
 
 - **Every WebView must use the exact same `BROWSER_ARGS`, scroll bar style and data folder.** WebView2
   refuses to create a WebView whose environment options differ (error `0x8007139F`). If you change one,
@@ -104,5 +119,11 @@ running Cederic through its debug port:
 CEDERIC_EVAL="document.title" cargo test --release live_eval -- --ignored --nocapture
 ```
 
-This runs the JavaScript in every page (toolbar, popups, tabs) and prints the results. Dispatch DOM events
-from that JavaScript to simulate clicks, hovers or drags inside Cederic's own pages.
+This runs the JavaScript in every page (popups, tabs) and prints the results. Dispatch DOM events
+from that JavaScript to simulate clicks or hovers inside Cederic's own pages.
+
+The native toolbar can be rendered off-screen to a PNG, with no window at all:
+
+```
+CEDERIC_SHOT=<folder> cargo test --release render_toolbar -- --ignored
+```
