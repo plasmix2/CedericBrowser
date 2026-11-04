@@ -264,7 +264,6 @@ const BRAND_SCRIPT: &str = r#"
   if (location.hostname !== 'search.brave.com') return;
   const style = document.createElement('style');
   let brandName = 'Cederic';
-  const re = /\b(Brave|Cederic|Uzaki)\b/;
   const fix = (s) => s.replace(/\b(Brave|Cederic|Uzaki)\b/g, brandName);
   const fixText = (n) => {
     const p = n.parentElement;
