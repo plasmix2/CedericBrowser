@@ -161,6 +161,7 @@ pub struct Toolbar {
     card_leave: Option<Instant>,
     last_frame: Instant,
     bg: Option<Pixmap>,
+    logo: Option<Pixmap>,
     /// Requests for the browser, drained after each event.
     pub cmds: Vec<ChromeCmd>,
 }
@@ -258,6 +259,7 @@ impl Toolbar {
             card_leave: None,
             last_frame: now,
             bg: None,
+            logo: Pixmap::decode_png(include_bytes!("ui/logo_64.png")).ok(),
             cmds: Vec::new(),
         }
     }
@@ -1188,9 +1190,13 @@ impl Toolbar {
         let icon_x = if narrow && !active { x + (w - 16.0) / 2.0 } else { x + 12.0 };
         let show_close = !self.vis[i].leaving && (active || hovered) && (!narrow || active) && w >= 44.0;
         let close = self.close_rect(&self.vis[i]);
-        // Favicon, spinner, or the Cederic/Uzaki badge.
+        // Favicon, spinner, or the Persona logo badge.
         if loading {
             c.spinner(icon_x + 8.0, cy, 6.0, self.spin, th.accent.with_alpha(alpha));
+        } else if (favicon == BRAND_ICON || (favicon.is_empty() && (title.is_empty() || title == "New Tab")))
+            && let Some(logo) = &self.logo
+        {
+            c.image(logo, icon_x, cy - 8.0, 16.0, 16.0, alpha);
         } else if favicon == BRAND_ICON {
             c.rrect(icon_x, cy - 8.0, 16.0, 16.0, [4.0; 4], th.accent.mix(th.accent2, 0.3).with_alpha(alpha));
             let mut b = self.fonts.line(self.model.brand.badge_letter(), 11.0, Weight::BOLD, self.s);

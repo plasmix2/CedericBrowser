@@ -53,6 +53,9 @@
   main > :nth-child(3) { animation-delay: .10s; }
   main > :nth-child(4) { animation-delay: .14s; }
   @keyframes rise { from { opacity: 0; transform: translateY(14px) scale(.98); } }
+  .hero { display: inline-flex; align-items: center; gap: 14px; }
+  #app-logo { width: 52px; height: 52px; border-radius: 14px; object-fit: cover; display: none;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .28); border: 1.5px solid var(--border); }
   h1 { margin: 0; font: 650 48px "Segoe UI Variable Display", "Segoe UI", system-ui; letter-spacing: -1.5px; }
   h1 span { color: var(--accent); }
   form { position: relative; width: min(640px, calc(100vw - 32px)); }
@@ -94,7 +97,10 @@
   <button id="theme-btn" class="top-pill" type="button" title="Switch between Cederic and Uzaki persona"><span class="dot"></span><span id="theme-lbl">Persona: Cederic</span></button>
 </div>
 <main>
-  <h1 id="brand"><b id="brand-name" style="font-weight:inherit">Cederic</b><span>.</span></h1>
+  <div class="hero">
+    <img id="app-logo" alt="Persona">
+    <h1 id="brand"><b id="brand-name" style="font-weight:inherit">Cederic</b><span>.</span></h1>
+  </div>
   <form id="f">
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
     <input id="q" placeholder="Search the web" autocomplete="off">
@@ -205,6 +211,11 @@
     const name = curBrand === 'uzaki' ? 'Uzaki' : 'Cederic';
     document.getElementById('brand-name').textContent = name;
     document.getElementById('theme-lbl').textContent = curBrand === 'uzaki' ? 'Persona: Uzaki (Slate Blue)' : 'Persona: Cederic';
+    if (s.logo) {
+      const logoEl = document.getElementById('app-logo');
+      if (!logoEl.src) logoEl.src = s.logo;
+      logoEl.style.display = 'block';
+    }
     const bg = s.background || '';
     if (bg !== curBg) {
       curBg = bg;

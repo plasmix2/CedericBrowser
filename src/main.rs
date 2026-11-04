@@ -32,7 +32,7 @@ use tao::{
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     platform::windows::WindowBuilderExtWindows,
     keyboard::ModifiersState,
-    window::{CursorIcon, Theme, Window, WindowBuilder, WindowId},
+    window::{CursorIcon, Icon as WinIcon, Theme, Window, WindowBuilder, WindowId},
 };
 use wry::{
     BackgroundThrottlingPolicy, MemoryUsageLevel, NewWindowResponse, PageLoadEvent,
@@ -725,6 +725,7 @@ struct NewTabState<'a> {
     bookmarks: &'a [Bookmark],
     history: &'a [HistoryEntry],
     background: Option<&'a str>,
+    logo: String,
 }
 
 struct Devtools {
@@ -1060,6 +1061,7 @@ impl Browser {
             bookmarks: &prefs.bookmarks,
             history: history.entries(),
             background: prefs.background.as_deref(),
+            logo: format!("data:image/png;base64,{}", base64_encode(include_bytes!("ui/logo_64.png"))),
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -2203,6 +2205,37 @@ fn data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Cederic")
 }
 
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 0x3F) as usize] as char);
+        out.push(T[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn load_app_icon() -> Option<WinIcon> {
+    let pm = Pixmap::decode_png(include_bytes!("ui/logo_64.png")).ok()?;
+    let (w, h) = (pm.width(), pm.height());
+    let mut rgba = pm.data().to_vec();
+    for p in rgba.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        if a > 0 && a < 255 {
+            p[0] = ((p[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+            p[1] = ((p[1] as u32 * 255 + a / 2) / a).min(255) as u8;
+            p[2] = ((p[2] as u32 * 255 + a / 2) / a).min(255) as u8;
+        }
+    }
+    WinIcon::from_rgba(rgba, w, h).ok()
+}
+
 fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -2214,6 +2247,7 @@ fn main() -> wry::Result<()> {
     let window = Rc::new(
         WindowBuilder::new()
         .with_title("Persona")
+        .with_window_icon(load_app_icon())
         .with_decorations(false)
         .with_undecorated_shadow(true)
         .with_inner_size(LogicalSize::new(1280.0, 820.0))
