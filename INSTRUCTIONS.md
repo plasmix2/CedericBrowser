@@ -101,6 +101,17 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`gemini/picture-in-picture`** — Comprehensive performance tuning, memory optimization, and UI polish:
+  - **Files changed:** `src/main.rs`, `src/gfx.rs`, `src/popups.rs`, `src/favicons.rs`, `src/suggest.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
+  - **Key optimizations:**
+    - GPU & engine performance flags added to `BROWSER_ARGS` (`--enable-quic`, `--enable-accelerated-video-decode`, `--enable-smooth-scrolling`, `--enable-fast-unload`, `--ignore-gpu-blocklist`, `--enable-native-gpu-memory-buffers`).
+    - Fixed-point integer text blending in `gfx::blend` replacing floating-point operations; row offset pre-calculation and inner loop boundary hoisting in `Canvas::text`.
+    - Softbuffer surface resize deduplication in `Browser::redraw` and `Popups::redraw` to eliminate redundant Win32 GDI DIB section reallocations during 120fps animations.
+    - Cached application logo data URI via `std::sync::LazyLock<String>` and zero-copy string slice in `NewTabState`, eliminating large heap allocations on tab syncs.
+    - Added in-memory caching to `favicons` and `suggest` background worker threads for instantaneous 0ms responses on repeated queries.
+    - Title deduplication in `sync_ui` preventing unnecessary `SetWindowTextW` OS calls.
+    - Hardware-accelerated GPU layer promotion (`will-change: transform`, `transform: translateZ(0)`) for New Tab gradient drift and background transitions, plus `DocumentFragment` bookmark rendering.
+
 - **`gemini/picture-in-picture`** — Implemented independent per-persona custom background images:
   - **Files changed:** `src/main.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
   - **Key additions:**

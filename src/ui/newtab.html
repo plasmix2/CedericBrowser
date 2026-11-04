@@ -17,10 +17,12 @@
   body::before { content: ""; position: fixed; inset: -20%; pointer-events: none; opacity: .55;
     background: radial-gradient(40% 35% at 30% 20%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 70%),
       radial-gradient(35% 30% at 75% 75%, rgba(120, 90, 255, .18), transparent 70%);
-    animation: drift 18s ease-in-out infinite alternate; }
+    animation: drift 18s ease-in-out infinite alternate;
+    will-change: transform; transform: translateZ(0); }
   @keyframes drift { to { transform: translate(4%, -3%) scale(1.08); } }
   #bg { position: fixed; inset: 0; z-index: 0; background-size: cover; background-position: center; background-repeat: no-repeat;
-    opacity: 0; transition: opacity .3s var(--ease); pointer-events: none; }
+    opacity: 0; transition: opacity .3s var(--ease); pointer-events: none;
+    will-change: opacity; transform: translateZ(0); }
   #bg::after { content: ""; position: absolute; inset: 0;
     background: radial-gradient(circle at center, rgba(10, 12, 18, .18) 0%, rgba(10, 12, 18, .54) 100%); }
   :root[data-has-bg="1"] #bg { opacity: 1; }
@@ -237,6 +239,7 @@
     }
     const box = document.getElementById('bms');
     box.textContent = '';
+    const frag = document.createDocumentFragment();
     for (const b of (s.bookmarks || [])) {
       const el = document.createElement('div');
       el.className = 'bm';
@@ -255,8 +258,9 @@
       del.onclick = (e) => { e.stopPropagation(); send({ nt: 'delete_bookmark', url: b.url }); };
       el.onclick = () => send({ nt: 'open_bookmark', url: b.url });
       el.append(star, lbl, del);
-      box.append(el);
+      frag.append(el);
     }
+    box.append(frag);
   };
   send({ nt: 'ready' });
 </script>

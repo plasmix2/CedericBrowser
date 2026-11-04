@@ -18,11 +18,20 @@ pub fn spawn(on_done: impl Fn(String, Option<Pixmap>) + Send + 'static) -> mpsc:
         let agent: Agent = Agent::config_builder()
             .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
             .timeout_global(Some(Duration::from_secs(4)))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Cederic")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
             .build()
             .into();
+        let mut cache: std::collections::HashMap<String, Option<Pixmap>> = std::collections::HashMap::new();
         while let Ok(url) = rx.recv() {
+            if let Some(cached) = cache.get(&url) {
+                on_done(url, cached.clone());
+                continue;
+            }
             let img = bytes(&agent, &url).and_then(|b| decode(&b));
+            if cache.len() >= 128 {
+                cache.clear();
+            }
+            cache.insert(url.clone(), img.clone());
             on_done(url, img);
         }
     });

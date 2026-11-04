@@ -101,6 +101,12 @@ const BROWSER_ARGS: &str = "\
     --autoplay-policy=no-user-gesture-required \
     --enable-gpu-rasterization \
     --enable-zero-copy \
+    --enable-quic \
+    --enable-accelerated-video-decode \
+    --enable-smooth-scrolling \
+    --enable-fast-unload \
+    --ignore-gpu-blocklist \
+    --enable-native-gpu-memory-buffers \
     --no-pings \
     --disable-domain-reliability \
     --disable-client-side-phishing-detection \
@@ -891,13 +897,17 @@ struct Tab {
     thumb: Option<Pixmap>,
 }
 
+static LOGO_DATA_URI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("data:image/png;base64,{}", base64_encode(include_bytes!("ui/logo_64.png")))
+});
+
 #[derive(Serialize)]
 struct NewTabState<'a> {
     brand: Brand,
     bookmarks: &'a [Bookmark],
     history: &'a [HistoryEntry],
     background: Option<&'a str>,
-    logo: String,
+    logo: &'a str,
 }
 
 struct Devtools {
@@ -951,6 +961,8 @@ struct Browser {
     clipboard: Option<arboard::Clipboard>,
     fullscreen: bool,
     html_fullscreen: bool,
+    surface_size: (u32, u32),
+    last_title: String,
 }
 
 impl Browser {
@@ -1257,7 +1269,7 @@ impl Browser {
             bookmarks: &prefs.bookmarks,
             history: history.entries(),
             background: prefs.background(),
-            logo: format!("data:image/png;base64,{}", base64_encode(include_bytes!("ui/logo_64.png"))),
+            logo: LOGO_DATA_URI.as_str(),
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -1294,7 +1306,10 @@ impl Browser {
             Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
         }
         let title = if tab.title.is_empty() { "Persona" } else { &tab.title };
-        self.window.set_title(&format!("{title} - Persona"));
+        if title != self.last_title {
+            self.window.set_title(&format!("{title} - Persona"));
+            self.last_title = title.to_owned();
+        }
         self.toolbar.set_model(model);
         for url in self.toolbar.take_icon_requests() {
             let _ = self.icons_tx.send(url);
@@ -2374,8 +2389,12 @@ impl Browser {
         self.toolbar.render(&mut self.frame);
         let dt = self.devtools_width();
         let logical_w = self.logical_size().width;
-        if self.surface.resize(w, h).is_err() {
-            return;
+        let (w_u32, h_u32) = (w.get(), h.get());
+        if self.surface_size != (w_u32, h_u32) {
+            if self.surface.resize(w, h).is_err() {
+                return;
+            }
+            self.surface_size = (w_u32, h_u32);
         }
         let Ok(mut buf) = self.surface.buffer_mut() else { return };
         let width = w.get() as usize;
@@ -2584,6 +2603,8 @@ fn main() -> wry::Result<()> {
         clipboard: None,
         fullscreen: false,
         html_fullscreen: false,
+        surface_size: (0, 0),
+        last_title: String::new(),
     };
     let start = std::env::args().nth(1).and_then(|a| {
         let resolved = input::resolve_with_info(&unmask(&a))?;
