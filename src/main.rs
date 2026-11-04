@@ -219,6 +219,8 @@ enum UserEvent {
     Suggestions(suggest::Response),
     DevtoolsTarget { tab: TabId, old_title: String, url: Option<String> },
     Prewarm,
+    /// Sent shortly after the main window loses focus, once it is known where focus went.
+    FocusCheck,
 }
 
 /// Messages from the browser UI (trusted, our own HTML).
@@ -434,7 +436,8 @@ struct NewTabState<'a> {
 
 /// Popups are shown once at creation without taking focus and then only moved: tao can show a
 /// window without activating it only at creation, and an active window gets the accent border.
-/// Hidden ones are parked off-screen.
+/// They take focus only while being clicked (a window that never takes focus gets no WebView2
+/// mouse input). Hidden ones are parked off-screen.
 struct Popup {
     window: Window,
     view: WebView,
@@ -476,6 +479,8 @@ struct Browser {
     menu: Popup,
     menu_actions: Vec<Option<MenuAction>>,
     menu_open: bool,
+    /// The menu window has focus (it takes it only when clicked).
+    menu_focused: bool,
     preview: Popup,
     thumbs_tx: Sender<thumbs::Request>,
     suggest: Popup,
@@ -805,6 +810,12 @@ impl Browser {
     fn hide_popup(popup: &Popup) {
         let _ = popup.view.evaluate_script("window.hideAll && window.hideAll()");
         popup.window.set_outer_position(PARKED);
+    }
+
+    /// Gives keyboard focus back to the page after a popup was clicked.
+    fn refocus_page(&self) {
+        self.window.set_focus();
+        self.with_active(|v| v.focus());
     }
 
     fn close_menu(&mut self) {
@@ -1203,10 +1214,14 @@ impl Browser {
     fn handle_popup(&mut self, cmd: PopupCmd, kind: PopupKind) {
         match (cmd, kind) {
             (_, PopupKind::Preview) => {}
-            (PopupCmd::Close, PopupKind::Menu) => self.close_menu(),
+            (PopupCmd::Close, PopupKind::Menu) => {
+                self.close_menu();
+                self.refocus_page();
+            }
             (PopupCmd::Close, PopupKind::Suggest) => self.close_suggest(),
             (PopupCmd::Pick { index }, PopupKind::Menu) => {
                 self.close_menu();
+                self.refocus_page();
                 if let Some(Some(action)) = self.menu_actions.get(index).cloned() {
                     self.run_menu_action(action);
                 }
@@ -1313,6 +1328,11 @@ impl Browser {
                 }
                 let _ = self.open_tab(Some(target), Some(self.active + 1), true);
             }
+            UserEvent::FocusCheck => {
+                if !self.menu_focused {
+                    self.close_menu();
+                }
+            }
             UserEvent::Prewarm => {
                 if self.spare.is_none() {
                     self.spare = self.build_tab(None).ok();
@@ -1388,9 +1408,15 @@ impl Browser {
 
     fn handle_window(&mut self, id: WindowId, event: WindowEvent) {
         if id != self.window.id() {
-            // Popups must never keep focus; hand it straight back if one ever gets it.
-            if let WindowEvent::Focused(true) = event {
-                self.window.set_focus();
+            // Popups are shown without focus and only take it while being clicked; taking it back
+            // here would cancel the click. The menu closes once it loses focus again.
+            if id == self.menu.window.id()
+                && let WindowEvent::Focused(focused) = event
+            {
+                self.menu_focused = focused;
+                if !focused {
+                    self.close_menu();
+                }
             }
             return;
         }
@@ -1408,8 +1434,13 @@ impl Browser {
                 self.hide_preview();
             }
             WindowEvent::Focused(false) => {
-                self.close_menu();
+                // Clicking the menu also takes focus from here; only close it if focus went elsewhere.
                 self.hide_preview();
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let _ = proxy.send_event(UserEvent::FocusCheck);
+                });
             }
             WindowEvent::CloseRequested => self.quit = true,
             WindowEvent::CursorMoved { position, .. } => {
@@ -1492,7 +1523,6 @@ fn build_popup(
         .with_resizable(false)
         .with_visible(true)
         .with_focused(false)
-        .with_focusable(false)
         .with_position(PARKED)
         .with_skip_taskbar(true)
         .with_owner_window(owner.hwnd())
@@ -1585,6 +1615,7 @@ fn main() -> wry::Result<()> {
         menu,
         menu_actions: Vec::new(),
         menu_open: false,
+        menu_focused: false,
         preview,
         thumbs_tx,
         suggest,

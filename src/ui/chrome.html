@@ -36,10 +36,10 @@
   .tab.active { color: var(--fg); z-index: 2; }
   .tab.active .bg { background: var(--toolbar); }
   /* curved "feet" joining the active tab to the toolbar */
-  .tab.active .bg::before, .tab.active .bg::after { content: ""; position: absolute; bottom: 0; width: 10px; height: 10px;
-    background: radial-gradient(circle at 0 0, transparent 9.5px, var(--toolbar) 10px); }
-  .tab.active .bg::before { right: -10px; }
-  .tab.active .bg::after { left: -10px; transform: scaleX(-1); }
+  /* Each foot is filled on the side touching the tab, with the curve's center at its outer top corner. */
+  .tab.active .bg::before, .tab.active .bg::after { content: ""; position: absolute; bottom: 0; width: 10px; height: 10px; }
+  .tab.active .bg::before { right: -10px; background: radial-gradient(circle at 100% 0, transparent 9.5px, var(--toolbar) 10px); }
+  .tab.active .bg::after { left: -10px; background: radial-gradient(circle at 0 0, transparent 9.5px, var(--toolbar) 10px); }
   /* separators between inactive tabs */
   .tab::after { content: ""; position: absolute; right: 0; top: 10px; bottom: 10px; width: 1px;
     background: var(--border); transition: opacity .15s; }
@@ -415,7 +415,9 @@
   addr.addEventListener('focus', () => { editing = true; omni.classList.add('focus'); requestAnimationFrame(() => addr.select()); });
   addr.addEventListener('blur', () => {
     editing = false; omni.classList.remove('focus'); if (state) addr.value = state.url;
-    sugg = []; send({ cmd: 'suggest_close' });
+    sugg = [];
+    // Clicking a suggestion takes focus first; leave the popup in place long enough for the click.
+    setTimeout(() => { if (!editing) send({ cmd: 'suggest_close' }); }, 150);
   });
 
   // ---- suggestions: Rust fetches them and draws the dropdown; arrows pick one here ----
