@@ -101,6 +101,16 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`gemini/picture-in-picture`** — Fixed Google Account sign-in ("This browser or app may not be secure") and YouTube 0:59 playback disconnection:
+  - **Files changed:** `src/main.rs`, `src/thumbs.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
+  - **Key fixes:**
+    - Removed `--remote-debugging-port=0` from `BROWSER_ARGS` (which forced Blink into automation mode, setting `navigator.webdriver = true` and tripping Google's botguard / account sign-in block).
+    - Added `--disable-blink-features=AutomationControlled` to `BROWSER_ARGS`.
+    - Added clean standard desktop Chrome `USER_AGENT` (`Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36`) via `with_user_agent` on `WebViewBuilder` to strip `Edg/...` and embedded WebView2 tokens.
+    - Added `STEALTH_SCRIPT` deleting `Object.getPrototypeOf(navigator).webdriver` and hiding `window.chrome.webview` from web page detection while maintaining secure internal IPC routing via `window.__cedericSendIpc`.
+    - Fixed YouTube 0:59 SABR playback interruption by avoiding CDP evaluation attachment on YouTube tabs, removing `__cederic*` globals from subframes, and preventing tab suspension.
+
+
 - **`gemini/picture-in-picture`** — Merged `origin/main` (native Rust toolbar/popups via `tiny-skia` + `cosmic-text` + `softbuffer`) and combined with Picture-in-Picture mode, Saved Bookmarks, and Theme/Persona switching (`Cederic` Orange default / `Uzaki` Slate Blue):
   - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `src/gfx.rs`, `src/popups.rs`, `src/thumbs.rs`, `src/ui/newtab.html`, `README.md`, `INSTRUCTIONS.md`.
   - **Key structs / enums / functions added or updated:**

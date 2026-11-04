@@ -48,10 +48,56 @@ const DEVTOOLS_MIN: f64 = 280.0;
 
 const NEWTAB_HTML: &str = include_str!("ui/newtab.html");
 
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+
+const STEALTH_SCRIPT: &str = r#"
+(() => {
+  try {
+    delete Object.getPrototypeOf(navigator).webdriver;
+  } catch (_) {}
+  try {
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => undefined,
+      configurable: true,
+    });
+  } catch (_) {}
+
+  if (!window.chrome) window.chrome = {};
+  if (window.chrome.webview) {
+    const realWebview = window.chrome.webview;
+    let internalCall = false;
+    window.__cedericSendIpc = (msg) => {
+      internalCall = true;
+      try {
+        if (window.ipc && typeof window.ipc.postMessage === 'function') {
+          window.ipc.postMessage(msg);
+        } else if (realWebview && typeof realWebview.postMessage === 'function') {
+          realWebview.postMessage(msg);
+        }
+      } finally {
+        internalCall = false;
+      }
+    };
+    try {
+      delete window.chrome.webview;
+      Object.defineProperty(window.chrome, 'webview', {
+        get() {
+          if (internalCall) return realWebview;
+          return undefined;
+        },
+        configurable: true,
+        enumerable: false,
+      });
+    } catch (_) {}
+  }
+})();
+"#;
+
 /// Every WebView sharing a data directory must use identical arguments.
 const BROWSER_ARGS: &str = "\
     --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,UserAgentClientHint \
     --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,BackForwardCache,ParallelDownloading,CanvasOopRasterization \
+    --disable-blink-features=AutomationControlled \
     --autoplay-policy=no-user-gesture-required \
     --enable-gpu-rasterization \
     --enable-zero-copy \
@@ -60,8 +106,7 @@ const BROWSER_ARGS: &str = "\
     --disable-client-side-phishing-detection \
     --disable-sync \
     --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
-    --enforce-webrtc-ip-permission-check \
-    --remote-debugging-port=0";
+    --enforce-webrtc-ip-permission-check";
 
 /// Keyboard shortcuts, the context menu, and Wi-Fi form/beacon encryption guard for content pages.
 /// Untrusted web content can only trigger the fixed `Shortcut` whitelist and a validated
@@ -69,6 +114,13 @@ const BROWSER_ARGS: &str = "\
 const SHORTCUT_SCRIPT: &str = r#"
 (() => {
   if (window !== window.top) return;
+  const post = (msg) => {
+    if (typeof window.__cedericSendIpc === 'function') {
+      window.__cedericSendIpc(msg);
+    } else if (window.ipc && typeof window.ipc.postMessage === 'function') {
+      window.ipc.postMessage(msg);
+    }
+  };
   let ctxVideo = null;
   const videos = (root = document, out = []) => {
     for (const v of root.querySelectorAll('video')) out.push(v);
@@ -105,25 +157,25 @@ const SHORTCUT_SCRIPT: &str = r#"
     try {
       if (document.pictureInPictureElement) {
         await document.exitPictureInPicture();
-        window.ipc.postMessage('pip_off');
+        post('pip_off');
         return true;
       }
       const v = bestVideo(preferCtx);
       if (!v) return false;
       v.disablePictureInPicture = false;
       v.removeAttribute('disablepictureinpicture');
-      v.addEventListener('leavepictureinpicture', () => window.ipc.postMessage('pip_off'), { once: true });
+      v.addEventListener('leavepictureinpicture', () => post('pip_off'), { once: true });
       await v.requestPictureInPicture();
-      window.ipc.postMessage('pip_on');
+      post('pip_on');
       return true;
     } catch (_) {
       return false;
     }
   };
-  window.addEventListener('enterpictureinpicture', () => window.ipc.postMessage('pip_on'), true);
-  window.addEventListener('leavepictureinpicture', () => window.ipc.postMessage('pip_off'), true);
+  window.addEventListener('enterpictureinpicture', () => post('pip_on'), true);
+  window.addEventListener('leavepictureinpicture', () => post('pip_off'), true);
   window.addEventListener('pagehide', () => {
-    if (document.pictureInPictureElement) window.ipc.postMessage('pip_off');
+    if (document.pictureInPictureElement) post('pip_off');
   }, true);
 
   const map = (e) => {
@@ -143,18 +195,18 @@ const SHORTCUT_SCRIPT: &str = r#"
     return null;
   };
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') window.ipc.postMessage('dismiss');
+    if (e.key === 'Escape') post('dismiss');
     const cmd = map(e);
     if (cmd === 'pip') {
       e.preventDefault(); e.stopPropagation();
-      togglePip(false).then((ok) => { if (!ok) window.ipc.postMessage('pip'); });
+      togglePip(false).then((ok) => { if (!ok) post('pip'); });
       return;
     }
-    if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); }
+    if (cmd) { e.preventDefault(); e.stopPropagation(); post(cmd); }
   }, true);
   // Popups never take focus, so a click or focus inside the page is what closes an open menu / address bar edit.
-  window.addEventListener('pointerdown', () => window.ipc.postMessage('dismiss'), true);
-  window.addEventListener('focusin', () => window.ipc.postMessage('dismiss'), true);
+  window.addEventListener('pointerdown', () => post('dismiss'), true);
+  window.addEventListener('focusin', () => post('dismiss'), true);
 
   // Bubble phase: pages with their own context menu call preventDefault first and keep it.
   // Editable fields keep the engine's menu so cut/paste/spellcheck work.
@@ -165,7 +217,7 @@ const SHORTCUT_SCRIPT: &str = r#"
     e.preventDefault();
     const a = t && t.closest('a[href]'), img = t && t.closest('img');
     ctxVideo = videoAt(e.clientX, e.clientY) || bestVideo(false);
-    window.ipc.postMessage(JSON.stringify({
+    post(JSON.stringify({
       x: e.clientX, y: e.clientY, dpr: window.devicePixelRatio,
       link: a ? a.href : '', image: img ? (img.currentSrc || img.src) : '',
       selection: String(getSelection()).slice(0, 20000),
@@ -219,10 +271,10 @@ const SHORTCUT_SCRIPT: &str = r#"
         sx.drawImage(img, (sc.width - dw) / 2, (sc.height - dh) * 0.2, dw, dh);
         strip = sc.toDataURL('image/png');
       } catch (_) {}
-      window.ipc.postMessage(JSON.stringify({ nt: 'set_background', data, strip }));
+      post(JSON.stringify({ nt: 'set_background', data, strip }));
     };
     img.onerror = () => {
-      if (rawUrl) window.ipc.postMessage(JSON.stringify({ nt: 'set_background', data: rawUrl, strip: '' }));
+      if (rawUrl) post(JSON.stringify({ nt: 'set_background', data: rawUrl, strip: '' }));
     };
     img.src = rawUrl;
   };
@@ -857,6 +909,8 @@ impl Browser {
         let mut builder = WebViewBuilder::new_with_web_context(&mut self.context)
             .with_bounds(bounds)
             .with_visible(false)
+            .with_user_agent(USER_AGENT)
+            .with_initialization_script(STEALTH_SCRIPT)
             .with_initialization_script(format!(
                 "if (window === window.top && location.hostname === 'search.brave.com') window.__cedericBrand = {brand_key:?};"
             ))
@@ -1659,6 +1713,7 @@ impl Browser {
                     .with_background_color(if self.dark { (36, 36, 36, 255) } else { (255, 255, 255, 255) })
                     .with_initialization_script(DEVTOOLS_SCRIPT)
                     .with_additional_browser_args(BROWSER_ARGS)
+                    .with_user_agent(USER_AGENT)
                     .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
                     .with_ipc_handler(move |req| {
                         if req.body() == "devtools" {

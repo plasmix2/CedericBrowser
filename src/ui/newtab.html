@@ -109,7 +109,11 @@
   <p><kbd>Ctrl T</kbd> new tab &nbsp; <kbd>Ctrl L</kbd> address bar &nbsp; <kbd>Ctrl D</kbd> bookmark &nbsp; <kbd>Ctrl B</kbd> bookmarks &nbsp; <kbd>Ctrl H</kbd> history &nbsp; <kbd>Alt P</kbd> PiP &nbsp; <kbd>F12</kbd> dev tools</p>
 </main>
 <script>
-  const send = (o) => window.ipc.postMessage(JSON.stringify(o));
+  const send = (o) => {
+    const s = JSON.stringify(o);
+    if (typeof window.__cedericSendIpc === 'function') window.__cedericSendIpc(s);
+    else if (window.ipc) window.ipc.postMessage(s);
+  };
   let curBrand = 'cederic';
   let curBg = '';
 
