@@ -64,6 +64,63 @@ const BROWSER_ARGS: &str = "\
 /// `ContextRequest` over IPC.
 const SHORTCUT_SCRIPT: &str = r#"
 (() => {
+  let ctxVideo = null;
+  const videos = (root = document, out = []) => {
+    for (const v of root.querySelectorAll('video')) out.push(v);
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) videos(el.shadowRoot, out);
+    }
+    return out;
+  };
+  const usable = (v) => v instanceof HTMLVideoElement && v.isConnected && (v.readyState >= 1 || v.videoWidth > 0 || !!(v.currentSrc || v.src));
+  const videoAt = (x, y) => {
+    for (const el of document.elementsFromPoint(x, y)) {
+      if (usable(el)) return el;
+    }
+    return videos().find((v) => {
+      if (!usable(v)) return false;
+      const r = v.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+    }) || null;
+  };
+  const bestVideo = (preferCtx) => {
+    if (preferCtx && usable(ctxVideo)) return ctxVideo;
+    const list = videos().filter(usable);
+    if (!list.length) return null;
+    const score = (v) => {
+      const r = v.getBoundingClientRect();
+      const area = Math.max(0, r.width) * Math.max(0, r.height);
+      const playing = (!v.paused && !v.ended) ? 1e9 : 0;
+      return playing + (area || (v.videoWidth * v.videoHeight));
+    };
+    list.sort((a, b) => score(b) - score(a));
+    return list[0];
+  };
+  window.__cedericTogglePip = async (preferCtx = false) => {
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        window.ipc.postMessage('pip_off');
+        return true;
+      }
+      const v = bestVideo(preferCtx);
+      if (!v) return false;
+      v.disablePictureInPicture = false;
+      v.removeAttribute('disablepictureinpicture');
+      v.addEventListener('leavepictureinpicture', () => window.ipc.postMessage('pip_off'), { once: true });
+      await v.requestPictureInPicture();
+      window.ipc.postMessage('pip_on');
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+  window.addEventListener('enterpictureinpicture', () => window.ipc.postMessage('pip_on'), true);
+  window.addEventListener('leavepictureinpicture', () => window.ipc.postMessage('pip_off'), true);
+  window.addEventListener('pagehide', () => {
+    if (document.pictureInPictureElement) window.ipc.postMessage('pip_off');
+  }, true);
+
   const map = (e) => {
     const c = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
     if (c && k === 't') return 'new_tab';
@@ -74,12 +131,18 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (c && e.key === 'Tab') return e.shiftKey ? 'prev_tab' : 'next_tab';
     if (e.altKey && e.key === 'ArrowLeft') return 'back';
     if (e.altKey && e.key === 'ArrowRight') return 'forward';
+    if (e.altKey && !c && !e.shiftKey && k === 'p') return 'pip';
     if (e.key === 'F12' || (c && e.shiftKey && k === 'i')) return 'devtools';
     return null;
   };
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') window.ipc.postMessage('dismiss');
     const cmd = map(e);
+    if (cmd === 'pip') {
+      e.preventDefault(); e.stopPropagation();
+      window.__cedericTogglePip(false).then((ok) => { if (!ok) window.ipc.postMessage('pip'); });
+      return;
+    }
     if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); }
   }, true);
   // Popups never take focus, so a click in the page is what closes an open menu.
@@ -93,10 +156,13 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (t && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
     e.preventDefault();
     const a = t && t.closest('a[href]'), img = t && t.closest('img');
+    ctxVideo = videoAt(e.clientX, e.clientY) || bestVideo(false);
     window.ipc.postMessage(JSON.stringify({
       x: e.clientX, y: e.clientY, dpr: window.devicePixelRatio,
       link: a ? a.href : '', image: img ? (img.currentSrc || img.src) : '',
       selection: String(getSelection()).slice(0, 20000),
+      video: !!ctxVideo,
+      pip: !!document.pictureInPictureElement,
     }));
   });
 
@@ -211,6 +277,7 @@ enum UserEvent {
     PageMenu(TabId, ContextRequest),
     Popup(PopupCmd, PopupKind),
     Thumb(TabId, String),
+    PipState(TabId, bool),
     UpgradeHttps(TabId, String),
     Title(TabId, String),
     Load(TabId, PageLoadEvent, String),
@@ -244,6 +311,7 @@ enum ChromeCmd {
     Forward,
     Reload,
     Stop,
+    Pip,
     Devtools,
     Ready,
     Minimize,
@@ -286,6 +354,7 @@ enum Shortcut {
     PrevTab,
     Back,
     Forward,
+    Pip,
     Devtools,
     Dismiss,
 }
@@ -302,6 +371,7 @@ impl Shortcut {
             "prev_tab" => Self::PrevTab,
             "back" => Self::Back,
             "forward" => Self::Forward,
+            "pip" => Self::Pip,
             "devtools" => Self::Devtools,
             "dismiss" => Self::Dismiss,
             _ => return None,
@@ -318,6 +388,10 @@ struct ContextRequest {
     link: String,
     image: String,
     selection: String,
+    #[serde(default)]
+    video: bool,
+    #[serde(default)]
+    pip: bool,
 }
 
 impl ContextRequest {
@@ -342,6 +416,7 @@ enum MenuAction {
     NewTabRight(TabId),
     ReloadTab(TabId),
     Duplicate(TabId),
+    TogglePip(TabId, bool),
     CloseTab(TabId),
     CloseOthers(TabId),
     CloseRight(TabId),
@@ -400,6 +475,7 @@ struct Tab {
     url: String,
     favicon: String,
     loading: bool,
+    pip: bool,
     is_newtab: bool,
     /// Still painted in the new-tab page color; switches to white once a real page loads.
     newtab_bg: bool,
@@ -413,6 +489,7 @@ struct TabState<'a> {
     title: &'a str,
     favicon: &'a str,
     loading: bool,
+    pip: bool,
 }
 
 #[derive(Serialize)]
@@ -425,6 +502,7 @@ struct UiState<'a> {
     loading: bool,
     maximized: bool,
     devtools: bool,
+    pip: bool,
     history: &'a [HistoryEntry],
     https_upgrades: u64,
 }
@@ -580,7 +658,11 @@ impl Browser {
             })
             .with_ipc_handler(move |req| {
                 let body = req.body();
-                if let Some(s) = Shortcut::parse(body) {
+                if body == "pip_on" {
+                    let _ = p_ipc.send_event(UserEvent::PipState(id, true));
+                } else if body == "pip_off" {
+                    let _ = p_ipc.send_event(UserEvent::PipState(id, false));
+                } else if let Some(s) = Shortcut::parse(body) {
                     let _ = p_ipc.send_event(UserEvent::Shortcut(s));
                 } else if let Ok(cmd) = serde_json::from_str::<NewTabCmd>(body) {
                     let _ = p_ipc.send_event(UserEvent::NewTab(id, cmd));
@@ -602,6 +684,7 @@ impl Browser {
             url: url.unwrap_or_default().to_owned(),
             favicon: String::new(),
             loading: url.is_some(),
+            pip: false,
             is_newtab: url.is_none(),
             newtab_bg: url.is_none(),
             thumb: String::new(),
@@ -696,8 +779,14 @@ impl Browser {
 
     fn hide_active(&self) {
         if let Some(cur) = self.tabs.get(self.active) {
-            let _ = cur.view.set_visible(false);
-            let _ = cur.view.set_memory_usage_level(MemoryUsageLevel::Low);
+            if cur.pip {
+                // Keep a tab with active Picture-in-Picture alive and decoding frames while
+                // parked outside the visible client area, so switching tabs never freezes PiP.
+                let _ = cur.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
+            } else {
+                let _ = cur.view.set_visible(false);
+                let _ = cur.view.set_memory_usage_level(MemoryUsageLevel::Low);
+            }
         }
     }
 
@@ -744,7 +833,7 @@ impl Browser {
             tabs: self
                 .tabs
                 .iter()
-                .map(|t| TabState { id: t.id, title: &t.title, favicon: &t.favicon, loading: t.loading })
+                .map(|t| TabState { id: t.id, title: &t.title, favicon: &t.favicon, loading: t.loading, pip: t.pip })
                 .collect(),
             active: tab.id,
             url: &url,
@@ -753,6 +842,7 @@ impl Browser {
             loading: tab.loading,
             maximized: self.window.is_maximized(),
             devtools: self.devtools.open,
+            pip: self.tabs.iter().any(|t| t.pip),
             history: self.history.entries(),
             https_upgrades: self.https_upgrades,
         };
@@ -769,8 +859,12 @@ impl Browser {
     fn layout(&self) {
         let _ = self.chrome.set_bounds(self.chrome_bounds());
         let bounds = self.content_bounds();
-        for tab in self.tabs.iter().chain(&self.spare) {
-            let _ = tab.view.set_bounds(bounds);
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let b = if i != self.active && tab.pip { rect(-10.0, -10.0, 1.0, 1.0) } else { bounds };
+            let _ = tab.view.set_bounds(b);
+        }
+        if let Some(spare) = &self.spare {
+            let _ = spare.view.set_bounds(bounds);
         }
         if let Some(v) = &self.devtools.view {
             let _ = v.set_bounds(self.devtools_bounds());
@@ -864,11 +958,15 @@ impl Browser {
     fn tab_menu(&mut self, id: TabId, x: f64, y: f64) {
         let Some(idx) = self.index_of(id) else { return };
         let more = self.tabs.len() > 1;
+        let pip_label = if self.tabs[idx].pip { "Exit Picture in Picture" } else { "Picture in Picture" };
         let items = vec![
             MenuItem::new("New tab to the right", MenuAction::NewTabRight(id)),
             MenuItem::sep(),
             MenuItem::new("Reload", MenuAction::ReloadTab(id)).hint("Ctrl+R"),
             MenuItem::new("Duplicate", MenuAction::Duplicate(id)).enabled(!self.tabs[idx].url.is_empty()),
+            MenuItem::new(pip_label, MenuAction::TogglePip(id, false))
+                .hint("Alt+P")
+                .enabled(!self.tabs[idx].is_newtab),
             MenuItem::sep(),
             MenuItem::new("Close tab", MenuAction::CloseTab(id)).hint("Ctrl+W"),
             MenuItem::new("Close other tabs", MenuAction::CloseOthers(id)).enabled(more),
@@ -914,6 +1012,11 @@ impl Browser {
             items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image)));
             items.push(MenuItem::sep());
         }
+        if r.video || r.pip || tab.pip {
+            let label = if r.pip || tab.pip { "Exit Picture in Picture" } else { "Picture in Picture" };
+            items.push(MenuItem::new(label, MenuAction::TogglePip(id, true)).hint("Alt+P"));
+            items.push(MenuItem::sep());
+        }
         let sel = r.selection.trim();
         if !sel.is_empty() {
             let short: String = sel.chars().take(24).collect();
@@ -954,6 +1057,7 @@ impl Browser {
                     let _ = self.open_tab(Some(url), Some(i + 1), true);
                 }
             }
+            MenuAction::TogglePip(id, prefer_ctx) => self.toggle_pip(Some(id), prefer_ctx),
             MenuAction::CloseTab(id) => {
                 if let Some(i) = self.index_of(id) {
                     self.close_tab(i);
@@ -1041,7 +1145,31 @@ impl Browser {
         Self::hide_popup(&self.suggest);
     }
 
-    // ---------- DevTools ----------
+    // ---------- Picture-in-Picture & DevTools ----------
+
+    fn toggle_pip(&mut self, target: Option<TabId>, prefer_ctx: bool) {
+        let id = target.or_else(|| {
+            let active = self.active_tab()?;
+            if active.pip {
+                Some(active.id)
+            } else {
+                self.tabs.iter().find(|t| t.pip).map(|t| t.id).or(Some(active.id))
+            }
+        });
+        let Some(id) = id else { return };
+        let Some(i) = self.index_of(id) else { return };
+        if i != self.active && !self.tabs[i].pip {
+            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Normal);
+            let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
+            let _ = self.tabs[i].view.set_visible(true);
+        }
+        let js = format!("window.__cedericTogglePip && window.__cedericTogglePip({prefer_ctx})");
+        if devtools::port(&self.data_dir).is_some() {
+            let _ = self.thumbs_tx.send(thumbs::Request::EvalGesture(id, js));
+        } else {
+            let _ = self.tabs[i].view.evaluate_script(&js);
+        }
+    }
 
     fn toggle_devtools(&mut self) {
         self.devtools.open = !self.devtools.open;
@@ -1179,6 +1307,7 @@ impl Browser {
             ChromeCmd::Forward => self.with_active(|v| v.go_forward()),
             ChromeCmd::Reload => self.with_active(|v| v.reload()),
             ChromeCmd::Stop => self.with_active(|v| v.evaluate_script("window.stop()")),
+            ChromeCmd::Pip => self.toggle_pip(None, false),
             ChromeCmd::Devtools => self.toggle_devtools(),
             ChromeCmd::Minimize => self.window.set_minimized(true),
             ChromeCmd::Maximize => self.window.set_maximized(!self.window.is_maximized()),
@@ -1250,6 +1379,7 @@ impl Browser {
             Shortcut::PrevTab => self.switch_to((self.active + n - 1) % n),
             Shortcut::Back => self.handle_chrome(ChromeCmd::Back),
             Shortcut::Forward => self.handle_chrome(ChromeCmd::Forward),
+            Shortcut::Pip => self.toggle_pip(None, false),
             Shortcut::Devtools => self.toggle_devtools(),
             Shortcut::Dismiss => self.close_menu(),
         }
@@ -1301,6 +1431,37 @@ impl Browser {
             UserEvent::Thumb(id, img) => {
                 if let Some(i) = self.index_of(id) {
                     self.tabs[i].thumb = img;
+                }
+            }
+            UserEvent::PipState(id, on) => {
+                if let Some(i) = self.index_of(id) {
+                    let bounds = self.content_bounds();
+                    let active = self.active;
+                    if on {
+                        for (j, t) in self.tabs.iter_mut().enumerate() {
+                            if j != i && t.pip {
+                                t.pip = false;
+                                if j != active {
+                                    let _ = t.view.set_visible(false);
+                                    let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
+                                    let _ = t.view.set_bounds(bounds);
+                                }
+                            }
+                        }
+                    }
+                    self.tabs[i].pip = on;
+                    if i != active {
+                        if on {
+                            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Normal);
+                            let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
+                            let _ = self.tabs[i].view.set_visible(true);
+                        } else {
+                            let _ = self.tabs[i].view.set_visible(false);
+                            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Low);
+                            let _ = self.tabs[i].view.set_bounds(bounds);
+                        }
+                    }
+                    self.sync_ui();
                 }
             }
             UserEvent::UpgradeHttps(id, https_url) => {

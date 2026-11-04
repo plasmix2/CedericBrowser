@@ -62,6 +62,9 @@
     animation: spin .65s linear infinite; opacity: 0; transform: scale(.4); }
   .tab.loading .spin { opacity: 1; transform: scale(1); }
   .tab.loading img, .tab.loading .globe, .tab:not(.has-icon) img, .tab.has-icon .globe { opacity: 0; transform: scale(.4); }
+  .tab.pip:not(.loading) .icon::after { content: ""; position: absolute; right: -2px; bottom: -2px; width: 7px; height: 7px;
+    border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 2px var(--strip); }
+  .tab.pip.active:not(.loading) .icon::after { box-shadow: 0 0 0 2px var(--toolbar); }
   @keyframes spin { to { rotate: 360deg; } }
 
   .tab .t { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap;
@@ -158,6 +161,7 @@
       <div id="pretty"></div>
       <input id="addr" spellcheck="false" autocomplete="off" placeholder="Search or type a URL">
     </div>
+    <button class="btn" id="pip" title="Picture in Picture (Alt+P)"><svg viewBox="0 0 24 24"><path d="M21 10V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6"/><rect x="13" y="13" width="8" height="6" rx="1.5" fill="currentColor" stroke="none"/></svg></button>
     <button class="btn" id="hist" title="Search history (Ctrl+H)"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg></button>
     <button class="btn" id="dev" title="Developer tools (F12)"><svg viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5"/></svg></button>
     <div id="progress"></div>
@@ -318,6 +322,7 @@
   function updateTab(el, t, active) {
     el.classList.toggle('active', active);
     el.classList.toggle('loading', t.loading);
+    el.classList.toggle('pip', !!t.pip);
     el.title = '';
     const title = el.querySelector('.t');
     const text = t.title || 'New Tab';
@@ -401,6 +406,8 @@
     $('reload').title = s.loading ? 'Stop loading' : 'Reload (Ctrl+R)';
     if (switched) { barOn = !s.loading; }
     setProgress(s.loading);
+    $('pip').classList.toggle('on', !!s.pip);
+    $('pip').title = s.pip ? 'Exit Picture in Picture (Alt+P)' : 'Picture in Picture (Alt+P)';
     $('dev').classList.toggle('on', !!s.devtools);
     $('wmax').innerHTML = s.maximized ? ICONS.restore : ICONS.max;
     $('wmax').title = s.maximized ? 'Restore' : 'Maximize';
@@ -447,6 +454,7 @@
   $('back').onclick = () => send({ cmd: 'back' });
   $('fwd').onclick = () => send({ cmd: 'forward' });
   $('reload').onclick = () => send({ cmd: state && state.loading ? 'stop' : 'reload' });
+  $('pip').onclick = () => send({ cmd: 'pip' });
   $('hist').onclick = () => window.openHistory();
   $('dev').onclick = () => send({ cmd: 'devtools' });
   $('wmin').onclick = () => send({ cmd: 'minimize' });
@@ -469,6 +477,7 @@
     else if (c && k === 'l') { e.preventDefault(); window.focusAddress(); return; }
     else if (c && k === 'h') { e.preventDefault(); window.openHistory(); return; }
     else if ((c && k === 'r') || e.key === 'F5') cmd = { cmd: 'reload' };
+    else if (e.altKey && !c && !e.shiftKey && k === 'p') cmd = { cmd: 'pip' };
     else if (e.key === 'F12' || (c && e.shiftKey && k === 'i')) cmd = { cmd: 'devtools' };
     if (cmd) { e.preventDefault(); send(cmd); }
   });

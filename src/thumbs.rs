@@ -27,6 +27,9 @@ pub enum Request {
     Capture(u32),
     /// The tab was closed.
     Forget(u32),
+    /// Evaluate `js` in `tab` with `userGesture: true` over CDP (needed for Picture-in-Picture
+    /// when triggered from the toolbar or popup WebView rather than inside the content page).
+    EvalGesture(u32, String),
 }
 
 pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, String) + Send + 'static) -> mpsc::Sender<Request> {
@@ -42,6 +45,20 @@ pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, String) + Send + 'static)
                 }
                 Ok(Request::Forget(t)) => {
                     targets.remove(&t);
+                    continue;
+                }
+                Ok(Request::EvalGesture(t, js)) => {
+                    if let Some(port) = devtools::port(&data_dir) {
+                        let _ = targets
+                            .get(&t)
+                            .and_then(|id| eval_gesture(port, id, &js))
+                            .or_else(|| {
+                                let id = find_target(port, t)?;
+                                let res = eval_gesture(port, &id, &js);
+                                targets.insert(t, id);
+                                res
+                            });
+                    }
                     continue;
                 }
                 Ok(Request::Capture(t)) => t,
@@ -127,7 +144,7 @@ fn capture(port: u16, target: &str) -> Option<String> {
     let m = s.call("Page.getLayoutMetrics", json!({}))?;
     let vp = &m["cssVisualViewport"];
     let (w, h) = (vp["clientWidth"].as_f64()?, vp["clientHeight"].as_f64()?);
-    if w < 1.0 || h < 1.0 {
+    if w < 2.0 || h < 2.0 {
         return None;
     }
     let clip = json!({
@@ -139,6 +156,20 @@ fn capture(port: u16, target: &str) -> Option<String> {
     });
     let r = s.call("Page.captureScreenshot", json!({ "format": "jpeg", "quality": 60, "clip": clip }))?;
     Some(format!("data:image/jpeg;base64,{}", r["data"].as_str()?))
+}
+
+/// Evaluates `js` in `target` with a synthesized user gesture (`userGesture: true`).
+fn eval_gesture(port: u16, target: &str, js: &str) -> Option<Value> {
+    let mut s = Session::open(port, target)?;
+    s.call(
+        "Runtime.evaluate",
+        json!({
+            "expression": js,
+            "userGesture": true,
+            "awaitPromise": true,
+            "returnByValue": true,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -155,7 +186,7 @@ mod tests {
         let js = std::env::var("CEDERIC_EVAL").unwrap_or_else(|_| "location.href".into());
         for id in devtools::page_targets(port).expect("targets") {
             let r = Session::open(port, &id)
-                .and_then(|mut s| s.call("Runtime.evaluate", json!({ "expression": js, "returnByValue": true, "awaitPromise": true })));
+                .and_then(|mut s| s.call("Runtime.evaluate", json!({ "expression": js, "returnByValue": true, "awaitPromise": true, "userGesture": true })));
             println!("{id}: {}", r.map(|v| v["result"]["value"].to_string()).unwrap_or_default());
         }
         for tab in 1..=3 {
