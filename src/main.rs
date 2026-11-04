@@ -1095,9 +1095,8 @@ impl Browser {
         if tab.is_newtab {
             Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
         }
-        let brand_name = brand.name();
-        let title = if tab.title.is_empty() { brand_name } else { &tab.title };
-        self.window.set_title(&format!("{title} - {brand_name}"));
+        let title = if tab.title.is_empty() { "Persona" } else { &tab.title };
+        self.window.set_title(&format!("{title} - Persona"));
         self.toolbar.set_model(model);
         for url in self.toolbar.take_icon_requests() {
             let _ = self.icons_tx.send(url);
@@ -2214,7 +2213,7 @@ fn main() -> wry::Result<()> {
 
     let window = Rc::new(
         WindowBuilder::new()
-        .with_title(brand.name())
+        .with_title("Persona")
         .with_decorations(false)
         .with_undecorated_shadow(true)
         .with_inner_size(LogicalSize::new(1280.0, 820.0))
