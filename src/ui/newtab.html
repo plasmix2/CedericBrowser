@@ -113,7 +113,7 @@
 
   <form id="search-form">
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
-    <input id="q" name="q" placeholder="Search privately with Brave or enter a URL..." autocomplete="off" autofocus>
+    <input id="q" name="q" placeholder="Search privately or enter a URL..." autocomplete="off" autofocus>
   </form>
 
   <section class="vault">
@@ -207,7 +207,7 @@
       qSpan.textContent = item.query;
       const engSpan = document.createElement('span');
       engSpan.className = 'item-engine';
-      engSpan.textContent = item.engine;
+      engSpan.textContent = item.engine.replace(/\bBrave\b/g, 'Cederic');
       top.append(qSpan, engSpan);
 
       const mom = document.createElement('div');

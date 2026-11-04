@@ -14,9 +14,18 @@ pub struct ResolvedInput {
     pub is_search: bool,
 }
 
+/// The search-results URL for `q`.
+pub fn search_url(q: &str) -> String {
+    search(q)
+}
+
+/// Whether `url` is a search-results page rather than a site the user typed.
+pub fn is_search(url: &str) -> bool {
+    url.starts_with(SEARCH)
+}
+
 /// Returns `None` for empty input or for schemes we refuse to load (e.g. `javascript:`).
 /// Non-local `http://` URLs are automatically upgraded to `https://` so traffic on Wi-Fi stays encrypted.
-#[cfg(test)]
 pub fn resolve(input: &str) -> Option<String> {
     resolve_with_info(input).map(|r| r.url)
 }
@@ -59,7 +68,7 @@ pub fn resolve_with_info(input: &str) -> Option<ResolvedInput> {
             return s.contains(char::is_whitespace).then(|| ResolvedInput {
                 url: search(s),
                 query: s.to_owned(),
-                engine: "Brave Search",
+                engine: "Cederic Search",
                 is_search: true,
             });
         }
@@ -89,7 +98,7 @@ pub fn resolve_with_info(input: &str) -> Option<ResolvedInput> {
     Some(ResolvedInput {
         url: search(s),
         query: s.to_owned(),
-        engine: "Brave Search",
+        engine: "Cederic Search",
         is_search: true,
     })
 }
@@ -129,7 +138,7 @@ pub fn extract_search(url: &str) -> Option<(String, &'static str)> {
     let path = parsed.path();
 
     let (engine, param) = if host == "search.brave.com" && path.starts_with("/search") {
-        ("Brave Search", "q")
+        ("Cederic Search", "q")
     } else if (host == "google.com" || host.ends_with(".google.com")) && path.starts_with("/search") {
         ("Google", "q")
     } else if host == "duckduckgo.com" || host.ends_with(".duckduckgo.com") {
@@ -218,7 +227,7 @@ mod tests {
     fn extracts_search_queries() {
         assert_eq!(
             extract_search("https://search.brave.com/search?q=rust+borrow+checker&source=web"),
-            Some(("rust borrow checker".into(), "Brave Search"))
+            Some(("rust borrow checker".into(), "Cederic Search"))
         );
         assert_eq!(
             extract_search("https://www.google.com/search?q=encrypted+dns"),

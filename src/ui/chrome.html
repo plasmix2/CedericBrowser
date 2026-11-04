@@ -365,7 +365,7 @@
       q.textContent = item.query;
       const eng = document.createElement('span');
       eng.className = 'h-eng';
-      eng.textContent = item.engine;
+      eng.textContent = item.engine.replace(/Brave/g, 'Cederic');
       main.append(q, eng);
 
       const time = document.createElement('div');
