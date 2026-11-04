@@ -17,7 +17,7 @@ use tiny_skia::Pixmap;
 
 use crate::{
     ChromeCmd, TabId,
-    gfx::{Canvas, Fonts, Icon, Rgba, Theme, attrs, text_width},
+    gfx::{Brand, Canvas, Fonts, Icon, Rgba, Theme, attrs, text_width},
 };
 
 /// Height of the tab strip (also the window's title bar).
@@ -39,11 +39,13 @@ const URL_FONT: f32 = 13.5;
 /// Favicon key for Brave Search pages, drawn as the Cederic "C" badge.
 pub const BRAND_ICON: &str = "cederic:brand";
 
+#[derive(Default)]
 pub struct TabInfo {
     pub id: TabId,
     pub title: String,
     pub favicon: String,
     pub loading: bool,
+    pub pip: bool,
 }
 
 #[derive(Default)]
@@ -56,6 +58,9 @@ pub struct Model {
     pub loading: bool,
     pub maximized: bool,
     pub devtools: bool,
+    pub pip: bool,
+    pub bookmarked: bool,
+    pub brand: Brand,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -70,7 +75,11 @@ enum Hit {
     Forward,
     Reload,
     Omni,
+    Star,
+    Bookmarks,
+    Pip,
     History,
+    Theme,
     Devtools,
     DragArea,
     None,
@@ -189,22 +198,31 @@ fn hit_key(h: Hit) -> u8 {
         Hit::Omni => 8,
         Hit::History => 9,
         Hit::Devtools => 10,
+        Hit::Star => 11,
+        Hit::Bookmarks => 12,
+        Hit::Pip => 13,
+        Hit::Theme => 14,
         _ => 0,
     }
 }
 
 impl Toolbar {
+    #[cfg(test)]
     pub fn new(dark: bool, scale: f32, width: f32) -> Self {
+        Self::new_with_brand(dark, Brand::Cederic, scale, width)
+    }
+
+    pub fn new_with_brand(dark: bool, brand: Brand, scale: f32, width: f32) -> Self {
         let mut fonts = Fonts::load();
         let editor = Editor::new(fonts.line("", URL_FONT, Weight::NORMAL, scale));
         let placeholder = fonts.line("Search or type a URL", URL_FONT, Weight::NORMAL, scale);
         let now = Instant::now();
         Self {
-            theme: Theme::new(dark),
+            theme: Theme::for_brand(dark, brand),
             fonts,
             s: scale,
             width,
-            model: Model::default(),
+            model: Model { brand, ..Model::default() },
             order: Vec::new(),
             vis: Vec::new(),
             tab_w: MAX_W,
@@ -244,8 +262,9 @@ impl Toolbar {
 
     // ---------- outside updates ----------
 
-    pub fn set_dark(&mut self, dark: bool) {
-        self.theme = Theme::new(dark);
+    pub fn set_theme(&mut self, dark: bool, brand: Brand) {
+        self.theme = Theme::for_brand(dark, brand);
+        self.model.brand = brand;
         self.pretty = None;
     }
 
@@ -341,6 +360,18 @@ impl Toolbar {
         (r.x + r.w, r.y + r.h + 4.0)
     }
 
+    /// Where the bookmarks dropdown hangs from (right edge, top), in logical pixels.
+    pub fn bookmarks_anchor(&self) -> (f32, f32) {
+        let r = self.geo().bookmarks;
+        (r.x + r.w, r.y + r.h + 4.0)
+    }
+
+    /// Where the theme dropdown hangs from (right edge, top), in logical pixels.
+    pub fn theme_anchor(&self) -> (f32, f32) {
+        let r = self.geo().theme;
+        (r.x + r.w, r.y + r.h + 4.0)
+    }
+
     /// The text caret in logical window coordinates, for placing the IME candidate window.
     pub fn caret(&mut self) -> Option<(f32, f32)> {
         if !self.editing {
@@ -410,14 +441,22 @@ impl Toolbar {
     fn geo(&self) -> Geo {
         let w = self.width;
         let dev = R { x: w - 8.0 - BTN, y: ROW_Y, w: BTN, h: BTN };
-        let hist = R { x: dev.x - 2.0 - BTN, ..dev };
+        let theme = R { x: dev.x - 2.0 - BTN, ..dev };
+        let hist = R { x: theme.x - 2.0 - BTN, ..dev };
+        let pip = R { x: hist.x - 2.0 - BTN, ..dev };
+        let bookmarks = R { x: pip.x - 2.0 - BTN, ..dev };
+        let star = R { x: bookmarks.x - 2.0 - BTN, ..dev };
         let ox = 8.0 + 3.0 * (BTN + 2.0) + 6.0;
         Geo {
             back: R { x: 8.0, y: ROW_Y, w: BTN, h: BTN },
             fwd: R { x: 8.0 + BTN + 2.0, y: ROW_Y, w: BTN, h: BTN },
             reload: R { x: 8.0 + 2.0 * (BTN + 2.0), y: ROW_Y, w: BTN, h: BTN },
-            omni: R { x: ox, y: ROW_Y, w: (hist.x - 8.0 - ox).max(60.0), h: BTN },
+            omni: R { x: ox, y: ROW_Y, w: (star.x - 8.0 - ox).max(60.0), h: BTN },
+            star,
+            bookmarks,
+            pip,
             hist,
+            theme,
             dev,
             new_tab: R { x: self.tabs_end() + 4.0, y: 5.0, w: 30.0, h: 30.0 },
             min: R { x: w - 3.0 * WIN_BTN_W, y: 0.0, w: WIN_BTN_W, h: TITLE_H },
@@ -460,7 +499,11 @@ impl Toolbar {
                 (g.fwd, Hit::Forward),
                 (g.reload, Hit::Reload),
                 (g.omni, Hit::Omni),
+                (g.star, Hit::Star),
+                (g.bookmarks, Hit::Bookmarks),
+                (g.pip, Hit::Pip),
                 (g.hist, Hit::History),
+                (g.theme, Hit::Theme),
                 (g.dev, Hit::Devtools),
             ] {
                 if r.has(x, y) {
@@ -621,9 +664,19 @@ impl Toolbar {
                     ChromeCmd::Reload
                 }
             }
+            Hit::Star if !self.model.url.is_empty() => ChromeCmd::ToggleBookmark,
+            Hit::Bookmarks => {
+                let (x, y) = self.bookmarks_anchor();
+                ChromeCmd::BookmarksMenu { x: x as f64, y: y as f64 }
+            }
+            Hit::Pip => ChromeCmd::Pip,
             Hit::History => {
                 let (x, y) = self.history_anchor();
                 ChromeCmd::HistoryMenu { x: x as f64, y: y as f64 }
+            }
+            Hit::Theme => {
+                let (x, y) = self.theme_anchor();
+                ChromeCmd::ThemeMenu { x: x as f64, y: y as f64 }
             }
             Hit::Devtools => ChromeCmd::Devtools,
             _ => return,
@@ -778,6 +831,12 @@ impl Toolbar {
             (Key::F5, _) => Some(ChromeCmd::Reload),
             (Key::F12, _) => Some(ChromeCmd::Devtools),
             (_, Some("i")) if ctrl && shift => Some(ChromeCmd::Devtools),
+            (_, Some("d")) if ctrl && !shift && !alt => Some(ChromeCmd::ToggleBookmark),
+            (_, Some("b")) if ctrl && !shift && !alt => {
+                let (x, y) = self.bookmarks_anchor();
+                Some(ChromeCmd::BookmarksMenu { x: x as f64, y: y as f64 })
+            }
+            (_, Some("p")) if alt && !ctrl && !shift => Some(ChromeCmd::Pip),
             (_, Some("h")) if ctrl => {
                 let (x, y) = self.history_anchor();
                 Some(ChromeCmd::HistoryMenu { x: x as f64, y: y as f64 })
@@ -915,7 +974,8 @@ impl Toolbar {
         busy |= drag_id.is_some();
 
         for h in [
-            Hit::NewTab, Hit::Min, Hit::Max, Hit::Close, Hit::Back, Hit::Forward, Hit::Reload, Hit::Omni, Hit::History, Hit::Devtools,
+            Hit::NewTab, Hit::Min, Hit::Max, Hit::Close, Hit::Back, Hit::Forward, Hit::Reload,
+            Hit::Omni, Hit::Star, Hit::Bookmarks, Hit::Pip, Hit::History, Hit::Theme, Hit::Devtools,
         ] {
             let target = if self.hover == h { 1.0 } else { 0.0 };
             let f = self.hover_fade.entry(hit_key(h)).or_insert(0.0);
@@ -992,6 +1052,7 @@ impl Toolbar {
         for (r, h, icon, on) in [
             (g.back, Hit::Back, Icon::Back, self.model.can_back),
             (g.fwd, Hit::Forward, Icon::Forward, self.model.can_forward),
+            (g.bookmarks, Hit::Bookmarks, Icon::Bookmarks, true),
             (g.hist, Hit::History, Icon::History, true),
         ] {
             if on {
@@ -999,16 +1060,36 @@ impl Toolbar {
             }
             c.icon(icon, r.x + 9.0, r.y + 9.0, 16.0, th.fg.with_alpha(disabled(on)));
         }
+        // Star (bookmark current page) button.
+        let can_star = !self.model.url.is_empty();
+        if self.model.bookmarked {
+            c.rrect(g.star.x, g.star.y, g.star.w, g.star.h, [9.0; 4], th.accent.with_alpha(0.14));
+        } else if can_star {
+            self.button_bg(&mut c, g.star, Hit::Star, 9.0, &th);
+        }
+        c.icon(
+            if self.model.bookmarked { Icon::StarFilled } else { Icon::Star },
+            g.star.x + 9.0,
+            g.star.y + 9.0,
+            16.0,
+            if self.model.bookmarked { th.accent } else { th.fg.with_alpha(disabled(can_star)) },
+        );
         self.button_bg(&mut c, g.reload, Hit::Reload, 9.0, &th);
         let m = self.load_morph;
         c.icon(Icon::Reload, g.reload.x + 9.0, g.reload.y + 9.0, 16.0, th.fg.with_alpha(1.0 - m));
         c.icon(Icon::Stop, g.reload.x + 9.0, g.reload.y + 9.0, 16.0, th.fg.with_alpha(m));
-        if self.model.devtools {
-            c.rrect(g.dev.x, g.dev.y, g.dev.w, g.dev.h, [9.0; 4], th.accent.with_alpha(0.14));
-        } else {
-            self.button_bg(&mut c, g.dev, Hit::Devtools, 9.0, &th);
+        for (r, h, icon, active) in [
+            (g.pip, Hit::Pip, Icon::Pip, self.model.pip),
+            (g.theme, Hit::Theme, Icon::Palette, self.model.brand == Brand::Uzaki),
+            (g.dev, Hit::Devtools, Icon::Code, self.model.devtools),
+        ] {
+            if active {
+                c.rrect(r.x, r.y, r.w, r.h, [9.0; 4], th.accent.with_alpha(0.14));
+            } else {
+                self.button_bg(&mut c, r, h, 9.0, &th);
+            }
+            c.icon(icon, r.x + 9.0, r.y + 9.0, 16.0, if active { th.accent } else { th.fg });
         }
-        c.icon(Icon::Code, g.dev.x + 9.0, g.dev.y + 9.0, 16.0, if self.model.devtools { th.accent } else { th.fg });
 
         self.draw_omni(&mut c, g.omni, &th);
 
@@ -1088,7 +1169,7 @@ impl Toolbar {
     fn draw_tab_content(&mut self, c: &mut Canvas, i: usize, x: f32, w: f32, alpha: f32, active: bool, th: &Theme) {
         let id = self.vis[i].id;
         let Some(info) = self.model.tabs.iter().find(|t| t.id == id) else { return };
-        let (title, favicon, loading) = (info.title.clone(), info.favicon.clone(), info.loading);
+        let (title, favicon, loading, pip) = (info.title.clone(), info.favicon.clone(), info.loading, info.pip);
         let hovered = matches!(self.hover, Hit::Tab(h) | Hit::TabClose(h) if h == id);
         let narrow = w < NARROW_W;
         let fg = if active || hovered { th.fg } else { th.dim }.with_alpha(alpha);
@@ -1096,18 +1177,23 @@ impl Toolbar {
         let icon_x = if narrow && !active { x + (w - 16.0) / 2.0 } else { x + 12.0 };
         let show_close = !self.vis[i].leaving && (active || hovered) && (!narrow || active) && w >= 44.0;
         let close = self.close_rect(&self.vis[i]);
-        // Favicon, spinner, or the Cederic badge.
+        // Favicon, spinner, or the Cederic/Uzaki badge.
         if loading {
             c.spinner(icon_x + 8.0, cy, 6.0, self.spin, th.accent.with_alpha(alpha));
         } else if favicon == BRAND_ICON {
             c.rrect(icon_x, cy - 8.0, 16.0, 16.0, [4.0; 4], th.accent.mix(th.accent2, 0.3).with_alpha(alpha));
-            let mut b = self.fonts.line("C", 11.0, Weight::BOLD, self.s);
+            let mut b = self.fonts.line(self.model.brand.badge_letter(), 11.0, Weight::BOLD, self.s);
             let bw = text_width(&b, self.s);
             c.text(&mut self.fonts, &mut b, icon_x + (16.0 - bw) / 2.0, cy - 7.5, Rgba(255, 255, 255, 255).with_alpha(alpha), f32::MAX, 0.0);
         } else if let Some(Some(img)) = self.icons.get(&favicon) {
             c.image(img, icon_x, cy - 8.0, 16.0, 16.0, alpha);
         } else {
             c.icon(Icon::Globe, icon_x, cy - 8.0, 16.0, th.faint.with_alpha(alpha));
+        }
+        if pip && !loading {
+            let ring = if active { th.toolbar } else { th.strip };
+            c.circle(icon_x + 14.5, cy + 6.5, 4.5, ring.with_alpha(alpha));
+            c.circle(icon_x + 14.5, cy + 6.5, 3.0, th.accent.with_alpha(alpha));
         }
         if !narrow {
             let s = self.s;
@@ -1242,7 +1328,11 @@ struct Geo {
     fwd: R,
     reload: R,
     omni: R,
+    star: R,
+    bookmarks: R,
+    pip: R,
     hist: R,
+    theme: R,
     dev: R,
     new_tab: R,
     min: R,
@@ -1262,7 +1352,7 @@ mod tests {
         for (name, dark, editing) in [("toolbar-dark", true, false), ("toolbar-light", false, false), ("toolbar-editing", true, true)] {
             let s = 2.0;
             let mut tb = Toolbar::new(dark, s, 1280.0);
-            let tab = |id, title: &str, favicon: &str, loading| TabInfo { id, title: title.into(), favicon: favicon.into(), loading };
+            let tab = |id, title: &str, favicon: &str, loading| TabInfo { id, title: title.into(), favicon: favicon.into(), loading, pip: false };
             tb.set_model(Model {
                 tabs: vec![
                     tab(1, "Rust Programming Language", "", false),
@@ -1300,7 +1390,7 @@ mod tests {
         let s = 2.0;
         let mut tb = Toolbar::new(true, s, 1280.0);
         let tabs = (1..=8)
-            .map(|id| TabInfo { id, title: format!("Some page title number {id}"), favicon: String::new(), loading: false })
+            .map(|id| TabInfo { id, title: format!("Some page title number {id}"), favicon: String::new(), loading: false, pip: false })
             .collect();
         tb.set_model(Model { tabs, active: 3, url: "https://example.com/some/path".into(), ..Model::default() });
         let mut pm = Pixmap::new((1280.0 * s) as u32, (HEIGHT * s) as u32).unwrap();

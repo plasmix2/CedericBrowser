@@ -31,6 +31,35 @@ impl Rgba {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Brand {
+    #[default]
+    Cederic,
+    Uzaki,
+}
+
+impl Brand {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Cederic => "Cederic",
+            Self::Uzaki => "Uzaki",
+        }
+    }
+    pub const fn badge_letter(self) -> &'static str {
+        match self {
+            Self::Cederic => "C",
+            Self::Uzaki => "U",
+        }
+    }
+    pub const fn search_host(self) -> &'static str {
+        match self {
+            Self::Cederic => "search.cederic.com",
+            Self::Uzaki => "search.uzaki.com",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub strip: Rgba,
@@ -42,6 +71,7 @@ pub struct Theme {
     pub field: Rgba,
     pub field_hover: Rgba,
     pub border: Rgba,
+    pub card: Rgba,
     pub accent: Rgba,
     pub accent2: Rgba,
     pub btn_hover: Rgba,
@@ -52,9 +82,14 @@ pub struct Theme {
 }
 
 impl Theme {
+    #[cfg(test)]
     pub fn new(dark: bool) -> Self {
-        if dark {
-            Self {
+        Self::for_brand(dark, Brand::Cederic)
+    }
+
+    pub fn for_brand(dark: bool, brand: Brand) -> Self {
+        match (brand, dark) {
+            (Brand::Cederic, true) => Self {
                 strip: Rgba::hex(0x18191d),
                 toolbar: Rgba::hex(0x26272c),
                 tab_hover: Rgba::hex(0x222328),
@@ -64,6 +99,7 @@ impl Theme {
                 field: Rgba::hex(0x18191d),
                 field_hover: Rgba::hex(0x1d1e22),
                 border: Rgba::hex(0x34363d),
+                card: Rgba::hex(0x2b2c32),
                 accent: Rgba::hex(0xff6a3d),
                 accent2: Rgba::hex(0xffb03d),
                 btn_hover: Rgba(255, 255, 255, 20),
@@ -71,9 +107,8 @@ impl Theme {
                 close: Rgba::hex(0xe81123),
                 warn: Rgba::hex(0xf0a03c),
                 selection: Rgba(255, 106, 61, 102),
-            }
-        } else {
-            Self {
+            },
+            (Brand::Cederic, false) => Self {
                 strip: Rgba::hex(0xdfe1e6),
                 toolbar: Rgba::hex(0xf7f7f9),
                 tab_hover: Rgba::hex(0xe9eaee),
@@ -83,6 +118,7 @@ impl Theme {
                 field: Rgba::hex(0xe9eaee),
                 field_hover: Rgba::hex(0xe2e3e8),
                 border: Rgba::hex(0xd2d4da),
+                card: Rgba(255, 255, 255, 255),
                 accent: Rgba::hex(0xff6a3d),
                 accent2: Rgba::hex(0xffb03d),
                 btn_hover: Rgba(0, 0, 0, 15),
@@ -90,7 +126,45 @@ impl Theme {
                 close: Rgba::hex(0xe81123),
                 warn: Rgba::hex(0xd9822b),
                 selection: Rgba(255, 106, 61, 90),
-            }
+            },
+            (Brand::Uzaki, true) => Self {
+                strip: Rgba::hex(0x151926),
+                toolbar: Rgba::hex(0x1f2537),
+                tab_hover: Rgba::hex(0x1a1f2e),
+                fg: Rgba::hex(0xeceff7),
+                dim: Rgba::hex(0x949eb8),
+                faint: Rgba::hex(0x5b647d),
+                field: Rgba::hex(0x151926),
+                field_hover: Rgba::hex(0x1a1f2e),
+                border: Rgba::hex(0x2e3750),
+                card: Rgba::hex(0x23293d),
+                accent: Rgba::hex(0x7366e6),
+                accent2: Rgba::hex(0x94a3f8),
+                btn_hover: Rgba(255, 255, 255, 20),
+                btn_press: Rgba(255, 255, 255, 33),
+                close: Rgba::hex(0xe81123),
+                warn: Rgba::hex(0xf0a03c),
+                selection: Rgba(115, 102, 230, 102),
+            },
+            (Brand::Uzaki, false) => Self {
+                strip: Rgba::hex(0xd8deed),
+                toolbar: Rgba::hex(0xeef1f8),
+                tab_hover: Rgba::hex(0xe2e7f3),
+                fg: Rgba::hex(0x181d2c),
+                dim: Rgba::hex(0x525c75),
+                faint: Rgba::hex(0x8c96b0),
+                field: Rgba::hex(0xe2e7f3),
+                field_hover: Rgba::hex(0xd8deed),
+                border: Rgba::hex(0xc5cee3),
+                card: Rgba::hex(0xf7f9fc),
+                accent: Rgba::hex(0x6a5acd),
+                accent2: Rgba::hex(0x94a3f8),
+                btn_hover: Rgba(0, 0, 0, 15),
+                btn_press: Rgba(0, 0, 0, 26),
+                close: Rgba::hex(0xe81123),
+                warn: Rgba::hex(0xd9822b),
+                selection: Rgba(106, 90, 205, 90),
+            },
         }
     }
 }
@@ -108,6 +182,11 @@ pub enum Icon {
     Info,
     Search,
     Globe,
+    Star,
+    StarFilled,
+    Bookmarks,
+    Pip,
+    Palette,
     History,
     Code,
     WinMin,
@@ -200,12 +279,25 @@ impl Canvas<'_> {
         let st = Stroke { width: width * k, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
         let t = Transform::from_row(k, 0.0, 0.0, k, x, y).post_scale(self.s, self.s);
         for p in paths.iter().flatten() {
+            if icon == Icon::StarFilled {
+                self.pm.fill_path(p, &c.paint(), FillRule::Winding, t, None);
+            }
             self.pm.stroke_path(p, &c.paint(), &st, t, None);
         }
         if icon == Icon::Info {
             // The dot of the "i".
             if let Some(p) = PathBuilder::from_circle(12.0, 8.0, 1.2) {
                 self.pm.fill_path(&p, &c.paint(), FillRule::Winding, t, None);
+            }
+        } else if icon == Icon::Pip {
+            if let Some(p) = rrect_path(12.5, 12.5, 8.5, 6.5, [1.5; 4]) {
+                self.pm.fill_path(&p, &c.paint(), FillRule::Winding, t, None);
+            }
+        } else if icon == Icon::Palette {
+            for (cx, cy) in [(8.0, 10.5), (10.5, 7.5), (14.5, 7.5)] {
+                if let Some(p) = PathBuilder::from_circle(cx, cy, 1.1) {
+                    self.pm.fill_path(&p, &c.paint(), FillRule::Winding, t, None);
+                }
             }
         }
     }
@@ -372,6 +464,50 @@ fn icon_paths(icon: Icon) -> (Vec<Option<Path>>, f32) {
                 Rect::from_xywh(7.5, 3.0, 9.0, 18.0).and_then(PathBuilder::from_oval),
             ],
             1.9,
+        ),
+        Icon::Star | Icon::StarFilled => (
+            vec![poly(&[
+                (12.0, 3.2),
+                (14.8, 8.9),
+                (21.0, 9.8),
+                (16.5, 14.2),
+                (17.6, 20.4),
+                (12.0, 17.4),
+                (6.4, 20.4),
+                (7.5, 14.2),
+                (3.0, 9.8),
+                (9.2, 8.9),
+                (12.0, 3.2),
+            ])],
+            1.8,
+        ),
+        Icon::Bookmarks => (
+            vec![poly(&[
+                (6.0, 4.0),
+                (18.0, 4.0),
+                (18.0, 20.5),
+                (12.0, 16.5),
+                (6.0, 20.5),
+                (6.0, 4.0),
+            ])],
+            1.9,
+        ),
+        Icon::Pip => (
+            vec![poly(&[
+                (21.0, 10.0),
+                (21.0, 5.5),
+                (3.0, 5.5),
+                (3.0, 18.5),
+                (10.5, 18.5),
+            ])],
+            1.9,
+        ),
+        Icon::Palette => (
+            vec![
+                PathBuilder::from_circle(12.0, 12.0, 9.0),
+                poly(&[(12.0, 21.0), (14.5, 17.5), (12.0, 14.5), (16.5, 13.5), (20.8, 12.0)]),
+            ],
+            1.8,
         ),
         Icon::History => {
             let mut pb = PathBuilder::new();

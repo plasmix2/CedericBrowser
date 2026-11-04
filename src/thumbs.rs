@@ -17,8 +17,6 @@ use crate::devtools;
 
 /// Thumbnail width in CSS pixels; the card shows it at about this size.
 const WIDTH: f64 = 320.0;
-/// While a tab stays active, refresh its thumbnail this often.
-const REFRESH: Duration = Duration::from_secs(10);
 
 pub enum Request {
     /// The tab now on screen (`None` while nothing should be captured, e.g. minimized).
@@ -27,6 +25,9 @@ pub enum Request {
     Capture(u32),
     /// The tab was closed.
     Forget(u32),
+    /// Evaluate `js` in `tab` with `userGesture: true` over CDP (needed for Picture-in-Picture
+    /// when triggered from the toolbar or popup WebView rather than inside the content page).
+    EvalGesture(u32, String),
 }
 
 pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send + 'static) -> mpsc::Sender<Request> {
@@ -34,22 +35,31 @@ pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send
     std::thread::spawn(move || {
         let mut targets: HashMap<u32, String> = HashMap::new();
         let mut active: Option<u32> = None;
-        loop {
-            let tab = match rx.recv_timeout(REFRESH) {
-                Ok(Request::Active(t)) => {
+        while let Ok(req) = rx.recv() {
+            let tab = match req {
+                Request::Active(t) => {
                     active = t;
                     continue;
                 }
-                Ok(Request::Forget(t)) => {
+                Request::Forget(t) => {
                     targets.remove(&t);
                     continue;
                 }
-                Ok(Request::Capture(t)) => t,
-                Err(mpsc::RecvTimeoutError::Timeout) => match active {
-                    Some(t) => t,
-                    None => continue,
-                },
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Request::EvalGesture(t, js) => {
+                    if let Some(port) = devtools::port(&data_dir) {
+                        let _ = targets
+                            .get(&t)
+                            .and_then(|id| eval_gesture(port, id, &js))
+                            .or_else(|| {
+                                let id = find_target(port, t)?;
+                                let res = eval_gesture(port, &id, &js);
+                                targets.insert(t, id);
+                                res
+                            });
+                    }
+                    continue;
+                }
+                Request::Capture(t) => t,
             };
             // Only the visible tab renders; a hidden one would give a stale or blank frame.
             if active != Some(tab) {
@@ -142,6 +152,20 @@ fn capture_at(port: u16, target: &str, width: f64) -> Option<tiny_skia::Pixmap> 
     Some(small)
 }
 
+/// Evaluates `js` in `target` with a synthesized user gesture (`userGesture: true`).
+fn eval_gesture(port: u16, target: &str, js: &str) -> Option<Value> {
+    let mut s = Session::open(port, target)?;
+    s.call(
+        "Runtime.evaluate",
+        json!({
+            "expression": js,
+            "userGesture": true,
+            "awaitPromise": true,
+            "returnByValue": true,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,7 +180,7 @@ mod tests {
         let js = std::env::var("CEDERIC_EVAL").unwrap_or_else(|_| "location.href".into());
         for id in devtools::page_targets(port).expect("targets") {
             let r = Session::open(port, &id)
-                .and_then(|mut s| s.call("Runtime.evaluate", json!({ "expression": js, "returnByValue": true, "awaitPromise": true })));
+                .and_then(|mut s| s.call("Runtime.evaluate", json!({ "expression": js, "returnByValue": true, "awaitPromise": true, "userGesture": true })));
             println!("{id}: {}", r.map(|v| v["result"]["value"].to_string()).unwrap_or_default());
         }
         // CEDERIC_SHOT=<dir>: also save a full-size PNG of every page, so a page's own

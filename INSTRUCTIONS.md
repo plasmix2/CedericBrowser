@@ -101,4 +101,15 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`gemini/picture-in-picture`** — Merged `origin/main` (native Rust toolbar/popups via `tiny-skia` + `cosmic-text` + `softbuffer`) and combined with Picture-in-Picture mode, Saved Bookmarks, and Theme/Persona switching (`Cederic` Orange default / `Uzaki` Slate Blue):
+  - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `src/gfx.rs`, `src/popups.rs`, `src/thumbs.rs`, `src/ui/newtab.html`, `README.md`, `INSTRUCTIONS.md`.
+  - **Key structs / enums / functions added or updated:**
+    - `gfx::Brand` (`Cederic`, `Uzaki`), `Theme::for_brand(dark, brand)` (with `card: Rgba`), and icons `Icon::Star`, `Icon::StarFilled`, `Icon::Bookmarks`, `Icon::Pip`, `Icon::Palette`.
+    - `ChromeCmd` appended variants: `Pip`, `ToggleBookmark`, `BookmarksMenu { x, y }`, `ThemeMenu { x, y }`.
+    - `Shortcut` appended variants: `Pip` (`Alt+P`), `Bookmark` (`Ctrl+D`), `Bookmarks` (`Ctrl+B`).
+    - `MenuAction` appended variants: `ToggleBookmark`, `DeleteBookmark(String)`, `SetBrand(Brand)`.
+    - `NewTabCmd` variants: `OpenBookmark { url }`, `DeleteBookmark { url }`, `SetBrand { brand }`.
+    - `Prefs` & `Bookmark` persisted to `%LOCALAPPDATA%\Cederic\prefs.json`.
+    - `thumbs.rs`: event-driven `rx.recv()` worker (no periodic `captureScreenshot` white-flash loop) combining `Pixmap` thumbnails with CDP `Runtime.evaluate(userGesture: true)` for `EvalGesture` (`Alt+P` / toolbar PiP).
+  - **What to preserve when merging:** Keep background tab PiP bounds (`rect(-10.0, -10.0, 1.0, 1.0)`) in `Browser::hide_tab` and `Browser::layout` so PiP video continues decoding when switching tabs; keep `Theme::for_brand` and `Prefs` sync across `toolbar`, `popups`, and `newtab.html`.
 - **`agy/agent-instructions`** — Added `INSTRUCTIONS.md` and wired `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` to reference it so both agents automatically sync via `git fetch --all`, communicate active branches/files, and merge `origin/main` cleanly.

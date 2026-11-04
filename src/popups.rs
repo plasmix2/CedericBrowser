@@ -22,7 +22,7 @@ use tao::{
 };
 use tiny_skia::Pixmap;
 
-use crate::gfx::{Canvas, Fonts, Icon, Rgba, Theme, attrs, text_width};
+use crate::gfx::{Brand, Canvas, Fonts, Icon, Rgba, Theme, attrs, text_width};
 
 /// Where hidden popups wait. Physical pixels: a logical position this far out would be scaled past
 /// what Windows accepts at high DPI, and the window would land at the screen's top-left instead.
@@ -115,9 +115,9 @@ pub struct Popups {
 }
 
 impl Popups {
-    pub fn new<T>(target: &EventLoopWindowTarget<T>, owner: &Window, dark: bool) -> Self {
-        let theme = Theme::new(dark);
-        let make = |kind| Popup::new(target, owner, kind, card_color(dark));
+    pub fn new<T>(target: &EventLoopWindowTarget<T>, owner: &Window, dark: bool, brand: Brand) -> Self {
+        let theme = Theme::for_brand(dark, brand);
+        let make = |kind| Popup::new(target, owner, kind, theme.card);
         Self {
             fonts: Fonts::load(),
             menu: make(Kind::Menu),
@@ -128,8 +128,15 @@ impl Popups {
         }
     }
 
-    pub fn set_dark(&mut self, dark: bool) {
-        self.theme = Theme::new(dark);
+    pub fn set_theme(&mut self, dark: bool, brand: Brand) {
+        self.theme = Theme::for_brand(dark, brand);
+        let c = self.theme.card;
+        for p in [&self.menu, &self.suggest, &self.preview] {
+            p.window.set_background_color(Some((c.0, c.1, c.2, 255)));
+            if p.open {
+                p.window.request_redraw();
+            }
+        }
     }
 
     fn get(&mut self, kind: Kind) -> &mut Popup {
@@ -298,10 +305,6 @@ impl Popups {
     }
 }
 
-fn card_color(dark: bool) -> Rgba {
-    if dark { Rgba::hex(0x2b2c32) } else { Rgba(255, 255, 255, 255) }
-}
-
 impl Popup {
     fn new<T>(target: &EventLoopWindowTarget<T>, owner: &Window, kind: Kind, card: Rgba) -> Self {
         let window = Rc::new(
@@ -395,7 +398,7 @@ fn layout(fonts: &mut Fonts, content: &Content, s: f32) -> (Vec<Row>, f32) {
 
 fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
     let dark = th.fg.0 > 128;
-    let bg = card_color(dark);
+    let bg = th.card;
     let hover_bg = if dark { Rgba(255, 255, 255, 20) } else { Rgba(0, 0, 0, 14) };
     let (w, h) = p.size;
     // Entrance: content eases in from slightly above while fading in over the card.

@@ -20,6 +20,7 @@ use std::{
     time::Instant,
 };
 
+use gfx::Brand;
 use history::{HistoryEntry, HistoryStore};
 use popups::{Card, Content, Kind as PopupKind, MenuEntry, Pick, Popups, SuggestEntry};
 use tiny_skia::Pixmap;
@@ -77,22 +78,87 @@ const BROWSER_ARGS: &str = "\
 /// `ContextRequest` over IPC.
 const SHORTCUT_SCRIPT: &str = r#"
 (() => {
+  let ctxVideo = null;
+  const videos = (root = document, out = []) => {
+    for (const v of root.querySelectorAll('video')) out.push(v);
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) videos(el.shadowRoot, out);
+    }
+    return out;
+  };
+  const usable = (v) => v instanceof HTMLVideoElement && v.isConnected && (v.readyState >= 1 || v.videoWidth > 0 || !!(v.currentSrc || v.src));
+  const videoAt = (x, y) => {
+    for (const el of document.elementsFromPoint(x, y)) {
+      if (usable(el)) return el;
+    }
+    return videos().find((v) => {
+      if (!usable(v)) return false;
+      const r = v.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+    }) || null;
+  };
+  const bestVideo = (preferCtx) => {
+    if (preferCtx && usable(ctxVideo)) return ctxVideo;
+    const list = videos().filter(usable);
+    if (!list.length) return null;
+    const score = (v) => {
+      const r = v.getBoundingClientRect();
+      const area = Math.max(0, r.width) * Math.max(0, r.height);
+      const playing = (!v.paused && !v.ended) ? 1e9 : 0;
+      return playing + (area || (v.videoWidth * v.videoHeight));
+    };
+    list.sort((a, b) => score(b) - score(a));
+    return list[0];
+  };
+  window.__cedericTogglePip = async (preferCtx = false) => {
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        window.ipc.postMessage('pip_off');
+        return true;
+      }
+      const v = bestVideo(preferCtx);
+      if (!v) return false;
+      v.disablePictureInPicture = false;
+      v.removeAttribute('disablepictureinpicture');
+      v.addEventListener('leavepictureinpicture', () => window.ipc.postMessage('pip_off'), { once: true });
+      await v.requestPictureInPicture();
+      window.ipc.postMessage('pip_on');
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+  window.addEventListener('enterpictureinpicture', () => window.ipc.postMessage('pip_on'), true);
+  window.addEventListener('leavepictureinpicture', () => window.ipc.postMessage('pip_off'), true);
+  window.addEventListener('pagehide', () => {
+    if (document.pictureInPictureElement) window.ipc.postMessage('pip_off');
+  }, true);
+
   const map = (e) => {
     const c = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
     if (c && k === 't') return 'new_tab';
     if (c && k === 'w') return 'close_tab';
     if (c && k === 'l') return 'focus_address';
     if (c && k === 'h') return 'history';
+    if (c && !e.shiftKey && !e.altKey && k === 'd') return 'bookmark';
+    if (c && !e.shiftKey && !e.altKey && k === 'b') return 'bookmarks';
     if (c && k === 'r' || e.key === 'F5') return 'reload';
     if (c && e.key === 'Tab') return e.shiftKey ? 'prev_tab' : 'next_tab';
     if (e.altKey && e.key === 'ArrowLeft') return 'back';
     if (e.altKey && e.key === 'ArrowRight') return 'forward';
+    if (e.altKey && !c && !e.shiftKey && k === 'p') return 'pip';
     if (e.key === 'F12' || (c && e.shiftKey && k === 'i')) return 'devtools';
     return null;
   };
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') window.ipc.postMessage('dismiss');
     const cmd = map(e);
+    if (cmd === 'pip') {
+      e.preventDefault(); e.stopPropagation();
+      window.__cedericTogglePip(false).then((ok) => { if (!ok) window.ipc.postMessage('pip'); });
+      return;
+    }
     if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); }
   }, true);
   // Popups never take focus, so a click in the page is what closes an open menu.
@@ -106,10 +172,13 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (t && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
     e.preventDefault();
     const a = t && t.closest('a[href]'), img = t && t.closest('img');
+    ctxVideo = videoAt(e.clientX, e.clientY) || bestVideo(false);
     window.ipc.postMessage(JSON.stringify({
       x: e.clientX, y: e.clientY, dpr: window.devicePixelRatio,
       link: a ? a.href : '', image: img ? (img.currentSrc || img.src) : '',
       selection: String(getSelection()).slice(0, 20000),
+      video: !!ctxVideo,
+      pip: !!document.pictureInPictureElement,
     }));
   });
 
@@ -129,35 +198,20 @@ const SHORTCUT_SCRIPT: &str = r#"
 })();
 "#;
 
-/// Shows Cederic's name and wordmark in place of Brave's on Brave Search.
+/// Shows Cederic's (or Uzaki's) name and wordmark in place of Brave's on Brave Search.
 const BRAND_SCRIPT: &str = r#"
 (() => {
   if (location.hostname !== 'search.brave.com') return;
-  // Every Brave logo is an <img> named brave-logo-* or alt "Brave logo"; the link around it gets
-  // the Cederic wordmark instead. Links to Brave's own products are hidden rather than renamed.
-  const css = `
-    img[src*="brave-logo" i], img[alt*="Brave logo" i], picture:has(img[alt*="Brave logo" i]) source,
-    .download-cta, .ask-brave-logo-divider, a[href*="//brave.com/"] { display: none !important; }
-    a:has(img[alt*="Brave logo" i]) { display: inline-flex !important; align-items: center;
-      justify-content: center; text-decoration: none !important; }
-    a:has(img[alt*="Brave logo" i])::after { content: "Cederic"; font: 700 24px/1 "Segoe UI Variable Display", "Segoe UI", system-ui;
-      letter-spacing: -.7px; background: linear-gradient(90deg, #ff6a3d, #ffb03d);
-      -webkit-background-clip: text; background-clip: text; color: transparent; padding: 2px 0; }
-    a.ntp-logo:has(img[alt*="Brave logo" i])::after { font-size: 64px; letter-spacing: -2.5px; padding-bottom: 6px; }
-    a.logo-wrapper:has(img[alt*="Brave logo" i])::after { content: "C"; display: grid; place-items: center;
-      width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(135deg, #ff6a3d, #ffb03d);
-      -webkit-background-clip: border-box; background-clip: border-box; color: #fff; font-size: 16px;
-      letter-spacing: 0; padding: 0; }`;
   const style = document.createElement('style');
-  style.textContent = css;
-  // Rename "Brave" in visible text and labels, but never inside what the user typed.
-  const re = /\bBrave\b/;
-  const fix = (s) => s.replace(/\bBrave\b/g, 'Cederic');
+  let brandName = 'Cederic';
+  const re = /\b(Brave|Cederic|Uzaki)\b/;
+  const fix = (s) => s.replace(/\b(Brave|Cederic|Uzaki)\b/g, brandName);
   const fixText = (n) => {
     const p = n.parentElement;
     if (p && !/^(SCRIPT|STYLE|TEXTAREA)$/.test(p.tagName) && re.test(n.data)) n.data = fix(n.data);
   };
   const scrub = (root) => {
+    if (!root) return;
     const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     for (let n; (n = walk.nextNode());) fixText(n);
     for (const el of root.querySelectorAll('[placeholder], [title], [aria-label], [alt]')) {
@@ -167,7 +221,30 @@ const BRAND_SCRIPT: &str = r#"
       }
     }
   };
-  // Runs before the document has a root element, so keep re-attaching until (and after) it exists.
+  window.__cedericSetBrand = (b) => {
+    const uzaki = b === 'uzaki';
+    brandName = uzaki ? 'Uzaki' : 'Cederic';
+    const letter = uzaki ? 'U' : 'C';
+    const grad = uzaki ? 'linear-gradient(90deg, #6a5acd, #94a3f8)' : 'linear-gradient(90deg, #ff6a3d, #ffb03d)';
+    const badgeGrad = uzaki ? 'linear-gradient(135deg, #6a5acd, #94a3f8)' : 'linear-gradient(135deg, #ff6a3d, #ffb03d)';
+    style.textContent = `
+      img[src*="brave-logo" i], img[alt*="Brave logo" i], img[alt*="Cederic logo" i], img[alt*="Uzaki logo" i],
+      picture:has(img[alt*="logo" i]) source,
+      .download-cta, .ask-brave-logo-divider, a[href*="//brave.com/"] { display: none !important; }
+      a:has(img[src*="brave-logo" i]), a:has(img[alt*="logo" i]) { display: inline-flex !important; align-items: center;
+        justify-content: center; text-decoration: none !important; }
+      a:has(img[src*="brave-logo" i])::after, a:has(img[alt*="logo" i])::after { content: "${brandName}"; font: 700 24px/1 "Segoe UI Variable Display", "Segoe UI", system-ui;
+        letter-spacing: -.7px; background: ${grad};
+        -webkit-background-clip: text; background-clip: text; color: transparent; padding: 2px 0; }
+      a.ntp-logo:has(img[src*="brave-logo" i])::after, a.ntp-logo:has(img[alt*="logo" i])::after { font-size: 64px; letter-spacing: -2.5px; padding-bottom: 6px; }
+      a.logo-wrapper:has(img[src*="brave-logo" i])::after, a.logo-wrapper:has(img[alt*="logo" i])::after { content: "${letter}"; display: grid; place-items: center;
+        width: 26px; height: 26px; border-radius: 8px; background: ${badgeGrad};
+        -webkit-background-clip: border-box; background-clip: border-box; color: #fff; font-size: 16px;
+        letter-spacing: 0; padding: 0; }`;
+    if (document.body) scrub(document.body);
+    if (document.title) document.title = fix(document.title);
+  };
+  window.__cedericSetBrand(window.__cedericBrand || 'cederic');
   const attach = () => {
     const root = document.head || document.documentElement;
     if (root && !style.isConnected) root.appendChild(style);
@@ -205,9 +282,8 @@ const FAVICON_SCRIPT: &str = r#"(() => {
   return location.protocol.startsWith('http') ? location.origin + '/favicon.ico' : '';
 })()"#;
 
-/// Brave Search is shown under Cederic's own name and icon.
+/// Brave Search is shown under Cederic's (or Uzaki's) own name and icon.
 const REAL_SEARCH_HOST: &str = "search.brave.com";
-const SHOWN_SEARCH_HOST: &str = "search.cederic.com";
 type TabId = u32;
 type Rgba = (u8, u8, u8, u8);
 
@@ -216,6 +292,7 @@ enum UserEvent {
     NewTab(TabId, NewTabCmd),
     PageMenu(TabId, ContextRequest),
     Thumb(TabId, Pixmap),
+    PipState(TabId, bool),
     UpgradeHttps(TabId, String),
     Title(TabId, String),
     Load(TabId, PageLoadEvent, String),
@@ -262,6 +339,10 @@ enum ChromeCmd {
     CloseWindow,
     Drag,
     ClearHistory,
+    Pip,
+    ToggleBookmark,
+    BookmarksMenu { x: f64, y: f64 },
+    ThemeMenu { x: f64, y: f64 },
 }
 
 /// Messages from the built-in New Tab page (accepted only while `tab.is_newtab` is true).
@@ -272,6 +353,9 @@ enum NewTabCmd {
     Search { input: String },
     DeleteHistory { id: u64 },
     ClearHistory,
+    OpenBookmark { url: String },
+    DeleteBookmark { url: String },
+    SetBrand { brand: Brand },
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -288,6 +372,9 @@ enum Shortcut {
     Forward,
     Devtools,
     Dismiss,
+    Pip,
+    Bookmark,
+    Bookmarks,
 }
 
 impl Shortcut {
@@ -304,6 +391,9 @@ impl Shortcut {
             "forward" => Self::Forward,
             "devtools" => Self::Devtools,
             "dismiss" => Self::Dismiss,
+            "pip" => Self::Pip,
+            "bookmark" => Self::Bookmark,
+            "bookmarks" => Self::Bookmarks,
             _ => return None,
         })
     }
@@ -318,6 +408,10 @@ struct ContextRequest {
     link: String,
     image: String,
     selection: String,
+    #[serde(default)]
+    video: bool,
+    #[serde(default)]
+    pip: bool,
 }
 
 impl ContextRequest {
@@ -342,6 +436,7 @@ enum MenuAction {
     NewTabRight(TabId),
     ReloadTab(TabId),
     Duplicate(TabId),
+    TogglePip(TabId, bool),
     CloseTab(TabId),
     CloseOthers(TabId),
     CloseRight(TabId),
@@ -355,6 +450,92 @@ enum MenuAction {
     Inspect,
     OpenUrl(String),
     ClearHistory,
+    ToggleBookmark,
+    DeleteBookmark(String),
+    SetBrand(Brand),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Bookmark {
+    title: String,
+    url: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct PrefsData {
+    #[serde(default)]
+    brand: Brand,
+    #[serde(default)]
+    bookmarks: Vec<Bookmark>,
+}
+
+struct Prefs {
+    path: PathBuf,
+    brand: Brand,
+    bookmarks: Vec<Bookmark>,
+}
+
+impl Prefs {
+    fn open(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join("prefs.json");
+        let data: PrefsData = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Self { path, brand: data.brand, bookmarks: data.bookmarks }
+    }
+
+    fn save(&self) {
+        let data = PrefsData { brand: self.brand, bookmarks: self.bookmarks.clone() };
+        if let Ok(json) = serde_json::to_string_pretty(&data) {
+            let tmp = self.path.with_extension("json.tmp");
+            if let Some(p) = self.path.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.path);
+            }
+        }
+    }
+
+    fn is_bookmarked(&self, url: &str) -> bool {
+        !url.is_empty() && self.bookmarks.iter().any(|b| b.url == url)
+    }
+
+    fn toggle_bookmark(&mut self, title: &str, url: &str) -> bool {
+        if url.is_empty() || url.starts_with("about:") || url.starts_with("data:") {
+            return false;
+        }
+        if let Some(pos) = self.bookmarks.iter().position(|b| b.url == url) {
+            self.bookmarks.remove(pos);
+            self.save();
+            false
+        } else {
+            let clean = title.trim();
+            let t = if clean.is_empty() || clean == "New Tab" {
+                host_of(url).unwrap_or(url).to_owned()
+            } else {
+                clean.chars().take(60).collect()
+            };
+            self.bookmarks.insert(0, Bookmark { title: t, url: url.to_owned() });
+            if self.bookmarks.len() > 100 {
+                self.bookmarks.truncate(100);
+            }
+            self.save();
+            true
+        }
+    }
+
+    fn remove_bookmark(&mut self, url: &str) -> bool {
+        let before = self.bookmarks.len();
+        self.bookmarks.retain(|b| b.url != url);
+        if self.bookmarks.len() != before {
+            self.save();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct MenuItem {
@@ -395,6 +576,7 @@ struct Tab {
     url: String,
     favicon: String,
     loading: bool,
+    pip: bool,
     is_newtab: bool,
     /// Still painted in the new-tab page color; switches to white once a real page loads.
     newtab_bg: bool,
@@ -404,6 +586,8 @@ struct Tab {
 
 #[derive(Serialize)]
 struct NewTabState<'a> {
+    brand: Brand,
+    bookmarks: &'a [Bookmark],
     history: &'a [HistoryEntry],
 }
 
@@ -439,6 +623,7 @@ struct Browser {
     active: usize,
     next_id: TabId,
     history: HistoryStore,
+    prefs: Prefs,
     https_upgrades: u64,
     context: WebContext,
     data_dir: PathBuf,
@@ -490,7 +675,12 @@ impl Browser {
     }
 
     fn newtab_color(&self) -> Rgba {
-        if self.dark { (29, 30, 34, 255) } else { (244, 244, 246, 255) }
+        match (self.dark, self.prefs.brand) {
+            (true, Brand::Uzaki) => (24, 29, 44, 255),
+            (false, Brand::Uzaki) => (237, 240, 247, 255),
+            (true, Brand::Cederic) => (29, 30, 34, 255),
+            (false, Brand::Cederic) => (244, 244, 246, 255),
+        }
     }
 
     /// Builds a hidden tab. It becomes visible when it is made the active tab.
@@ -499,6 +689,7 @@ impl Browser {
         self.next_id += 1;
         let bounds = self.content_bounds();
         let bg = self.newtab_color();
+        let brand_key = if self.prefs.brand == Brand::Uzaki { "uzaki" } else { "cederic" };
 
         let p_title = self.proxy.clone();
         let p_load = self.proxy.clone();
@@ -509,11 +700,11 @@ impl Browser {
         let mut builder = WebViewBuilder::new_with_web_context(&mut self.context)
             .with_bounds(bounds)
             .with_visible(false)
+            .with_initialization_script(format!(
+                "Object.defineProperty(window, '__cedericTab', {{ value: {id} }}); window.__cedericBrand = {brand_key:?};"
+            ))
             .with_initialization_script(SHORTCUT_SCRIPT)
             .with_initialization_script(BRAND_SCRIPT)
-            .with_initialization_script(format!(
-                "Object.defineProperty(window, '__cedericTab', {{ value: {id} }});"
-            ))
             .with_additional_browser_args(BROWSER_ARGS)
             .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
             .with_devtools(true)
@@ -540,7 +731,11 @@ impl Browser {
             })
             .with_ipc_handler(move |req| {
                 let body = req.body();
-                if let Some(s) = Shortcut::parse(body) {
+                if body == "pip_on" {
+                    let _ = p_ipc.send_event(UserEvent::PipState(id, true));
+                } else if body == "pip_off" {
+                    let _ = p_ipc.send_event(UserEvent::PipState(id, false));
+                } else if let Some(s) = Shortcut::parse(body) {
                     let _ = p_ipc.send_event(UserEvent::Shortcut(s));
                 } else if let Ok(cmd) = serde_json::from_str::<NewTabCmd>(body) {
                     let _ = p_ipc.send_event(UserEvent::NewTab(id, cmd));
@@ -562,6 +757,7 @@ impl Browser {
             url: url.unwrap_or_default().to_owned(),
             favicon: String::new(),
             loading: url.is_some(),
+            pip: false,
             is_newtab: url.is_none(),
             newtab_bg: url.is_none(),
             thumb: None,
@@ -680,8 +876,14 @@ impl Browser {
     /// bare window never shows through for a frame.
     fn hide_tab(&self, id: TabId) {
         if let Some(t) = self.index_of(id).map(|i| &self.tabs[i]) {
-            let _ = t.view.set_visible(false);
-            let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
+            if t.pip {
+                // Keep a tab with active Picture-in-Picture alive and decoding frames while
+                // parked outside the visible client area, so switching tabs never freezes PiP.
+                let _ = t.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
+            } else {
+                let _ = t.view.set_visible(false);
+                let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
+            }
         }
     }
 
@@ -716,8 +918,12 @@ impl Browser {
         self.window.request_redraw();
     }
 
-    fn push_newtab_state(view: &WebView, history: &HistoryStore) {
-        let state = NewTabState { history: history.entries() };
+    fn push_newtab_state(view: &WebView, prefs: &Prefs, history: &HistoryStore) {
+        let state = NewTabState {
+            brand: prefs.brand,
+            bookmarks: &prefs.bookmarks,
+            history: history.entries(),
+        };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
         }
@@ -725,6 +931,7 @@ impl Browser {
 
     fn sync_ui(&mut self) {
         let Some(tab) = self.active_tab() else { return };
+        let brand = self.prefs.brand;
         let model = toolbar::Model {
             tabs: self
                 .tabs
@@ -734,21 +941,26 @@ impl Browser {
                     title: t.title.clone(),
                     favicon: t.favicon.clone(),
                     loading: t.loading,
+                    pip: t.pip,
                 })
                 .collect(),
             active: tab.id,
-            url: display_url(&tab.url),
+            url: display_url(&tab.url, brand),
             can_back: tab.view.can_go_back().unwrap_or(false),
             can_forward: tab.view.can_go_forward().unwrap_or(false),
             loading: tab.loading,
             maximized: self.window.is_maximized(),
             devtools: self.devtools.open,
+            pip: self.tabs.iter().any(|t| t.pip),
+            bookmarked: self.prefs.is_bookmarked(&tab.url),
+            brand,
         };
         if tab.is_newtab {
-            Self::push_newtab_state(&tab.view, &self.history);
+            Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
         }
-        let title = if tab.title.is_empty() { "Cederic" } else { &tab.title };
-        self.window.set_title(&format!("{title} - Cederic"));
+        let brand_name = brand.name();
+        let title = if tab.title.is_empty() { brand_name } else { &tab.title };
+        self.window.set_title(&format!("{title} - {brand_name}"));
         self.toolbar.set_model(model);
         for url in self.toolbar.take_icon_requests() {
             let _ = self.icons_tx.send(url);
@@ -761,8 +973,12 @@ impl Browser {
         self.toolbar.set_size(scale, self.logical_size().width as f32);
         self.window.request_redraw();
         let bounds = self.content_bounds();
-        for tab in self.tabs.iter().chain(&self.spare) {
-            let _ = tab.view.set_bounds(bounds);
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let b = if i != self.active && tab.pip { rect(-10.0, -10.0, 1.0, 1.0) } else { bounds };
+            let _ = tab.view.set_bounds(b);
+        }
+        if let Some(spare) = &self.spare {
+            let _ = spare.view.set_bounds(bounds);
         }
         if let Some(v) = &self.devtools.view {
             let _ = v.set_bounds(self.devtools_bounds());
@@ -829,7 +1045,12 @@ impl Browser {
         }
         let Some(tab) = self.index_of(id).map(|i| &self.tabs[i]) else { return };
         let active = self.active_tab().map(|t| t.id) == Some(id);
-        let shown = display_url(&tab.url);
+        if !active
+            && let Some(cur) = self.active_tab()
+        {
+            let _ = self.thumbs_tx.send(thumbs::Request::Capture(cur.id));
+        }
+        let shown = display_url(&tab.url, self.prefs.brand);
         let card = Card {
             title: if tab.title.is_empty() { "New Tab".into() } else { tab.title.clone() },
             host: host_of(&shown).unwrap_or_default().to_owned(),
@@ -847,11 +1068,15 @@ impl Browser {
     fn tab_menu(&mut self, id: TabId, x: f64, y: f64) {
         let Some(idx) = self.index_of(id) else { return };
         let more = self.tabs.len() > 1;
+        let pip_label = if self.tabs[idx].pip { "Exit Picture in Picture" } else { "Picture in Picture" };
         let items = vec![
             MenuItem::new("New tab to the right", MenuAction::NewTabRight(id)),
             MenuItem::sep(),
             MenuItem::new("Reload", MenuAction::ReloadTab(id)).hint("Ctrl+R"),
             MenuItem::new("Duplicate", MenuAction::Duplicate(id)).enabled(!self.tabs[idx].url.is_empty()),
+            MenuItem::new(pip_label, MenuAction::TogglePip(id, false))
+                .hint("Alt+P")
+                .enabled(!self.tabs[idx].is_newtab),
             MenuItem::sep(),
             MenuItem::new("Close tab", MenuAction::CloseTab(id)).hint("Ctrl+W"),
             MenuItem::new("Close other tabs", MenuAction::CloseOthers(id)).enabled(more),
@@ -884,6 +1109,117 @@ impl Browser {
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
+    fn toggle_bookmark(&mut self) {
+        let Some((title, url)) = self.active_tab().map(|t| (t.title.clone(), t.url.clone())) else {
+            return;
+        };
+        self.prefs.toggle_bookmark(&title, &url);
+        self.sync_all_newtabs();
+        self.sync_ui();
+    }
+
+    fn sync_all_newtabs(&self) {
+        for tab in &self.tabs {
+            if tab.is_newtab {
+                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+            }
+        }
+        if let Some(spare) = &self.spare
+            && spare.is_newtab
+        {
+            Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
+        }
+    }
+
+    /// Saved bookmarks dropdown under the bookmarks button.
+    fn bookmarks_menu(&mut self, right: f64, y: f64) {
+        const MAX: usize = 14;
+        let (can_bookmark, is_bookmarked, active_url) = self
+            .active_tab()
+            .map(|t| {
+                let ok = !t.is_newtab && !t.url.is_empty() && t.url.starts_with("http");
+                (ok, self.prefs.is_bookmarked(&t.url), t.url.clone())
+            })
+            .unwrap_or((false, false, String::new()));
+
+        let mut items = Vec::new();
+        let toggle_label = if is_bookmarked { "Remove bookmark" } else { "Bookmark this page" };
+        items.push(
+            MenuItem::new(toggle_label, MenuAction::ToggleBookmark)
+                .hint("Ctrl+D")
+                .enabled(can_bookmark),
+        );
+        items.push(MenuItem::sep());
+
+        if self.prefs.bookmarks.is_empty() {
+            items.push(MenuItem::new("No saved bookmarks yet", MenuAction::ToggleBookmark).enabled(false));
+        } else {
+            for b in self.prefs.bookmarks.iter().take(MAX) {
+                let shown = display_url(&b.url, self.prefs.brand);
+                let host = host_of(&shown).unwrap_or_default().to_owned();
+                items.push(
+                    MenuItem::new(b.title.clone(), MenuAction::OpenUrl(b.url.clone())).hint(host),
+                );
+            }
+            if is_bookmarked && !active_url.is_empty() {
+                items.push(MenuItem::sep());
+                items.push(MenuItem::new(
+                    "Delete current bookmark",
+                    MenuAction::DeleteBookmark(active_url),
+                ));
+            }
+        }
+        self.show_menu(items, (right - 248.0).max(0.0), y);
+    }
+
+    /// Theme & persona dropdown under the palette button: switch between Cederic (Orange) and Uzaki (Slate Blue).
+    fn theme_menu(&mut self, right: f64, y: f64) {
+        let cur = self.prefs.brand;
+        let c_check = if cur == Brand::Cederic { "✓  Cederic (Orange)" } else { "   Cederic (Orange)" };
+        let u_check = if cur == Brand::Uzaki { "✓  Uzaki (Slate Blue)" } else { "   Uzaki (Slate Blue)" };
+        let items = vec![
+            MenuItem::new(c_check, MenuAction::SetBrand(Brand::Cederic)).hint("Default"),
+            MenuItem::new(u_check, MenuAction::SetBrand(Brand::Uzaki)).hint("Slate Blue"),
+        ];
+        self.show_menu(items, (right - 248.0).max(0.0), y);
+    }
+
+    fn set_brand(&mut self, brand: Brand) {
+        if self.prefs.brand == brand {
+            return;
+        }
+        self.prefs.brand = brand;
+        self.prefs.save();
+        self.toolbar.set_theme(self.dark, brand);
+        self.popups.set_theme(self.dark, brand);
+        let bg = self.newtab_color();
+        let brand_key = if brand == Brand::Uzaki { "uzaki" } else { "cederic" };
+        let js = format!(
+            "window.__cedericBrand = {brand_key:?}; window.__cedericSetBrand && window.__cedericSetBrand({brand_key:?});"
+        );
+        for tab in &mut self.tabs {
+            if tab.newtab_bg {
+                let _ = tab.view.set_background_color(bg);
+            }
+            if host_of(&tab.url) == Some(REAL_SEARCH_HOST) {
+                tab.title = tab
+                    .title
+                    .replace("Brave", brand.name())
+                    .replace("Cederic", brand.name())
+                    .replace("Uzaki", brand.name());
+            }
+            let _ = tab.view.evaluate_script(&js);
+        }
+        if let Some(spare) = &self.spare {
+            if spare.newtab_bg {
+                let _ = spare.view.set_background_color(bg);
+            }
+            let _ = spare.view.evaluate_script(&js);
+        }
+        self.sync_all_newtabs();
+        self.sync_ui();
+    }
+
     fn page_menu(&mut self, id: TabId, r: ContextRequest) {
         let Some(tab) = self.active_tab().filter(|t| t.id == id) else { return };
         let mut items = Vec::new();
@@ -897,6 +1233,11 @@ impl Browser {
             items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image)));
             items.push(MenuItem::sep());
         }
+        if r.video || r.pip || tab.pip {
+            let label = if r.pip || tab.pip { "Exit Picture in Picture" } else { "Picture in Picture" };
+            items.push(MenuItem::new(label, MenuAction::TogglePip(id, true)).hint("Alt+P"));
+            items.push(MenuItem::sep());
+        }
         let sel = r.selection.trim();
         if !sel.is_empty() {
             let short: String = sel.chars().take(24).collect();
@@ -906,11 +1247,13 @@ impl Browser {
             items.push(MenuItem::sep());
         }
         let (back, fwd) = (tab.view.can_go_back().unwrap_or(false), tab.view.can_go_forward().unwrap_or(false));
+        let web = tab.url.starts_with("http");
+        let bm_label = if self.prefs.is_bookmarked(&tab.url) { "Remove bookmark" } else { "Bookmark this page" };
         items.push(MenuItem::new("Back", MenuAction::Back).hint("Alt+←").enabled(back));
         items.push(MenuItem::new("Forward", MenuAction::Forward).hint("Alt+→").enabled(fwd));
         items.push(MenuItem::new("Reload", MenuAction::Reload).hint("Ctrl+R"));
+        items.push(MenuItem::new(bm_label, MenuAction::ToggleBookmark).hint("Ctrl+D").enabled(web));
         items.push(MenuItem::sep());
-        let web = tab.url.starts_with("http");
         items.push(MenuItem::new("View page source", MenuAction::ViewSource).enabled(web));
         items.push(MenuItem::new("Inspect", MenuAction::Inspect).hint("F12"));
 
@@ -937,6 +1280,7 @@ impl Browser {
                     let _ = self.open_tab(Some(url), Some(i + 1), true);
                 }
             }
+            MenuAction::TogglePip(id, prefer_ctx) => self.toggle_pip(Some(id), prefer_ctx),
             MenuAction::CloseTab(id) => {
                 if let Some(i) = self.index_of(id) {
                     self.close_tab(i);
@@ -977,6 +1321,14 @@ impl Browser {
             }
             MenuAction::OpenUrl(url) => self.navigate_active(&url),
             MenuAction::ClearHistory => self.handle_chrome(ChromeCmd::ClearHistory),
+            MenuAction::ToggleBookmark => self.toggle_bookmark(),
+            MenuAction::DeleteBookmark(url) => {
+                if self.prefs.remove_bookmark(&url) {
+                    self.sync_all_newtabs();
+                    self.sync_ui();
+                }
+            }
+            MenuAction::SetBrand(brand) => self.set_brand(brand),
         }
     }
 
@@ -1021,7 +1373,31 @@ impl Browser {
         self.popups.hide(PopupKind::Suggest);
     }
 
-    // ---------- DevTools ----------
+    // ---------- Picture-in-Picture & DevTools ----------
+
+    fn toggle_pip(&mut self, target: Option<TabId>, prefer_ctx: bool) {
+        let id = target.or_else(|| {
+            let active = self.active_tab()?;
+            if active.pip {
+                Some(active.id)
+            } else {
+                self.tabs.iter().find(|t| t.pip).map(|t| t.id).or(Some(active.id))
+            }
+        });
+        let Some(id) = id else { return };
+        let Some(i) = self.index_of(id) else { return };
+        if i != self.active && !self.tabs[i].pip {
+            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Normal);
+            let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
+            let _ = self.tabs[i].view.set_visible(true);
+        }
+        let js = format!("window.__cedericTogglePip && window.__cedericTogglePip({prefer_ctx})");
+        if devtools::port(&self.data_dir).is_some() {
+            let _ = self.thumbs_tx.send(thumbs::Request::EvalGesture(id, js));
+        } else {
+            let _ = self.tabs[i].view.evaluate_script(&js);
+        }
+    }
 
     fn toggle_devtools(&mut self) {
         self.devtools.open = !self.devtools.open;
@@ -1179,6 +1555,10 @@ impl Browser {
                 }
                 self.sync_ui();
             }
+            ChromeCmd::Pip => self.toggle_pip(None, false),
+            ChromeCmd::ToggleBookmark => self.toggle_bookmark(),
+            ChromeCmd::BookmarksMenu { x, y } => self.bookmarks_menu(x, y),
+            ChromeCmd::ThemeMenu { x, y } => self.theme_menu(x, y),
         }
     }
 
@@ -1222,6 +1602,12 @@ impl Browser {
                 self.toolbar.blur_address();
                 self.window.request_redraw();
             }
+            Shortcut::Pip => self.toggle_pip(None, false),
+            Shortcut::Bookmark => self.toggle_bookmark(),
+            Shortcut::Bookmarks => {
+                let (x, y) = self.toolbar.bookmarks_anchor();
+                self.bookmarks_menu(x as f64, y as f64);
+            }
         }
     }
 
@@ -1230,7 +1616,7 @@ impl Browser {
             && spare.id == id
         {
             if matches!(cmd, NewTabCmd::Ready) {
-                Self::push_newtab_state(&spare.view, &self.history);
+                Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
             }
             return;
         }
@@ -1239,7 +1625,7 @@ impl Browser {
             return;
         }
         match cmd {
-            NewTabCmd::Ready => Self::push_newtab_state(&self.tabs[i].view, &self.history),
+            NewTabCmd::Ready => Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history),
             NewTabCmd::Search { input } => {
                 if i != self.active {
                     self.switch_to(i);
@@ -1248,10 +1634,24 @@ impl Browser {
             }
             NewTabCmd::DeleteHistory { id: entry_id } => {
                 if self.history.remove(entry_id) {
+                    self.sync_all_newtabs();
                     self.sync_ui();
                 }
             }
             NewTabCmd::ClearHistory => self.handle_chrome(ChromeCmd::ClearHistory),
+            NewTabCmd::OpenBookmark { url } => {
+                if i != self.active {
+                    self.switch_to(i);
+                }
+                self.navigate_active(&url);
+            }
+            NewTabCmd::DeleteBookmark { url } => {
+                if self.prefs.remove_bookmark(&url) {
+                    self.sync_all_newtabs();
+                    self.sync_ui();
+                }
+            }
+            NewTabCmd::SetBrand { brand } => self.set_brand(brand),
         }
     }
 
@@ -1273,6 +1673,37 @@ impl Browser {
             UserEvent::Thumb(id, img) => {
                 if let Some(i) = self.index_of(id) {
                     self.tabs[i].thumb = Some(img);
+                }
+            }
+            UserEvent::PipState(id, on) => {
+                if let Some(i) = self.index_of(id) {
+                    let bounds = self.content_bounds();
+                    let active = self.active;
+                    if on {
+                        for (j, t) in self.tabs.iter_mut().enumerate() {
+                            if j != i && t.pip {
+                                t.pip = false;
+                                if j != active {
+                                    let _ = t.view.set_visible(false);
+                                    let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
+                                    let _ = t.view.set_bounds(bounds);
+                                }
+                            }
+                        }
+                    }
+                    self.tabs[i].pip = on;
+                    if i != active {
+                        if on {
+                            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Normal);
+                            let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
+                            let _ = self.tabs[i].view.set_visible(true);
+                        } else {
+                            let _ = self.tabs[i].view.set_visible(false);
+                            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Low);
+                            let _ = self.tabs[i].view.set_bounds(bounds);
+                        }
+                    }
+                    self.sync_ui();
                 }
             }
             UserEvent::UpgradeHttps(id, https_url) => {
@@ -1318,9 +1749,13 @@ impl Browser {
                     return;
                 }
                 if let Some(i) = self.index_of(id) {
+                    let brand_name = self.prefs.brand.name();
                     let t = &mut self.tabs[i];
                     t.title = if host_of(&t.url) == Some(REAL_SEARCH_HOST) {
-                        title.replace("Brave", "Cederic")
+                        title
+                            .replace("Brave", brand_name)
+                            .replace("Cederic", brand_name)
+                            .replace("Uzaki", brand_name)
                     } else {
                         title
                     };
@@ -1410,8 +1845,20 @@ impl Browser {
             }
             WindowEvent::CloseRequested => self.quit = true,
             WindowEvent::ThemeChanged(theme) => {
-                self.toolbar.set_dark(theme == Theme::Dark);
-                self.popups.set_dark(theme == Theme::Dark);
+                self.dark = theme == Theme::Dark;
+                self.toolbar.set_theme(self.dark, self.prefs.brand);
+                self.popups.set_theme(self.dark, self.prefs.brand);
+                let bg = self.newtab_color();
+                for tab in &self.tabs {
+                    if tab.newtab_bg {
+                        let _ = tab.view.set_background_color(bg);
+                    }
+                }
+                if let Some(spare) = &self.spare
+                    && spare.newtab_bg
+                {
+                    let _ = spare.view.set_background_color(bg);
+                }
                 self.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1510,7 +1957,12 @@ impl Browser {
             // The bare strip between page and DevTools is the splitter.
             let x0 = ((logical_w - dt - SPLITTER) * scale).floor().max(0.0) as u32;
             let gap = ((SPLITTER * scale).ceil() as u32 + 1).min(w.get().saturating_sub(x0));
-            let color = if self.dark { 0x18191d } else { 0xdfe1e6 };
+            let color = match (self.dark, self.prefs.brand) {
+                (true, Brand::Uzaki) => 0x131722,
+                (false, Brand::Uzaki) => 0xd9deec,
+                (true, Brand::Cederic) => 0x18191d,
+                (false, Brand::Cederic) => 0xdfe1e6,
+            };
             for row in bar_h as usize..h.get() as usize {
                 buf[row * width + x0 as usize..row * width + (x0 + gap) as usize].fill(color);
             }
@@ -1544,14 +1996,15 @@ fn parse_favicon(json: &str) -> Option<String> {
     (ok && url.len() < 64 * 1024).then_some(url)
 }
 
-/// The address-bar text for `url`; Brave Search is shown as Cederic's own search host.
-fn display_url(url: &str) -> String {
+/// The address-bar text for `url`; Brave Search is shown as Cederic's (or Uzaki's) own search host.
+fn display_url(url: &str, brand: Brand) -> String {
     if url.starts_with("about:") || url.starts_with("data:") {
         return String::new();
     }
     match url.split_once("://") {
         Some((scheme, rest)) if host_of(url) == Some(REAL_SEARCH_HOST) => {
-            format!("{scheme}://{SHOWN_SEARCH_HOST}{}", &rest[REAL_SEARCH_HOST.len()..])
+            let shown_host = brand.search_host();
+            format!("{scheme}://{shown_host}{}", &rest[REAL_SEARCH_HOST.len()..])
         }
         _ => url.to_owned(),
     }
@@ -1559,7 +2012,9 @@ fn display_url(url: &str) -> String {
 
 /// Maps the displayed search host back to the real one when the user edits and submits it.
 fn unmask(input: &str) -> String {
-    input.replace(SHOWN_SEARCH_HOST, REAL_SEARCH_HOST)
+    input
+        .replace(Brand::Cederic.search_host(), REAL_SEARCH_HOST)
+        .replace(Brand::Uzaki.search_host(), REAL_SEARCH_HOST)
 }
 
 fn host_of(url: &str) -> Option<&str> {
@@ -1576,9 +2031,13 @@ fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
+    let dir = data_dir();
+    let prefs = Prefs::open(&dir);
+    let brand = prefs.brand;
+
     let window = Rc::new(
         WindowBuilder::new()
-        .with_title("Cederic")
+        .with_title(brand.name())
         .with_decorations(false)
         .with_undecorated_shadow(true)
         .with_inner_size(LogicalSize::new(1280.0, 820.0))
@@ -1591,17 +2050,16 @@ fn main() -> wry::Result<()> {
     // of it is invalidated, and since the window does not clip its children that paints over the
     // pages and makes them flash. Everything that is not a page is drawn by `Browser::redraw`.
 
-    let dir = data_dir();
     let history = HistoryStore::open(&dir);
     let context = WebContext::new(Some(dir.clone()));
 
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
-    let toolbar = Toolbar::new(dark, scale as f32, size.width as f32);
+    let toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
-    let popups = Popups::new(&event_loop, &window, dark);
+    let popups = Popups::new(&event_loop, &window, dark, brand);
 
     let p_thumb = proxy.clone();
     let thumbs_tx = thumbs::spawn(dir.clone(), move |tab, img| {
@@ -1642,6 +2100,7 @@ fn main() -> wry::Result<()> {
         active: 0,
         next_id: 1,
         history,
+        prefs,
         https_upgrades: 0,
         context,
         data_dir: dir,
@@ -1700,4 +2159,61 @@ fn main() -> wry::Result<()> {
             *control_flow = ControlFlow::Exit;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brand_display_url_and_unmask() {
+        let raw = "https://search.brave.com/search?q=rust";
+        assert_eq!(
+            display_url(raw, Brand::Cederic),
+            "https://search.cederic.com/search?q=rust"
+        );
+        assert_eq!(
+            display_url(raw, Brand::Uzaki),
+            "https://search.uzaki.com/search?q=rust"
+        );
+        assert_eq!(unmask("https://search.cederic.com/search?q=rust"), raw);
+        assert_eq!(unmask("https://search.uzaki.com/search?q=rust"), raw);
+    }
+
+    #[test]
+    fn prefs_bookmark_and_brand_persistence() {
+        let dir = std::env::temp_dir().join(format!(
+            "cederic_prefs_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut prefs = Prefs::open(&dir);
+        assert_eq!(prefs.brand, Brand::Cederic);
+        assert!(prefs.bookmarks.is_empty());
+
+        assert!(prefs.toggle_bookmark("Rust Lang", "https://www.rust-lang.org/"));
+        assert!(prefs.is_bookmarked("https://www.rust-lang.org/"));
+        prefs.brand = Brand::Uzaki;
+        prefs.save();
+
+        let reloaded = Prefs::open(&dir);
+        assert_eq!(reloaded.brand, Brand::Uzaki);
+        assert_eq!(reloaded.bookmarks.len(), 1);
+        assert_eq!(reloaded.bookmarks[0].title, "Rust Lang");
+
+        let mut reloaded = reloaded;
+        assert!(!reloaded.toggle_bookmark("Rust Lang", "https://www.rust-lang.org/"));
+        assert!(!reloaded.is_bookmarked("https://www.rust-lang.org/"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shortcut_parsing_includes_pip_and_bookmarks() {
+        assert!(matches!(Shortcut::parse("pip"), Some(Shortcut::Pip)));
+        assert!(matches!(Shortcut::parse("bookmark"), Some(Shortcut::Bookmark)));
+        assert!(matches!(Shortcut::parse("bookmarks"), Some(Shortcut::Bookmarks)));
+    }
 }
