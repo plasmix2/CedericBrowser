@@ -941,6 +941,11 @@ impl Browser {
         }
         let Some(tab) = self.index_of(id).map(|i| &self.tabs[i]) else { return };
         let active = self.active_tab().map(|t| t.id) == Some(id);
+        if !active
+            && let Some(cur) = self.active_tab()
+        {
+            let _ = self.thumbs_tx.send(thumbs::Request::Capture(cur.id));
+        }
         let img = if active { "" } else { tab.thumb.as_str() };
         let shown = display_url(&tab.url);
         let host = host_of(&shown).unwrap_or_default();

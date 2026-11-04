@@ -15,11 +15,6 @@ use tungstenite::{Message, WebSocket};
 
 use crate::devtools;
 
-/// Thumbnail width in CSS pixels; the card shows it at about this size.
-const WIDTH: f64 = 320.0;
-/// While a tab stays active, refresh its thumbnail this often.
-const REFRESH: Duration = Duration::from_secs(4);
-
 pub enum Request {
     /// The tab now on screen (`None` while nothing should be captured, e.g. minimized).
     Active(Option<u32>),
@@ -37,17 +32,17 @@ pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, String) + Send + 'static)
     std::thread::spawn(move || {
         let mut targets: HashMap<u32, String> = HashMap::new();
         let mut active: Option<u32> = None;
-        loop {
-            let tab = match rx.recv_timeout(REFRESH) {
-                Ok(Request::Active(t)) => {
+        while let Ok(req) = rx.recv() {
+            let tab = match req {
+                Request::Active(t) => {
                     active = t;
                     continue;
                 }
-                Ok(Request::Forget(t)) => {
+                Request::Forget(t) => {
                     targets.remove(&t);
                     continue;
                 }
-                Ok(Request::EvalGesture(t, js)) => {
+                Request::EvalGesture(t, js) => {
                     if let Some(port) = devtools::port(&data_dir) {
                         let _ = targets
                             .get(&t)
@@ -61,12 +56,7 @@ pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, String) + Send + 'static)
                     }
                     continue;
                 }
-                Ok(Request::Capture(t)) => t,
-                Err(mpsc::RecvTimeoutError::Timeout) => match active {
-                    Some(t) => t,
-                    None => continue,
-                },
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Request::Capture(t) => t,
             };
             // Only the visible tab renders; a hidden one would give a stale or blank frame.
             if active != Some(tab) {
@@ -138,7 +128,9 @@ fn find_target(port: u16, tab: u32) -> Option<String> {
     })
 }
 
-/// A small JPEG of what the tab currently shows, as a data URL.
+/// A JPEG snapshot of what the tab currently shows, as a data URL.
+/// Avoids passing `clip` to `Page.captureScreenshot`, because Chromium implements `clip.scale` by
+/// overriding device emulation metrics on the live renderer, which flashes the viewport white.
 fn capture(port: u16, target: &str) -> Option<String> {
     let mut s = Session::open(port, target)?;
     let m = s.call("Page.getLayoutMetrics", json!({}))?;
@@ -147,14 +139,10 @@ fn capture(port: u16, target: &str) -> Option<String> {
     if w < 2.0 || h < 2.0 {
         return None;
     }
-    let clip = json!({
-        "x": vp["pageX"].as_f64().unwrap_or(0.0),
-        "y": vp["pageY"].as_f64().unwrap_or(0.0),
-        "width": w,
-        "height": h,
-        "scale": (WIDTH / w).min(1.0),
-    });
-    let r = s.call("Page.captureScreenshot", json!({ "format": "jpeg", "quality": 60, "clip": clip }))?;
+    let r = s.call(
+        "Page.captureScreenshot",
+        json!({ "format": "jpeg", "quality": 45, "optimizeForSpeed": true }),
+    )?;
     Some(format!("data:image/jpeg;base64,{}", r["data"].as_str()?))
 }
 
