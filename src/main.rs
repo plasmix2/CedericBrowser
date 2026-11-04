@@ -36,8 +36,8 @@ use tao::{
 };
 use wry::{
     BackgroundThrottlingPolicy, MemoryUsageLevel, NewWindowResponse, PageLoadEvent,
-    PermissionResponse, Rect, ScrollBarStyle, WebContext, WebView, WebViewBuilder,
-    WebViewBuilderExtWindows, WebViewExtWindows,
+    PermissionKind, PermissionResponse, Rect, ScrollBarStyle, WebContext, WebView,
+    WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows,
 };
 
 /// Height of the native tab strip + toolbar, in logical pixels.
@@ -49,23 +49,13 @@ const DEVTOOLS_MIN: f64 = 280.0;
 const NEWTAB_HTML: &str = include_str!("ui/newtab.html");
 
 /// Every WebView sharing a data directory must use identical arguments.
-/// Hardened for Wi-Fi search privacy:
-/// - Built-in Async DNS + DNS-over-HTTPS (DoH via Cloudflare) so local Wi-Fi routers cannot see DNS queries.
-/// - Encrypted Client Hello (ECH) + Post-Quantum Kyber TLS key exchange + HTTPS-First automatic upgrades.
-/// - WebRTC non-proxied UDP disabled to prevent local Wi-Fi IP leaks.
-/// - SmartScreen, DNS prefetch, hyperlink auditing (`<a ping>`), and background telemetry disabled.
-/// - A loopback-only DevTools port chosen by the OS, which the docked DevTools pane connects to.
 const BROWSER_ARGS: &str = "\
-    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate \
-    --enable-features=AsyncDns,DnsOverHttps<DoHTrial,EncryptedClientHello,PostQuantumKyber,HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,StrictOriginIsolation,BackForwardCache,ParallelDownloading \
-    --force-fieldtrials=DoHTrial/Group1 \
-    --force-fieldtrial-params=DoHTrial.Group1:server/https%3A%2F%2Fcloudflare-dns.com%2Fdns-query/method/POST \
-    --enable-quic \
-    --ssl-version-min=tls1.2 \
-    --dns-prefetch-disable \
+    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,UserAgentClientHint \
+    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,BackForwardCache,ParallelDownloading,CanvasOopRasterization \
+    --autoplay-policy=no-user-gesture-required \
+    --enable-gpu-rasterization \
+    --enable-zero-copy \
     --no-pings \
-    --reduced-referrer-granularity \
-    --disable-background-networking \
     --disable-domain-reliability \
     --disable-client-side-phishing-detection \
     --disable-sync \
@@ -78,6 +68,7 @@ const BROWSER_ARGS: &str = "\
 /// `ContextRequest` over IPC.
 const SHORTCUT_SCRIPT: &str = r#"
 (() => {
+  if (window !== window.top) return;
   let ctxVideo = null;
   const videos = (root = document, out = []) => {
     for (const v of root.querySelectorAll('video')) out.push(v);
@@ -110,7 +101,7 @@ const SHORTCUT_SCRIPT: &str = r#"
     list.sort((a, b) => score(b) - score(a));
     return list[0];
   };
-  window.__cedericTogglePip = async (preferCtx = false) => {
+  const togglePip = async (preferCtx = false) => {
     try {
       if (document.pictureInPictureElement) {
         await document.exitPictureInPicture();
@@ -156,7 +147,7 @@ const SHORTCUT_SCRIPT: &str = r#"
     const cmd = map(e);
     if (cmd === 'pip') {
       e.preventDefault(); e.stopPropagation();
-      window.__cedericTogglePip(false).then((ok) => { if (!ok) window.ipc.postMessage('pip'); });
+      togglePip(false).then((ok) => { if (!ok) window.ipc.postMessage('pip'); });
       return;
     }
     if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); }
@@ -235,30 +226,59 @@ const SHORTCUT_SCRIPT: &str = r#"
     };
     img.src = rawUrl;
   };
-  if (!window.__cedericApplyBgUrl) window.__cedericApplyBgUrl = (u) => sendBg(u, false);
-  if (!window.__cedericOpenBgPicker) {
-    window.__cedericOpenBgPicker = () => {
-      const existing = document.getElementById('bg-file');
-      if (existing) { existing.click(); return; }
-      const inp = document.createElement('input');
-      inp.type = 'file';
-      inp.accept = 'image/*';
-      inp.style.display = 'none';
-      inp.onchange = () => {
-        const f = inp.files && inp.files[0];
-        if (f && f.type.startsWith('image/')) {
-          const reader = new FileReader();
-          const keepGif = f.type === 'image/gif' && f.size <= 4 * 1024 * 1024;
-          reader.onload = () => {
-            if (typeof reader.result === 'string') sendBg(reader.result, keepGif);
-          };
-          reader.readAsDataURL(f);
-        }
-        inp.remove();
-      };
-      (document.body || document.documentElement).appendChild(inp);
-      inp.click();
+  const openBgPicker = () => {
+    const existing = document.getElementById('bg-file');
+    if (existing) { existing.click(); return; }
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = 'image/*';
+    inp.style.display = 'none';
+    inp.onchange = () => {
+      const f = inp.files && inp.files[0];
+      if (f && f.type.startsWith('image/')) {
+        const reader = new FileReader();
+        const keepGif = f.type === 'image/gif' && f.size <= 4 * 1024 * 1024;
+        reader.onload = () => {
+          if (typeof reader.result === 'string') sendBg(reader.result, keepGif);
+        };
+        reader.readAsDataURL(f);
+      }
+      inp.remove();
     };
+    (document.body || document.documentElement).appendChild(inp);
+    inp.click();
+  };
+  document.addEventListener('cederic:act', (e) => {
+    const d = e.detail;
+    if (!d) return;
+    if (d.cmd === 'pip') togglePip(!!d.preferCtx);
+    else if (d.cmd === 'pick_bg') openBgPicker();
+    else if (d.cmd === 'apply_bg' && d.url) sendBg(d.url, false);
+  });
+
+  if (location.hostname === 'www.youtube.com' || location.hostname === 'm.youtube.com') {
+    let lastPos = 0, lastRecover = 0;
+    setInterval(() => {
+      const v = document.querySelector('video');
+      if (v && v.currentTime > 1 && !v.paused) lastPos = v.currentTime;
+      const err = document.querySelector('.ytp-error');
+      if (err && err.offsetParent !== null && lastPos > 1 && Date.now() - lastRecover > 8000) {
+        lastRecover = Date.now();
+        const p = document.getElementById('movie_player');
+        if (p && typeof p.loadVideoById === 'function' && typeof p.getVideoData === 'function') {
+          const vd = p.getVideoData();
+          if (vd && vd.video_id) {
+            p.loadVideoById(vd.video_id, Math.max(0, lastPos - 0.5));
+            return;
+          }
+        }
+        const u = new URL(location.href);
+        if (u.pathname === '/watch' && u.searchParams.get('v')) {
+          u.searchParams.set('t', Math.floor(lastPos) + 's');
+          location.replace(u.toString());
+        }
+      }
+    }, 1000);
   }
 })();
 "#;
@@ -838,7 +858,7 @@ impl Browser {
             .with_bounds(bounds)
             .with_visible(false)
             .with_initialization_script(format!(
-                "Object.defineProperty(window, '__cedericTab', {{ value: {id} }}); window.__cedericBrand = {brand_key:?};"
+                "if (window === window.top && location.hostname === 'search.brave.com') window.__cedericBrand = {brand_key:?};"
             ))
             .with_initialization_script(SHORTCUT_SCRIPT)
             .with_initialization_script(BRAND_SCRIPT)
@@ -847,8 +867,14 @@ impl Browser {
             .with_devtools(true)
             .with_hotkeys_zoom(true)
             .with_general_autofill_enabled(false)
-            .with_background_throttling(BackgroundThrottlingPolicy::Suspend)
-            .with_permission_handler(|_kind| PermissionResponse::Deny)
+            .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
+            .with_permission_handler(|kind| match kind {
+                PermissionKind::Microphone
+                | PermissionKind::Camera
+                | PermissionKind::Geolocation
+                | PermissionKind::Notifications => PermissionResponse::Deny,
+                _ => PermissionResponse::Allow,
+            })
             .with_navigation_handler(move |nav_url| {
                 if let Some(https_url) = input::upgrade_to_https(&nav_url) {
                     let _ = p_nav.send_event(UserEvent::UpgradeHttps(id, https_url));
@@ -1013,9 +1039,9 @@ impl Browser {
     /// bare window never shows through for a frame.
     fn hide_tab(&self, id: TabId) {
         if let Some(t) = self.index_of(id).map(|i| &self.tabs[i]) {
-            if t.pip {
-                // Keep a tab with active Picture-in-Picture alive and decoding frames while
-                // parked outside the visible client area, so switching tabs never freezes PiP.
+            if t.pip || t.url.contains("youtube.com") || t.url.contains("youtu.be") {
+                // Keep a tab with active Picture-in-Picture or YouTube playback alive while
+                // parked outside the visible client area, so switching tabs never drops video/audio.
                 let _ = t.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             } else {
                 let _ = t.view.set_visible(false);
@@ -1185,6 +1211,8 @@ impl Browser {
         let active = self.active_tab().map(|t| t.id) == Some(id);
         if !active
             && let Some(cur) = self.active_tab()
+            && !cur.url.contains("youtube.com")
+            && !cur.url.contains("youtu.be")
         {
             let _ = self.thumbs_tx.send(thumbs::Request::Capture(cur.id));
         }
@@ -1336,13 +1364,8 @@ impl Browser {
     }
 
     fn choose_background(&mut self) {
-        let Some(id) = self.active_tab().map(|t| t.id) else { return };
-        let js = "window.__cedericOpenBgPicker && window.__cedericOpenBgPicker()".to_owned();
-        if devtools::port(&self.data_dir).is_some() {
-            let _ = self.thumbs_tx.send(thumbs::Request::EvalGesture(id, js));
-        } else {
-            self.with_active(|v| v.evaluate_script(&js));
-        }
+        let js = "document.dispatchEvent(new CustomEvent('cederic:act', { detail: { cmd: 'pick_bg' } }))";
+        self.with_active(|v| v.evaluate_script(js));
     }
 
     fn set_brand(&mut self, brand: Brand) {
@@ -1495,7 +1518,7 @@ impl Browser {
             MenuAction::SetBackgroundUrl(url) => {
                 self.apply_background(Some(url.clone()), None);
                 if let Ok(u) = serde_json::to_string(&url) {
-                    let js = format!("window.__cedericApplyBgUrl && window.__cedericApplyBgUrl({u})");
+                    let js = format!("document.dispatchEvent(new CustomEvent('cederic:act', {{ detail: {{ cmd: 'apply_bg', url: {u} }} }}))");
                     self.with_active(|v| v.evaluate_script(&js));
                 }
             }
@@ -1562,12 +1585,8 @@ impl Browser {
             let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             let _ = self.tabs[i].view.set_visible(true);
         }
-        let js = format!("window.__cedericTogglePip && window.__cedericTogglePip({prefer_ctx})");
-        if devtools::port(&self.data_dir).is_some() {
-            let _ = self.thumbs_tx.send(thumbs::Request::EvalGesture(id, js));
-        } else {
-            let _ = self.tabs[i].view.evaluate_script(&js);
-        }
+        let js = format!("document.dispatchEvent(new CustomEvent('cederic:act', {{ detail: {{ cmd: 'pip', preferCtx: {prefer_ctx} }} }}))");
+        let _ = self.tabs[i].view.evaluate_script(&js);
     }
 
     fn toggle_devtools(&mut self) {
@@ -1974,7 +1993,9 @@ impl Browser {
                     tab.title = host_of(&tab.url).unwrap_or("New Tab").to_owned();
                 }
                 if !started {
-                    let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
+                    if !tab.url.contains("youtube.com") && !tab.url.contains("youtu.be") {
+                        let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
+                    }
                     let proxy = self.proxy.clone();
                     let _ = tab.view.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
                         if let Some(icon) = parse_favicon(&res) {
