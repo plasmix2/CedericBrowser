@@ -2,21 +2,37 @@
 
 mod crypto;
 mod devtools;
+mod favicons;
+mod gfx;
 mod history;
 mod input;
+mod pacer;
+mod popups;
 mod suggest;
 mod thumbs;
+mod toolbar;
 
-use std::{path::PathBuf, sync::mpsc::Sender};
+use std::{
+    num::NonZeroU32,
+    path::PathBuf,
+    rc::Rc,
+    sync::mpsc::Sender,
+    time::Instant,
+};
 
+use gfx::Brand;
 use history::{HistoryEntry, HistoryStore};
+use popups::{Card, Content, Kind as PopupKind, MenuEntry, Pick, Popups, SuggestEntry};
+use tiny_skia::Pixmap;
+use toolbar::{BRAND_ICON, Toolbar};
 use serde::{Deserialize, Serialize};
 use tao::{
     dpi::{LogicalPosition, LogicalSize},
-    event::{ElementState, Event, MouseButton, WindowEvent},
-    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget},
-    platform::windows::{WindowBuilderExtWindows, WindowExtWindows},
-    window::{CursorIcon, ResizeDirection, Theme, Window, WindowBuilder, WindowId},
+    event::{ElementState, Event, MouseButton, StartCause, WindowEvent},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
+    platform::windows::WindowBuilderExtWindows,
+    keyboard::ModifiersState,
+    window::{CursorIcon, Theme, Window, WindowBuilder, WindowId},
 };
 use wry::{
     BackgroundThrottlingPolicy, MemoryUsageLevel, NewWindowResponse, PageLoadEvent,
@@ -24,15 +40,13 @@ use wry::{
     WebViewBuilderExtWindows, WebViewExtWindows,
 };
 
-/// Base height of the tab strip + toolbar, in logical pixels.
-const CHROME_HEIGHT: f64 = 84.0;
+/// Height of the native tab strip + toolbar, in logical pixels.
+const CHROME_HEIGHT: f64 = toolbar::HEIGHT as f64;
 /// Width of the draggable gap between the page and the DevTools pane.
 const SPLITTER: f64 = 5.0;
 const DEVTOOLS_MIN: f64 = 280.0;
 
-const CHROME_HTML: &str = include_str!("ui/chrome.html");
 const NEWTAB_HTML: &str = include_str!("ui/newtab.html");
-const POPUP_HTML: &str = include_str!("ui/popup.html");
 
 /// Every WebView sharing a data directory must use identical arguments.
 /// Hardened for Wi-Fi search privacy:
@@ -127,6 +141,8 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (c && k === 'w') return 'close_tab';
     if (c && k === 'l') return 'focus_address';
     if (c && k === 'h') return 'history';
+    if (c && !e.shiftKey && !e.altKey && k === 'd') return 'bookmark';
+    if (c && !e.shiftKey && !e.altKey && k === 'b') return 'bookmarks';
     if (c && k === 'r' || e.key === 'F5') return 'reload';
     if (c && e.key === 'Tab') return e.shiftKey ? 'prev_tab' : 'next_tab';
     if (e.altKey && e.key === 'ArrowLeft') return 'back';
@@ -182,35 +198,20 @@ const SHORTCUT_SCRIPT: &str = r#"
 })();
 "#;
 
-/// Shows Cederic's name and wordmark in place of Brave's on Brave Search.
+/// Shows Cederic's (or Uzaki's) name and wordmark in place of Brave's on Brave Search.
 const BRAND_SCRIPT: &str = r#"
 (() => {
   if (location.hostname !== 'search.brave.com') return;
-  // Every Brave logo is an <img> named brave-logo-* or alt "Brave logo"; the link around it gets
-  // the Cederic wordmark instead. Links to Brave's own products are hidden rather than renamed.
-  const css = `
-    img[src*="brave-logo" i], img[alt*="Brave logo" i], picture:has(img[alt*="Brave logo" i]) source,
-    .download-cta, .ask-brave-logo-divider, a[href*="//brave.com/"] { display: none !important; }
-    a:has(img[alt*="Brave logo" i]) { display: inline-flex !important; align-items: center;
-      justify-content: center; text-decoration: none !important; }
-    a:has(img[alt*="Brave logo" i])::after { content: "Cederic"; font: 700 24px/1 "Segoe UI Variable Display", "Segoe UI", system-ui;
-      letter-spacing: -.7px; background: linear-gradient(90deg, #ff6a3d, #ffb03d);
-      -webkit-background-clip: text; background-clip: text; color: transparent; padding: 2px 0; }
-    a.ntp-logo:has(img[alt*="Brave logo" i])::after { font-size: 64px; letter-spacing: -2.5px; padding-bottom: 6px; }
-    a.logo-wrapper:has(img[alt*="Brave logo" i])::after { content: "C"; display: grid; place-items: center;
-      width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(135deg, #ff6a3d, #ffb03d);
-      -webkit-background-clip: border-box; background-clip: border-box; color: #fff; font-size: 16px;
-      letter-spacing: 0; padding: 0; }`;
   const style = document.createElement('style');
-  style.textContent = css;
-  // Rename "Brave" in visible text and labels, but never inside what the user typed.
-  const re = /\bBrave\b/;
-  const fix = (s) => s.replace(/\bBrave\b/g, 'Cederic');
+  let brandName = 'Cederic';
+  const re = /\b(Brave|Cederic|Uzaki)\b/;
+  const fix = (s) => s.replace(/\b(Brave|Cederic|Uzaki)\b/g, brandName);
   const fixText = (n) => {
     const p = n.parentElement;
     if (p && !/^(SCRIPT|STYLE|TEXTAREA)$/.test(p.tagName) && re.test(n.data)) n.data = fix(n.data);
   };
   const scrub = (root) => {
+    if (!root) return;
     const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     for (let n; (n = walk.nextNode());) fixText(n);
     for (const el of root.querySelectorAll('[placeholder], [title], [aria-label], [alt]')) {
@@ -220,7 +221,30 @@ const BRAND_SCRIPT: &str = r#"
       }
     }
   };
-  // Runs before the document has a root element, so keep re-attaching until (and after) it exists.
+  window.__cedericSetBrand = (b) => {
+    const uzaki = b === 'uzaki';
+    brandName = uzaki ? 'Uzaki' : 'Cederic';
+    const letter = uzaki ? 'U' : 'C';
+    const grad = uzaki ? 'linear-gradient(90deg, #6a5acd, #94a3f8)' : 'linear-gradient(90deg, #ff6a3d, #ffb03d)';
+    const badgeGrad = uzaki ? 'linear-gradient(135deg, #6a5acd, #94a3f8)' : 'linear-gradient(135deg, #ff6a3d, #ffb03d)';
+    style.textContent = `
+      img[src*="brave-logo" i], img[alt*="Brave logo" i], img[alt*="Cederic logo" i], img[alt*="Uzaki logo" i],
+      picture:has(img[alt*="logo" i]) source,
+      .download-cta, .ask-brave-logo-divider, a[href*="//brave.com/"] { display: none !important; }
+      a:has(img[src*="brave-logo" i]), a:has(img[alt*="logo" i]) { display: inline-flex !important; align-items: center;
+        justify-content: center; text-decoration: none !important; }
+      a:has(img[src*="brave-logo" i])::after, a:has(img[alt*="logo" i])::after { content: "${brandName}"; font: 700 24px/1 "Segoe UI Variable Display", "Segoe UI", system-ui;
+        letter-spacing: -.7px; background: ${grad};
+        -webkit-background-clip: text; background-clip: text; color: transparent; padding: 2px 0; }
+      a.ntp-logo:has(img[src*="brave-logo" i])::after, a.ntp-logo:has(img[alt*="logo" i])::after { font-size: 64px; letter-spacing: -2.5px; padding-bottom: 6px; }
+      a.logo-wrapper:has(img[src*="brave-logo" i])::after, a.logo-wrapper:has(img[alt*="logo" i])::after { content: "${letter}"; display: grid; place-items: center;
+        width: 26px; height: 26px; border-radius: 8px; background: ${badgeGrad};
+        -webkit-background-clip: border-box; background-clip: border-box; color: #fff; font-size: 16px;
+        letter-spacing: 0; padding: 0; }`;
+    if (document.body) scrub(document.body);
+    if (document.title) document.title = fix(document.title);
+  };
+  window.__cedericSetBrand(window.__cedericBrand || 'cederic');
   const attach = () => {
     const root = document.head || document.documentElement;
     if (root && !style.isConnected) root.appendChild(style);
@@ -249,55 +273,49 @@ window.addEventListener('keydown', (e) => {
 }, true);
 "#;
 
-/// Finds the page's favicon; runs in the content page after it loads.
+/// Finds the page's favicon; runs in the content page after it loads. The tab strip can decode
+/// PNG and ICO, so those are preferred over SVG, with the site's /favicon.ico as the fallback.
 const FAVICON_SCRIPT: &str = r#"(() => {
-  const l = document.querySelector('link[rel~="icon"], link[rel="shortcut icon"], link[rel="apple-touch-icon"]');
-  return l ? l.href : (location.protocol.startsWith('http') ? location.origin + '/favicon.ico' : '');
+  const links = [...document.querySelectorAll('link[rel~="icon"], link[rel="shortcut icon"], link[rel="apple-touch-icon"]')];
+  const raster = links.find((l) => !/svg/i.test(l.type) && !/\.svg(\?|#|$)/i.test(l.href));
+  if (raster) return raster.href;
+  return location.protocol.startsWith('http') ? location.origin + '/favicon.ico' : '';
 })()"#;
 
-/// Brave Search is shown under Cederic's own name and icon.
+/// Brave Search is shown under Cederic's (or Uzaki's) own name and icon.
 const REAL_SEARCH_HOST: &str = "search.brave.com";
-const SHOWN_SEARCH_HOST: &str = "search.cederic.com";
-const CEDERIC_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E\
-%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ff6a3d'/%3E\
-%3Cstop offset='1' stop-color='%23ffb03d'/%3E%3C/linearGradient%3E%3C/defs%3E\
-%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Ctext x='16' y='23' font-family='Segoe UI,sans-serif' \
-font-size='20' font-weight='700' fill='white' text-anchor='middle'%3EC%3C/text%3E%3C/svg%3E";
-
-/// Where never-hidden popups wait while they are not in use.
-const PARKED: LogicalPosition<f64> = LogicalPosition::new(-32000.0, -32000.0);
-
 type TabId = u32;
 type Rgba = (u8, u8, u8, u8);
 
 enum UserEvent {
-    Chrome(ChromeCmd),
     Shortcut(Shortcut),
     NewTab(TabId, NewTabCmd),
     PageMenu(TabId, ContextRequest),
-    Popup(PopupCmd, PopupKind),
-    Thumb(TabId, String),
+    Thumb(TabId, Pixmap),
     PipState(TabId, bool),
     UpgradeHttps(TabId, String),
     Title(TabId, String),
     Load(TabId, PageLoadEvent, String),
     Favicon(TabId, String),
+    /// A favicon was fetched and decoded (or failed to) for the tab strip.
+    IconLoaded(String, Option<Pixmap>),
     OpenInNewTab(String),
     Suggestions(suggest::Response),
     DevtoolsTarget { tab: TabId, old_title: String, url: Option<String> },
     Prewarm,
-    /// Sent shortly after the main window loses focus, once it is known where focus went.
-    FocusCheck,
+    /// Frame tick from the pacer while the UI animates.
+    Frame,
 }
 
-/// Messages from the browser UI (trusted, our own HTML).
-#[derive(Debug, Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
+/// What the browser chrome (the native toolbar, menus) asks the browser to do.
+#[derive(Debug)]
 enum ChromeCmd {
     Navigate { input: String },
     NewTab,
     CloseTab { id: TabId },
     Switch { id: TabId },
+    NextTab,
+    PrevTab,
     MoveTab { id: TabId, to: usize },
     TabMenu { id: TabId, x: f64, y: f64 },
     HistoryMenu { x: f64, y: f64 },
@@ -307,21 +325,24 @@ enum ChromeCmd {
     Query { text: String, x: f64, y: f64, w: f64 },
     SuggestSelect { index: usize },
     SuggestClose,
+    /// The address bar took keyboard focus: move it from the page to the browser window.
+    FocusChrome,
+    /// Editing ended without navigating: give keyboard focus back to the page.
+    FocusPage,
     Back,
     Forward,
     Reload,
     Stop,
-    Pip,
     Devtools,
-    Ready,
     Minimize,
     Maximize,
     CloseWindow,
     Drag,
-    ResizeTop,
-    SetPanel { height: f64 },
-    DeleteHistory { id: u64 },
     ClearHistory,
+    Pip,
+    ToggleBookmark,
+    BookmarksMenu { x: f64, y: f64 },
+    ThemeMenu { x: f64, y: f64 },
 }
 
 /// Messages from the built-in New Tab page (accepted only while `tab.is_newtab` is true).
@@ -332,14 +353,9 @@ enum NewTabCmd {
     Search { input: String },
     DeleteHistory { id: u64 },
     ClearHistory,
-}
-
-/// Messages from our popup page.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-enum PopupCmd {
-    Pick { index: usize },
-    Close,
+    OpenBookmark { url: String },
+    DeleteBookmark { url: String },
+    SetBrand { brand: Brand },
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -354,9 +370,11 @@ enum Shortcut {
     PrevTab,
     Back,
     Forward,
-    Pip,
     Devtools,
     Dismiss,
+    Pip,
+    Bookmark,
+    Bookmarks,
 }
 
 impl Shortcut {
@@ -371,9 +389,11 @@ impl Shortcut {
             "prev_tab" => Self::PrevTab,
             "back" => Self::Back,
             "forward" => Self::Forward,
-            "pip" => Self::Pip,
             "devtools" => Self::Devtools,
             "dismiss" => Self::Dismiss,
+            "pip" => Self::Pip,
+            "bookmark" => Self::Bookmark,
+            "bookmarks" => Self::Bookmarks,
             _ => return None,
         })
     }
@@ -430,18 +450,99 @@ enum MenuAction {
     Inspect,
     OpenUrl(String),
     ClearHistory,
+    ToggleBookmark,
+    DeleteBookmark(String),
+    SetBrand(Brand),
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Bookmark {
+    title: String,
+    url: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct PrefsData {
+    #[serde(default)]
+    brand: Brand,
+    #[serde(default)]
+    bookmarks: Vec<Bookmark>,
+}
+
+struct Prefs {
+    path: PathBuf,
+    brand: Brand,
+    bookmarks: Vec<Bookmark>,
+}
+
+impl Prefs {
+    fn open(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join("prefs.json");
+        let data: PrefsData = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Self { path, brand: data.brand, bookmarks: data.bookmarks }
+    }
+
+    fn save(&self) {
+        let data = PrefsData { brand: self.brand, bookmarks: self.bookmarks.clone() };
+        if let Ok(json) = serde_json::to_string_pretty(&data) {
+            let tmp = self.path.with_extension("json.tmp");
+            if let Some(p) = self.path.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.path);
+            }
+        }
+    }
+
+    fn is_bookmarked(&self, url: &str) -> bool {
+        !url.is_empty() && self.bookmarks.iter().any(|b| b.url == url)
+    }
+
+    fn toggle_bookmark(&mut self, title: &str, url: &str) -> bool {
+        if url.is_empty() || url.starts_with("about:") || url.starts_with("data:") {
+            return false;
+        }
+        if let Some(pos) = self.bookmarks.iter().position(|b| b.url == url) {
+            self.bookmarks.remove(pos);
+            self.save();
+            false
+        } else {
+            let clean = title.trim();
+            let t = if clean.is_empty() || clean == "New Tab" {
+                host_of(url).unwrap_or(url).to_owned()
+            } else {
+                clean.chars().take(60).collect()
+            };
+            self.bookmarks.insert(0, Bookmark { title: t, url: url.to_owned() });
+            if self.bookmarks.len() > 100 {
+                self.bookmarks.truncate(100);
+            }
+            self.save();
+            true
+        }
+    }
+
+    fn remove_bookmark(&mut self, url: &str) -> bool {
+        let before = self.bookmarks.len();
+        self.bookmarks.retain(|b| b.url != url);
+        if self.bookmarks.len() != before {
+            self.save();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 struct MenuItem {
     label: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     disabled: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     sep: bool,
-    #[serde(skip)]
     action: Option<MenuAction>,
 }
 
@@ -462,9 +563,9 @@ impl MenuItem {
     }
 }
 
-#[derive(Serialize)]
 struct Suggestion {
-    kind: &'static str,
+    /// Opens a site rather than searching.
+    url: bool,
     text: String,
 }
 
@@ -479,53 +580,15 @@ struct Tab {
     is_newtab: bool,
     /// Still painted in the new-tab page color; switches to white once a real page loads.
     newtab_bg: bool,
-    /// Small screenshot for the hover card, as a data URL.
-    thumb: String,
-}
-
-#[derive(Serialize)]
-struct TabState<'a> {
-    id: TabId,
-    title: &'a str,
-    favicon: &'a str,
-    loading: bool,
-    pip: bool,
-}
-
-#[derive(Serialize)]
-struct UiState<'a> {
-    tabs: Vec<TabState<'a>>,
-    active: TabId,
-    url: &'a str,
-    can_back: bool,
-    can_forward: bool,
-    loading: bool,
-    maximized: bool,
-    devtools: bool,
-    pip: bool,
-    history: &'a [HistoryEntry],
-    https_upgrades: u64,
+    /// Small snapshot of the page for the hover card.
+    thumb: Option<Pixmap>,
 }
 
 #[derive(Serialize)]
 struct NewTabState<'a> {
+    brand: Brand,
+    bookmarks: &'a [Bookmark],
     history: &'a [HistoryEntry],
-}
-
-/// Popups are shown once at creation without taking focus and then only moved: tao can show a
-/// window without activating it only at creation, and an active window gets the accent border.
-/// They take focus only while being clicked (a window that never takes focus gets no WebView2
-/// mouse input). Hidden ones are parked off-screen.
-struct Popup {
-    window: Window,
-    view: WebView,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PopupKind {
-    Menu,
-    Suggest,
-    Preview,
 }
 
 struct Devtools {
@@ -539,29 +602,37 @@ struct Devtools {
 }
 
 struct Browser {
-    window: Window,
-    chrome: WebView,
+    window: Rc<Window>,
+    toolbar: Toolbar,
+    /// Paints the toolbar strip of the main window (pages are separate child windows on top).
+    surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+    frame: Pixmap,
+    /// When the toolbar next needs a frame (animation or timer); `None` when idle.
+    next_frame: Option<Instant>,
+    pacer: pacer::Pacer,
+    mouse: (f64, f64),
+    mods: ModifiersState,
+    cursor: CursorIcon,
+    /// Last laid-out window size, so repeated `Resized` events with an unchanged size (Windows sends
+    /// them on focus and frame changes) don't resize every page.
+    laid_out: (u32, u32, f64),
+    icons_tx: Sender<String>,
     tabs: Vec<Tab>,
     /// A hidden, already-rendered new tab so Ctrl+T appears instantly.
     spare: Option<Tab>,
     active: usize,
     next_id: TabId,
-    panel_height: f64,
     history: HistoryStore,
+    prefs: Prefs,
     https_upgrades: u64,
     context: WebContext,
     data_dir: PathBuf,
     proxy: EventLoopProxy<UserEvent>,
     quit: bool,
     dark: bool,
-    menu: Popup,
+    popups: Popups,
     menu_actions: Vec<Option<MenuAction>>,
-    menu_open: bool,
-    /// The menu window has focus (it takes it only when clicked).
-    menu_focused: bool,
-    preview: Popup,
     thumbs_tx: Sender<thumbs::Request>,
-    suggest: Popup,
     suggest_tx: Sender<suggest::Request>,
     suggest_seq: u64,
     suggest_query: String,
@@ -577,11 +648,7 @@ impl Browser {
     }
 
     fn top_bar_height(&self) -> f64 {
-        CHROME_HEIGHT + self.panel_height
-    }
-
-    fn chrome_bounds(&self) -> Rect {
-        rect(0.0, 0.0, self.logical_size().width, self.top_bar_height())
+        CHROME_HEIGHT
     }
 
     fn devtools_width(&self) -> f64 {
@@ -608,7 +675,12 @@ impl Browser {
     }
 
     fn newtab_color(&self) -> Rgba {
-        if self.dark { (29, 30, 34, 255) } else { (244, 244, 246, 255) }
+        match (self.dark, self.prefs.brand) {
+            (true, Brand::Uzaki) => (24, 29, 44, 255),
+            (false, Brand::Uzaki) => (237, 240, 247, 255),
+            (true, Brand::Cederic) => (29, 30, 34, 255),
+            (false, Brand::Cederic) => (244, 244, 246, 255),
+        }
     }
 
     /// Builds a hidden tab. It becomes visible when it is made the active tab.
@@ -617,6 +689,7 @@ impl Browser {
         self.next_id += 1;
         let bounds = self.content_bounds();
         let bg = self.newtab_color();
+        let brand_key = if self.prefs.brand == Brand::Uzaki { "uzaki" } else { "cederic" };
 
         let p_title = self.proxy.clone();
         let p_load = self.proxy.clone();
@@ -627,11 +700,11 @@ impl Browser {
         let mut builder = WebViewBuilder::new_with_web_context(&mut self.context)
             .with_bounds(bounds)
             .with_visible(false)
+            .with_initialization_script(format!(
+                "Object.defineProperty(window, '__cedericTab', {{ value: {id} }}); window.__cedericBrand = {brand_key:?};"
+            ))
             .with_initialization_script(SHORTCUT_SCRIPT)
             .with_initialization_script(BRAND_SCRIPT)
-            .with_initialization_script(format!(
-                "Object.defineProperty(window, '__cedericTab', {{ value: {id} }});"
-            ))
             .with_additional_browser_args(BROWSER_ARGS)
             .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
             .with_devtools(true)
@@ -687,7 +760,7 @@ impl Browser {
             pip: false,
             is_newtab: url.is_none(),
             newtab_bg: url.is_none(),
-            thumb: String::new(),
+            thumb: None,
         })
     }
 
@@ -701,13 +774,14 @@ impl Browser {
             }
         };
         let at = at.unwrap_or(self.tabs.len()).min(self.tabs.len());
-        if foreground {
-            self.hide_active();
-        }
+        let previous = self.active_tab().map(|t| t.id);
         self.tabs.insert(at, tab);
         if foreground {
             self.active = at;
             self.show_active();
+            if let Some(id) = previous {
+                self.hide_tab(id);
+            }
             if url.is_none() {
                 self.focus_address();
             }
@@ -727,37 +801,57 @@ impl Browser {
             return;
         }
         let was_active = idx == self.active;
+        if self.tabs.len() == 1 {
+            // Last tab: open the replacement first so the window is never empty.
+            let closing = self.tabs[idx].id;
+            let _ = self.open_tab(None, None, true);
+            if let Some(i) = self.index_of(closing) {
+                self.close_tab(i);
+            }
+            return;
+        }
+        if was_active {
+            // The right neighbour takes over (the left one at the end), shown before the closed
+            // tab disappears so nothing flashes in between.
+            self.active = if idx + 1 < self.tabs.len() { idx + 1 } else { idx - 1 };
+            self.show_active();
+        }
         // Dropping the WebView tears down its renderer and frees its memory.
         let _ = self.thumbs_tx.send(thumbs::Request::Forget(self.tabs[idx].id));
         drop(self.tabs.remove(idx));
-        if self.tabs.is_empty() {
-            self.active = 0;
-            let _ = self.open_tab(None, None, true);
-            return;
+        if idx < self.active {
+            self.active -= 1;
         }
-        if idx < self.active || self.active >= self.tabs.len() {
-            self.active = self.active.saturating_sub(1).min(self.tabs.len() - 1);
-        }
-        if was_active {
-            self.show_active();
-        } else {
-            self.sync_ui();
-        }
+        self.sync_ui();
     }
 
     fn close_where(&mut self, keep: impl Fn(usize, &Tab) -> bool) {
-        let active_id = self.active_tab().map(|t| t.id);
+        let kept: Vec<bool> = self.tabs.iter().enumerate().map(|(i, t)| keep(i, t)).collect();
+        if !kept.contains(&true) {
+            return;
+        }
+        // If the visible tab is closing, show the nearest kept tab before anything is dropped.
+        if !kept[self.active] {
+            let next = (0..self.tabs.len())
+                .filter(|&i| kept[i])
+                .min_by_key(|&i| i.abs_diff(self.active))
+                .unwrap_or(0);
+            self.active = next;
+            self.show_active();
+        }
+        let active_id = self.tabs[self.active].id;
+        for (i, t) in self.tabs.iter().enumerate() {
+            if !kept[i] {
+                let _ = self.thumbs_tx.send(thumbs::Request::Forget(t.id));
+            }
+        }
         let mut i = 0;
-        self.tabs.retain(|t| {
-            let k = keep(i, t);
+        self.tabs.retain(|_| {
             i += 1;
-            k
+            kept[i - 1]
         });
-        self.active = active_id
-            .and_then(|id| self.index_of(id))
-            .unwrap_or(0)
-            .min(self.tabs.len().saturating_sub(1));
-        self.show_active();
+        self.active = self.index_of(active_id).unwrap_or(0);
+        self.sync_ui();
     }
 
     fn move_tab(&mut self, id: TabId, to: usize) {
@@ -771,21 +865,24 @@ impl Browser {
 
     fn switch_to(&mut self, idx: usize) {
         if idx < self.tabs.len() && idx != self.active {
-            self.hide_active();
+            let previous = self.tabs[self.active].id;
             self.active = idx;
             self.show_active();
+            self.hide_tab(previous);
         }
     }
 
-    fn hide_active(&self) {
-        if let Some(cur) = self.tabs.get(self.active) {
-            if cur.pip {
+    /// Hides a background tab. Always called after the next tab is shown, never before, so the
+    /// bare window never shows through for a frame.
+    fn hide_tab(&self, id: TabId) {
+        if let Some(t) = self.index_of(id).map(|i| &self.tabs[i]) {
+            if t.pip {
                 // Keep a tab with active Picture-in-Picture alive and decoding frames while
                 // parked outside the visible client area, so switching tabs never freezes PiP.
-                let _ = cur.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
+                let _ = t.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             } else {
-                let _ = cur.view.set_visible(false);
-                let _ = cur.view.set_memory_usage_level(MemoryUsageLevel::Low);
+                let _ = t.view.set_visible(false);
+                let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
             }
         }
     }
@@ -814,50 +911,67 @@ impl Browser {
         self.tabs.get(self.active)
     }
 
-    fn focus_address(&self) {
-        let _ = self.chrome.focus();
-        let _ = self.chrome.evaluate_script("window.focusAddress && window.focusAddress()");
+    fn focus_address(&mut self) {
+        self.toolbar.focus_address();
+        self.with_active(|v| v.focus_parent());
+        self.window.set_focus();
+        self.window.request_redraw();
     }
 
-    fn push_newtab_state(view: &WebView, history: &HistoryStore) {
-        let state = NewTabState { history: history.entries() };
+    fn push_newtab_state(view: &WebView, prefs: &Prefs, history: &HistoryStore) {
+        let state = NewTabState {
+            brand: prefs.brand,
+            bookmarks: &prefs.bookmarks,
+            history: history.entries(),
+        };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
         }
     }
 
-    fn sync_ui(&self) {
+    fn sync_ui(&mut self) {
         let Some(tab) = self.active_tab() else { return };
-        let url = display_url(&tab.url);
-        let state = UiState {
+        let brand = self.prefs.brand;
+        let model = toolbar::Model {
             tabs: self
                 .tabs
                 .iter()
-                .map(|t| TabState { id: t.id, title: &t.title, favicon: &t.favicon, loading: t.loading, pip: t.pip })
+                .map(|t| toolbar::TabInfo {
+                    id: t.id,
+                    title: t.title.clone(),
+                    favicon: t.favicon.clone(),
+                    loading: t.loading,
+                    pip: t.pip,
+                })
                 .collect(),
             active: tab.id,
-            url: &url,
+            url: display_url(&tab.url, brand),
             can_back: tab.view.can_go_back().unwrap_or(false),
             can_forward: tab.view.can_go_forward().unwrap_or(false),
             loading: tab.loading,
             maximized: self.window.is_maximized(),
             devtools: self.devtools.open,
             pip: self.tabs.iter().any(|t| t.pip),
-            history: self.history.entries(),
-            https_upgrades: self.https_upgrades,
+            bookmarked: self.prefs.is_bookmarked(&tab.url),
+            brand,
         };
-        if let Ok(json) = serde_json::to_string(&state) {
-            let _ = self.chrome.evaluate_script(&format!("window.render && window.render({json})"));
-        }
         if tab.is_newtab {
-            Self::push_newtab_state(&tab.view, &self.history);
+            Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
         }
-        let title = if tab.title.is_empty() { "Cederic" } else { &tab.title };
-        self.window.set_title(&format!("{title} - Cederic"));
+        let brand_name = brand.name();
+        let title = if tab.title.is_empty() { brand_name } else { &tab.title };
+        self.window.set_title(&format!("{title} - {brand_name}"));
+        self.toolbar.set_model(model);
+        for url in self.toolbar.take_icon_requests() {
+            let _ = self.icons_tx.send(url);
+        }
+        self.window.request_redraw();
     }
 
-    fn layout(&self) {
-        let _ = self.chrome.set_bounds(self.chrome_bounds());
+    fn layout(&mut self) {
+        let scale = self.window.scale_factor() as f32;
+        self.toolbar.set_size(scale, self.logical_size().width as f32);
+        self.window.request_redraw();
         let bounds = self.content_bounds();
         for (i, tab) in self.tabs.iter().enumerate() {
             let b = if i != self.active && tab.pip { rect(-10.0, -10.0, 1.0, 1.0) } else { bounds };
@@ -894,29 +1008,13 @@ impl Browser {
         LogicalPosition::new(origin.x + x, origin.y + y)
     }
 
-    fn show_popup(popup: &Popup, script: &str, pos: LogicalPosition<f64>, w: f64, h: f64) {
-        let _ = popup.view.evaluate_script(script);
-        popup.window.set_inner_size(LogicalSize::new(w, h));
-        popup.window.set_outer_position(pos);
-        let _ = popup.view.set_bounds(rect(0.0, 0.0, w, h));
-    }
-
-    fn hide_popup(popup: &Popup) {
-        let _ = popup.view.evaluate_script("window.hideAll && window.hideAll()");
-        popup.window.set_outer_position(PARKED);
-    }
-
-    /// Gives keyboard focus back to the page after a popup was clicked.
+    /// Gives keyboard focus back to the page after a menu closes.
     fn refocus_page(&self) {
-        self.window.set_focus();
         self.with_active(|v| v.focus());
     }
 
     fn close_menu(&mut self) {
-        if self.menu_open {
-            self.menu_open = false;
-            Self::hide_popup(&self.menu);
-        }
+        self.popups.hide(PopupKind::Menu);
     }
 
     /// Shows a menu at a point in the main window's client area.
@@ -926,17 +1024,23 @@ impl Browser {
         let size = self.logical_size();
         let x = if x + W > size.width { (x - W).max(0.0) } else { x };
         let y = if y + h > size.height { (size.height - h).max(0.0) } else { y };
-        let Ok(json) = serde_json::to_string(&items) else { return };
-        self.menu_actions = items.into_iter().map(|i| i.action).collect();
+        let mut entries = Vec::with_capacity(items.len());
+        self.menu_actions = items
+            .into_iter()
+            .map(|i| {
+                entries.push(MenuEntry { label: i.label, hint: i.hint, disabled: i.disabled, sep: i.sep });
+                i.action
+            })
+            .collect();
         self.hide_preview();
-        Self::show_popup(&self.menu, &format!("window.showMenu({json})"), self.to_screen(x, y), W, h);
-        self.menu_open = true;
+        let pos = self.to_screen(x, y);
+        self.popups.show(PopupKind::Menu, Content::Menu(entries), pos, W as f32);
     }
 
     /// Hover card under a tab: title, site and (for background tabs) a snapshot of the page.
     fn show_preview(&mut self, id: TabId, x: f64, y: f64) {
-        const W: f64 = 280.0;
-        if self.menu_open {
+        let w = popups::CARD_W as f64;
+        if self.popups.is_open(PopupKind::Menu) {
             return;
         }
         let Some(tab) = self.index_of(id).map(|i| &self.tabs[i]) else { return };
@@ -946,18 +1050,19 @@ impl Browser {
         {
             let _ = self.thumbs_tx.send(thumbs::Request::Capture(cur.id));
         }
-        let img = if active { "" } else { tab.thumb.as_str() };
-        let shown = display_url(&tab.url);
-        let host = host_of(&shown).unwrap_or_default();
-        let title = if tab.title.is_empty() { "New Tab" } else { &tab.title };
-        let card = serde_json::json!({ "title": title, "host": host, "img": img });
-        let h = if img.is_empty() { 62.0 } else { 62.0 + 158.0 };
-        let x = x.clamp(0.0, (self.logical_size().width - W).max(0.0));
-        Self::show_popup(&self.preview, &format!("window.showPreview({card})"), self.to_screen(x, y), W, h);
+        let shown = display_url(&tab.url, self.prefs.brand);
+        let card = Card {
+            title: if tab.title.is_empty() { "New Tab".into() } else { tab.title.clone() },
+            host: host_of(&shown).unwrap_or_default().to_owned(),
+            img: if active { None } else { tab.thumb.clone() },
+        };
+        let x = x.clamp(0.0, (self.logical_size().width - w).max(0.0));
+        let pos = self.to_screen(x, y);
+        self.popups.show(PopupKind::Preview, Content::Preview(card), pos, w as f32);
     }
 
-    fn hide_preview(&self) {
-        Self::hide_popup(&self.preview);
+    fn hide_preview(&mut self) {
+        self.popups.hide(PopupKind::Preview);
     }
 
     fn tab_menu(&mut self, id: TabId, x: f64, y: f64) {
@@ -1004,6 +1109,117 @@ impl Browser {
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
+    fn toggle_bookmark(&mut self) {
+        let Some((title, url)) = self.active_tab().map(|t| (t.title.clone(), t.url.clone())) else {
+            return;
+        };
+        self.prefs.toggle_bookmark(&title, &url);
+        self.sync_all_newtabs();
+        self.sync_ui();
+    }
+
+    fn sync_all_newtabs(&self) {
+        for tab in &self.tabs {
+            if tab.is_newtab {
+                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+            }
+        }
+        if let Some(spare) = &self.spare
+            && spare.is_newtab
+        {
+            Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
+        }
+    }
+
+    /// Saved bookmarks dropdown under the bookmarks button.
+    fn bookmarks_menu(&mut self, right: f64, y: f64) {
+        const MAX: usize = 14;
+        let (can_bookmark, is_bookmarked, active_url) = self
+            .active_tab()
+            .map(|t| {
+                let ok = !t.is_newtab && !t.url.is_empty() && t.url.starts_with("http");
+                (ok, self.prefs.is_bookmarked(&t.url), t.url.clone())
+            })
+            .unwrap_or((false, false, String::new()));
+
+        let mut items = Vec::new();
+        let toggle_label = if is_bookmarked { "Remove bookmark" } else { "Bookmark this page" };
+        items.push(
+            MenuItem::new(toggle_label, MenuAction::ToggleBookmark)
+                .hint("Ctrl+D")
+                .enabled(can_bookmark),
+        );
+        items.push(MenuItem::sep());
+
+        if self.prefs.bookmarks.is_empty() {
+            items.push(MenuItem::new("No saved bookmarks yet", MenuAction::ToggleBookmark).enabled(false));
+        } else {
+            for b in self.prefs.bookmarks.iter().take(MAX) {
+                let shown = display_url(&b.url, self.prefs.brand);
+                let host = host_of(&shown).unwrap_or_default().to_owned();
+                items.push(
+                    MenuItem::new(b.title.clone(), MenuAction::OpenUrl(b.url.clone())).hint(host),
+                );
+            }
+            if is_bookmarked && !active_url.is_empty() {
+                items.push(MenuItem::sep());
+                items.push(MenuItem::new(
+                    "Delete current bookmark",
+                    MenuAction::DeleteBookmark(active_url),
+                ));
+            }
+        }
+        self.show_menu(items, (right - 248.0).max(0.0), y);
+    }
+
+    /// Theme & persona dropdown under the palette button: switch between Cederic (Orange) and Uzaki (Slate Blue).
+    fn theme_menu(&mut self, right: f64, y: f64) {
+        let cur = self.prefs.brand;
+        let c_check = if cur == Brand::Cederic { "✓  Cederic (Orange)" } else { "   Cederic (Orange)" };
+        let u_check = if cur == Brand::Uzaki { "✓  Uzaki (Slate Blue)" } else { "   Uzaki (Slate Blue)" };
+        let items = vec![
+            MenuItem::new(c_check, MenuAction::SetBrand(Brand::Cederic)).hint("Default"),
+            MenuItem::new(u_check, MenuAction::SetBrand(Brand::Uzaki)).hint("Slate Blue"),
+        ];
+        self.show_menu(items, (right - 248.0).max(0.0), y);
+    }
+
+    fn set_brand(&mut self, brand: Brand) {
+        if self.prefs.brand == brand {
+            return;
+        }
+        self.prefs.brand = brand;
+        self.prefs.save();
+        self.toolbar.set_theme(self.dark, brand);
+        self.popups.set_theme(self.dark, brand);
+        let bg = self.newtab_color();
+        let brand_key = if brand == Brand::Uzaki { "uzaki" } else { "cederic" };
+        let js = format!(
+            "window.__cedericBrand = {brand_key:?}; window.__cedericSetBrand && window.__cedericSetBrand({brand_key:?});"
+        );
+        for tab in &mut self.tabs {
+            if tab.newtab_bg {
+                let _ = tab.view.set_background_color(bg);
+            }
+            if host_of(&tab.url) == Some(REAL_SEARCH_HOST) {
+                tab.title = tab
+                    .title
+                    .replace("Brave", brand.name())
+                    .replace("Cederic", brand.name())
+                    .replace("Uzaki", brand.name());
+            }
+            let _ = tab.view.evaluate_script(&js);
+        }
+        if let Some(spare) = &self.spare {
+            if spare.newtab_bg {
+                let _ = spare.view.set_background_color(bg);
+            }
+            let _ = spare.view.evaluate_script(&js);
+        }
+        self.sync_all_newtabs();
+        self.sync_ui();
+    }
+
     fn page_menu(&mut self, id: TabId, r: ContextRequest) {
         let Some(tab) = self.active_tab().filter(|t| t.id == id) else { return };
         let mut items = Vec::new();
@@ -1031,11 +1247,13 @@ impl Browser {
             items.push(MenuItem::sep());
         }
         let (back, fwd) = (tab.view.can_go_back().unwrap_or(false), tab.view.can_go_forward().unwrap_or(false));
+        let web = tab.url.starts_with("http");
+        let bm_label = if self.prefs.is_bookmarked(&tab.url) { "Remove bookmark" } else { "Bookmark this page" };
         items.push(MenuItem::new("Back", MenuAction::Back).hint("Alt+←").enabled(back));
         items.push(MenuItem::new("Forward", MenuAction::Forward).hint("Alt+→").enabled(fwd));
         items.push(MenuItem::new("Reload", MenuAction::Reload).hint("Ctrl+R"));
+        items.push(MenuItem::new(bm_label, MenuAction::ToggleBookmark).hint("Ctrl+D").enabled(web));
         items.push(MenuItem::sep());
-        let web = tab.url.starts_with("http");
         items.push(MenuItem::new("View page source", MenuAction::ViewSource).enabled(web));
         items.push(MenuItem::new("Inspect", MenuAction::Inspect).hint("F12"));
 
@@ -1103,6 +1321,14 @@ impl Browser {
             }
             MenuAction::OpenUrl(url) => self.navigate_active(&url),
             MenuAction::ClearHistory => self.handle_chrome(ChromeCmd::ClearHistory),
+            MenuAction::ToggleBookmark => self.toggle_bookmark(),
+            MenuAction::DeleteBookmark(url) => {
+                if self.prefs.remove_bookmark(&url) {
+                    self.sync_all_newtabs();
+                    self.sync_ui();
+                }
+            }
+            MenuAction::SetBrand(brand) => self.set_brand(brand),
         }
     }
 
@@ -1115,7 +1341,7 @@ impl Browser {
         let text = text.trim().to_owned();
         if text.is_empty() {
             self.suggestions.clear();
-            Self::hide_popup(&self.suggest);
+            self.popups.hide(PopupKind::Suggest);
             return;
         }
         // Show the typed row instantly, then fill in suggestions when they arrive.
@@ -1125,29 +1351,26 @@ impl Browser {
     }
 
     fn set_suggestions(&mut self, items: Vec<String>) {
-        let q = &self.suggest_query;
-        let kind = match input::resolve(&unmask(q)) {
-            Some(url) if !input::is_search(&url) => "url",
-            _ => "search",
-        };
-        let mut list = vec![Suggestion { kind, text: q.clone() }];
+        let q = self.suggest_query.clone();
+        let url = matches!(input::resolve(&unmask(&q)), Some(u) if !input::is_search(&u));
+        let mut list = vec![Suggestion { url, text: q.clone() }];
         list.extend(
             items
                 .into_iter()
-                .filter(|s| !s.eq_ignore_ascii_case(q))
-                .map(|text| Suggestion { kind: "suggest", text }),
+                .filter(|s| !s.eq_ignore_ascii_case(&q))
+                .map(|text| Suggestion { url: false, text }),
         );
-        let Ok(json) = serde_json::to_string(&list) else { return };
-        let _ = self.chrome.evaluate_script(&format!("window.setSuggestions && window.setSuggestions({json})"));
+        self.toolbar.set_suggestions(list.iter().map(|s| s.text.clone()).collect());
         let (x, y, w) = self.suggest_anchor;
-        let h = 12.0 + 36.0 * list.len() as f64;
-        Self::show_popup(&self.suggest, &format!("window.showSuggest({json})"), self.to_screen(x, y), w, h);
+        let entries = list.iter().map(|s| SuggestEntry { text: s.text.clone(), url: s.url }).collect();
+        let pos = self.to_screen(x, y);
+        self.popups.show(PopupKind::Suggest, Content::Suggest { items: entries, query: q }, pos, w as f32);
         self.suggestions = list;
     }
 
     fn close_suggest(&mut self) {
         self.suggest_seq += 1;
-        Self::hide_popup(&self.suggest);
+        self.popups.hide(PopupKind::Suggest);
     }
 
     // ---------- Picture-in-Picture & DevTools ----------
@@ -1282,7 +1505,6 @@ impl Browser {
 
     fn handle_chrome(&mut self, cmd: ChromeCmd) {
         match cmd {
-            ChromeCmd::Ready => self.sync_ui(),
             ChromeCmd::Navigate { input } => self.navigate_active(&input),
             ChromeCmd::NewTab => {
                 let _ = self.open_tab(None, None, true);
@@ -1297,6 +1519,13 @@ impl Browser {
                     self.switch_to(i);
                 }
             }
+            ChromeCmd::NextTab => self.handle_shortcut(Shortcut::NextTab),
+            ChromeCmd::PrevTab => self.handle_shortcut(Shortcut::PrevTab),
+            ChromeCmd::FocusChrome => {
+                self.with_active(|v| v.focus_parent());
+                self.window.set_focus();
+            }
+            ChromeCmd::FocusPage => self.with_active(|v| v.focus()),
             ChromeCmd::MoveTab { id, to } => self.move_tab(id, to),
             ChromeCmd::TabMenu { id, x, y } => self.tab_menu(id, x, y),
             ChromeCmd::HistoryMenu { x, y } => self.history_menu(x, y),
@@ -1305,35 +1534,19 @@ impl Browser {
             ChromeCmd::Dismiss => self.close_menu(),
             ChromeCmd::Query { text, x, y, w } => self.query(text, x, y, w),
             ChromeCmd::SuggestSelect { index } => {
-                let _ = self.suggest.view.evaluate_script(&format!("window.select({index})"));
+                self.popups.select(PopupKind::Suggest, index);
             }
             ChromeCmd::SuggestClose => self.close_suggest(),
             ChromeCmd::Back => self.with_active(|v| v.go_back()),
             ChromeCmd::Forward => self.with_active(|v| v.go_forward()),
             ChromeCmd::Reload => self.with_active(|v| v.reload()),
             ChromeCmd::Stop => self.with_active(|v| v.evaluate_script("window.stop()")),
-            ChromeCmd::Pip => self.toggle_pip(None, false),
             ChromeCmd::Devtools => self.toggle_devtools(),
             ChromeCmd::Minimize => self.window.set_minimized(true),
             ChromeCmd::Maximize => self.window.set_maximized(!self.window.is_maximized()),
             ChromeCmd::CloseWindow => self.quit = true,
             ChromeCmd::Drag => {
                 let _ = self.window.drag_window();
-            }
-            ChromeCmd::ResizeTop => {
-                let _ = self.window.drag_resize_window(ResizeDirection::North);
-            }
-            ChromeCmd::SetPanel { height } => {
-                let clamped = height.clamp(0.0, 480.0);
-                if (self.panel_height - clamped).abs() > 0.5 {
-                    self.panel_height = clamped;
-                    self.layout();
-                }
-            }
-            ChromeCmd::DeleteHistory { id } => {
-                if self.history.remove(id) {
-                    self.sync_ui();
-                }
             }
             ChromeCmd::ClearHistory => {
                 self.history.clear();
@@ -1342,28 +1555,25 @@ impl Browser {
                 }
                 self.sync_ui();
             }
+            ChromeCmd::Pip => self.toggle_pip(None, false),
+            ChromeCmd::ToggleBookmark => self.toggle_bookmark(),
+            ChromeCmd::BookmarksMenu { x, y } => self.bookmarks_menu(x, y),
+            ChromeCmd::ThemeMenu { x, y } => self.theme_menu(x, y),
         }
     }
 
-    fn handle_popup(&mut self, cmd: PopupCmd, kind: PopupKind) {
-        match (cmd, kind) {
-            (_, PopupKind::Preview) => {}
-            (PopupCmd::Close, PopupKind::Menu) => {
-                self.close_menu();
-                self.refocus_page();
-            }
-            (PopupCmd::Close, PopupKind::Suggest) => self.close_suggest(),
-            (PopupCmd::Pick { index }, PopupKind::Menu) => {
+    fn handle_pick(&mut self, pick: Pick) {
+        match pick {
+            Pick::Menu(index) => {
                 self.close_menu();
                 self.refocus_page();
                 if let Some(Some(action)) = self.menu_actions.get(index).cloned() {
                     self.run_menu_action(action);
                 }
             }
-            (PopupCmd::Pick { index }, PopupKind::Suggest) => {
+            Pick::Suggest(index) => {
                 if let Some(text) = self.suggestions.get(index).map(|s| s.text.clone()) {
-                    let _ = self.chrome.evaluate_script("window.blurAddress && window.blurAddress()");
-                    self.window.set_focus();
+                    self.toolbar.blur_address();
                     self.navigate_active(&text);
                 }
             }
@@ -1377,16 +1587,27 @@ impl Browser {
             Shortcut::CloseTab => self.close_tab(self.active),
             Shortcut::FocusAddress => self.focus_address(),
             Shortcut::History => {
-                let _ = self.chrome.evaluate_script("window.openHistory && window.openHistory()");
+                let (x, y) = self.toolbar.history_anchor();
+                self.history_menu(x as f64, y as f64);
             }
             Shortcut::Reload => self.handle_chrome(ChromeCmd::Reload),
             Shortcut::NextTab => self.switch_to((self.active + 1) % n),
             Shortcut::PrevTab => self.switch_to((self.active + n - 1) % n),
             Shortcut::Back => self.handle_chrome(ChromeCmd::Back),
             Shortcut::Forward => self.handle_chrome(ChromeCmd::Forward),
-            Shortcut::Pip => self.toggle_pip(None, false),
             Shortcut::Devtools => self.toggle_devtools(),
-            Shortcut::Dismiss => self.close_menu(),
+            Shortcut::Dismiss => {
+                // A click or Escape in the page: close menus and stop editing the address bar.
+                self.close_menu();
+                self.toolbar.blur_address();
+                self.window.request_redraw();
+            }
+            Shortcut::Pip => self.toggle_pip(None, false),
+            Shortcut::Bookmark => self.toggle_bookmark(),
+            Shortcut::Bookmarks => {
+                let (x, y) = self.toolbar.bookmarks_anchor();
+                self.bookmarks_menu(x as f64, y as f64);
+            }
         }
     }
 
@@ -1395,7 +1616,7 @@ impl Browser {
             && spare.id == id
         {
             if matches!(cmd, NewTabCmd::Ready) {
-                Self::push_newtab_state(&spare.view, &self.history);
+                Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
             }
             return;
         }
@@ -1404,7 +1625,7 @@ impl Browser {
             return;
         }
         match cmd {
-            NewTabCmd::Ready => Self::push_newtab_state(&self.tabs[i].view, &self.history),
+            NewTabCmd::Ready => Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history),
             NewTabCmd::Search { input } => {
                 if i != self.active {
                     self.switch_to(i);
@@ -1413,10 +1634,24 @@ impl Browser {
             }
             NewTabCmd::DeleteHistory { id: entry_id } => {
                 if self.history.remove(entry_id) {
+                    self.sync_all_newtabs();
                     self.sync_ui();
                 }
             }
             NewTabCmd::ClearHistory => self.handle_chrome(ChromeCmd::ClearHistory),
+            NewTabCmd::OpenBookmark { url } => {
+                if i != self.active {
+                    self.switch_to(i);
+                }
+                self.navigate_active(&url);
+            }
+            NewTabCmd::DeleteBookmark { url } => {
+                if self.prefs.remove_bookmark(&url) {
+                    self.sync_all_newtabs();
+                    self.sync_ui();
+                }
+            }
+            NewTabCmd::SetBrand { brand } => self.set_brand(brand),
         }
     }
 
@@ -1428,14 +1663,16 @@ impl Browser {
 
     fn handle(&mut self, ev: UserEvent) {
         match ev {
-            UserEvent::Chrome(cmd) => self.handle_chrome(cmd),
             UserEvent::Shortcut(s) => self.handle_shortcut(s),
             UserEvent::NewTab(id, cmd) => self.handle_newtab(id, cmd),
             UserEvent::PageMenu(id, r) => self.page_menu(id, r),
-            UserEvent::Popup(cmd, kind) => self.handle_popup(cmd, kind),
+            UserEvent::IconLoaded(url, img) => {
+                self.toolbar.icon_loaded(url, img);
+                self.window.request_redraw();
+            }
             UserEvent::Thumb(id, img) => {
                 if let Some(i) = self.index_of(id) {
-                    self.tabs[i].thumb = img;
+                    self.tabs[i].thumb = Some(img);
                 }
             }
             UserEvent::PipState(id, on) => {
@@ -1494,11 +1731,7 @@ impl Browser {
                 }
                 let _ = self.open_tab(Some(target), Some(self.active + 1), true);
             }
-            UserEvent::FocusCheck => {
-                if !self.menu_focused {
-                    self.close_menu();
-                }
-            }
+            UserEvent::Frame => self.window.request_redraw(),
             UserEvent::Prewarm => {
                 if self.spare.is_none() {
                     self.spare = self.build_tab(None).ok();
@@ -1516,9 +1749,13 @@ impl Browser {
                     return;
                 }
                 if let Some(i) = self.index_of(id) {
+                    let brand_name = self.prefs.brand.name();
                     let t = &mut self.tabs[i];
                     t.title = if host_of(&t.url) == Some(REAL_SEARCH_HOST) {
-                        title.replace("Brave", "Cederic")
+                        title
+                            .replace("Brave", brand_name)
+                            .replace("Cederic", brand_name)
+                            .replace("Uzaki", brand_name)
                     } else {
                         title
                     };
@@ -1528,7 +1765,7 @@ impl Browser {
             UserEvent::Favicon(id, icon) => {
                 if let Some(i) = self.index_of(id) {
                     let t = &mut self.tabs[i];
-                    t.favicon = if host_of(&t.url) == Some(REAL_SEARCH_HOST) { CEDERIC_ICON.into() } else { icon };
+                    t.favicon = if host_of(&t.url) == Some(REAL_SEARCH_HOST) { BRAND_ICON.into() } else { icon };
                     self.sync_ui();
                 }
             }
@@ -1549,7 +1786,7 @@ impl Browser {
                 }
                 if started && host_of(&url) != host_of(&tab.url) {
                     tab.favicon = if host_of(&url) == Some(REAL_SEARCH_HOST) {
-                        CEDERIC_ICON.into()
+                        BRAND_ICON.into()
                     } else {
                         String::new()
                     };
@@ -1573,25 +1810,27 @@ impl Browser {
     }
 
     fn handle_window(&mut self, id: WindowId, event: WindowEvent) {
-        if id != self.window.id() {
-            // Popups are shown without focus and only take it while being clicked; taking it back
-            // here would cancel the click. The menu closes once it loses focus again.
-            if id == self.menu.window.id()
-                && let WindowEvent::Focused(focused) = event
-            {
-                self.menu_focused = focused;
-                if !focused {
-                    self.close_menu();
-                }
+        if let Some(kind) = self.popups.owns(id) {
+            if let Some(pick) = self.popups.window_event(kind, &event) {
+                self.handle_pick(pick);
             }
+            return;
+        }
+        if id != self.window.id() {
             return;
         }
         match event {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                self.close_suggest();
-                self.close_menu();
-                self.hide_preview();
-                self.layout();
+                let size = self.window.inner_size();
+                let now = (size.width, size.height, self.window.scale_factor());
+                if now != self.laid_out {
+                    self.laid_out = now;
+                    self.close_suggest();
+                    self.close_menu();
+                    self.hide_preview();
+                    self.layout();
+                }
+                // Maximize/restore also arrives here; refresh the toolbar either way.
                 self.sync_ui();
             }
             WindowEvent::Moved(_) => {
@@ -1600,24 +1839,138 @@ impl Browser {
                 self.hide_preview();
             }
             WindowEvent::Focused(false) => {
-                // Clicking the menu also takes focus from here; only close it if focus went elsewhere.
+                // Popups never take focus, so losing it means the user switched away.
+                self.close_menu();
                 self.hide_preview();
-                let proxy = self.proxy.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                    let _ = proxy.send_event(UserEvent::FocusCheck);
-                });
             }
             WindowEvent::CloseRequested => self.quit = true,
+            WindowEvent::ThemeChanged(theme) => {
+                self.dark = theme == Theme::Dark;
+                self.toolbar.set_theme(self.dark, self.prefs.brand);
+                self.popups.set_theme(self.dark, self.prefs.brand);
+                let bg = self.newtab_color();
+                for tab in &self.tabs {
+                    if tab.newtab_bg {
+                        let _ = tab.view.set_background_color(bg);
+                    }
+                }
+                if let Some(spare) = &self.spare
+                    && spare.newtab_bg
+                {
+                    let _ = spare.view.set_background_color(bg);
+                }
+                self.window.request_redraw();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f64>(self.window.scale_factor());
-                self.on_cursor(p.x, p.y);
+                self.mouse = (p.x, p.y);
+                if p.y < CHROME_HEIGHT || self.toolbar.captures_mouse() {
+                    let icon = self.toolbar.mouse_move(p.x as f32, p.y as f32);
+                    self.set_cursor(icon);
+                    self.devtools.hover = false;
+                    self.window.request_redraw();
+                } else {
+                    self.toolbar.mouse_left();
+                    self.on_cursor(p.x, p.y);
+                }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
+            WindowEvent::CursorLeft { .. } => {
+                self.toolbar.mouse_left();
+                self.window.request_redraw();
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
+                match state {
+                    ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
+                    ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => {
+                        self.toolbar.mouse_up(button, x, y)
+                    }
+                    _ => {}
+                }
+                if button == MouseButton::Left {
+                    self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
+                }
+                self.window.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(m) => self.mods = m,
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.toolbar.key(&event, self.mods);
+                self.window.request_redraw();
+            }
+            WindowEvent::ReceivedImeText(text) => {
+                self.toolbar.ime(&text);
+                self.window.request_redraw();
             }
             _ => {}
         }
+        self.flush_toolbar();
+    }
+
+    fn set_cursor(&mut self, icon: CursorIcon) {
+        if icon != self.cursor {
+            self.cursor = icon;
+            self.window.set_cursor_icon(icon);
+        }
+    }
+
+    /// Runs what the toolbar asked for since the last event.
+    fn flush_toolbar(&mut self) {
+        let cmds = std::mem::take(&mut self.toolbar.cmds);
+        for cmd in cmds {
+            self.handle_chrome(cmd);
+        }
+        if let Some((x, y)) = self.toolbar.caret() {
+            self.window.set_ime_position(LogicalPosition::new(x as f64, y as f64));
+        }
+    }
+
+    /// Draws the toolbar and shows it. Only the toolbar strip (and the gap beside the DevTools
+    /// pane) is put on screen: the rest of the window is covered by page windows, and painting
+    /// under them would flicker.
+    fn redraw(&mut self) {
+        let now = Instant::now();
+        self.next_frame = self.toolbar.tick(now);
+        self.flush_toolbar();
+        let size = self.window.inner_size();
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
+        let scale = self.window.scale_factor();
+        let bar_h = ((CHROME_HEIGHT * scale).round() as u32).min(h.get()).max(1);
+        if self.frame.width() != w.get() || self.frame.height() != bar_h {
+            let Some(pm) = Pixmap::new(w.get(), bar_h) else { return };
+            self.frame = pm;
+        }
+        self.toolbar.render(&mut self.frame);
+        let dt = self.devtools_width();
+        let logical_w = self.logical_size().width;
+        if self.surface.resize(w, h).is_err() {
+            return;
+        }
+        let Ok(mut buf) = self.surface.buffer_mut() else { return };
+        let width = w.get() as usize;
+        for (dst, src) in buf.chunks_exact_mut(width).zip(self.frame.data().chunks_exact(width * 4)) {
+            for (d, p) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+            }
+        }
+        let mut damage = vec![softbuffer::Rect { x: 0, y: 0, width: w, height: NonZeroU32::new(bar_h).unwrap_or(h) }];
+        if dt > 0.0 {
+            // The bare strip between page and DevTools is the splitter.
+            let x0 = ((logical_w - dt - SPLITTER) * scale).floor().max(0.0) as u32;
+            let gap = ((SPLITTER * scale).ceil() as u32 + 1).min(w.get().saturating_sub(x0));
+            let color = match (self.dark, self.prefs.brand) {
+                (true, Brand::Uzaki) => 0x131722,
+                (false, Brand::Uzaki) => 0xd9deec,
+                (true, Brand::Cederic) => 0x18191d,
+                (false, Brand::Cederic) => 0xdfe1e6,
+            };
+            for row in bar_h as usize..h.get() as usize {
+                buf[row * width + x0 as usize..row * width + (x0 + gap) as usize].fill(color);
+            }
+            if let (Some(gw), Some(gh)) = (NonZeroU32::new(gap), NonZeroU32::new(h.get() - bar_h)) {
+                damage.push(softbuffer::Rect { x: x0, y: bar_h, width: gw, height: gh });
+            }
+        }
+        let _ = buf.present_with_damage(&damage);
     }
 }
 
@@ -1643,14 +1996,15 @@ fn parse_favicon(json: &str) -> Option<String> {
     (ok && url.len() < 64 * 1024).then_some(url)
 }
 
-/// The address-bar text for `url`; Brave Search is shown as Cederic's own search host.
-fn display_url(url: &str) -> String {
+/// The address-bar text for `url`; Brave Search is shown as Cederic's (or Uzaki's) own search host.
+fn display_url(url: &str, brand: Brand) -> String {
     if url.starts_with("about:") || url.starts_with("data:") {
         return String::new();
     }
     match url.split_once("://") {
         Some((scheme, rest)) if host_of(url) == Some(REAL_SEARCH_HOST) => {
-            format!("{scheme}://{SHOWN_SEARCH_HOST}{}", &rest[REAL_SEARCH_HOST.len()..])
+            let shown_host = brand.search_host();
+            format!("{scheme}://{shown_host}{}", &rest[REAL_SEARCH_HOST.len()..])
         }
         _ => url.to_owned(),
     }
@@ -1658,7 +2012,9 @@ fn display_url(url: &str) -> String {
 
 /// Maps the displayed search host back to the real one when the user edits and submits it.
 fn unmask(input: &str) -> String {
-    input.replace(SHOWN_SEARCH_HOST, REAL_SEARCH_HOST)
+    input
+        .replace(Brand::Cederic.search_host(), REAL_SEARCH_HOST)
+        .replace(Brand::Uzaki.search_host(), REAL_SEARCH_HOST)
 }
 
 fn host_of(url: &str) -> Option<&str> {
@@ -1671,89 +2027,53 @@ fn data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Cederic")
 }
 
-/// A borderless owned popup window (menus, suggestions) hosting our popup page. Windows 11 gives
-/// it a native drop shadow and rounded corners.
-fn build_popup(
-    target: &EventLoopWindowTarget<UserEvent>,
-    owner: &Window,
-    context: &mut WebContext,
-    proxy: EventLoopProxy<UserEvent>,
-    kind: PopupKind,
-    dark: bool,
-) -> wry::Result<Popup> {
-    let card: Rgba = if dark { (43, 44, 50, 255) } else { (255, 255, 255, 255) };
-    let window = WindowBuilder::new()
-        .with_decorations(false)
-        .with_undecorated_shadow(true)
-        .with_background_color(card)
-        .with_resizable(false)
-        .with_visible(true)
-        .with_focused(false)
-        .with_position(PARKED)
-        .with_skip_taskbar(true)
-        .with_owner_window(owner.hwnd())
-        .with_inner_size(LogicalSize::new(10.0, 10.0))
-        .build(target)
-        .expect("failed to create popup window");
-    let view = WebViewBuilder::new_with_web_context(context)
-        .with_html(POPUP_HTML)
-        .with_background_color(card)
-        .with_additional_browser_args(BROWSER_ARGS)
-        .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
-        .with_hotkeys_zoom(false)
-        .with_ipc_handler(move |req| {
-            if let Ok(cmd) = serde_json::from_str::<PopupCmd>(req.body()) {
-                let _ = proxy.send_event(UserEvent::Popup(cmd, kind));
-            }
-        })
-        .build(&window)?;
-    Ok(Popup { window, view })
-}
-
 fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let window = WindowBuilder::new()
-        .with_title("Cederic")
+    let dir = data_dir();
+    let prefs = Prefs::open(&dir);
+    let brand = prefs.brand;
+
+    let window = Rc::new(
+        WindowBuilder::new()
+        .with_title(brand.name())
         .with_decorations(false)
         .with_undecorated_shadow(true)
         .with_inner_size(LogicalSize::new(1280.0, 820.0))
         .with_min_inner_size(LogicalSize::new(480.0, 320.0))
         .build(&event_loop)
-        .expect("failed to create window");
+        .expect("failed to create window"),
+    );
     let dark = window.theme() == Theme::Dark;
-    let frame: Rgba = if dark { (24, 25, 29, 255) } else { (223, 225, 230, 255) };
-    window.set_background_color(Some(frame));
+    // No background color on the main window: tao would fill the whole window with it whenever part
+    // of it is invalidated, and since the window does not clip its children that paints over the
+    // pages and makes them flash. Everything that is not a page is drawn by `Browser::redraw`.
 
-    let dir = data_dir();
     let history = HistoryStore::open(&dir);
-    let mut context = WebContext::new(Some(dir.clone()));
+    let context = WebContext::new(Some(dir.clone()));
 
-    let p_chrome = proxy.clone();
-    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
-    let chrome = WebViewBuilder::new_with_web_context(&mut context)
-        .with_bounds(rect(0.0, 0.0, size.width, CHROME_HEIGHT))
-        .with_html(CHROME_HTML)
-        .with_background_color(frame)
-        .with_additional_browser_args(BROWSER_ARGS)
-        .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
-        .with_devtools(cfg!(debug_assertions))
-        .with_hotkeys_zoom(false)
-        .with_ipc_handler(move |req| {
-            if let Ok(cmd) = serde_json::from_str::<ChromeCmd>(req.body()) {
-                let _ = p_chrome.send_event(UserEvent::Chrome(cmd));
-            }
-        })
-        .build_as_child(&window)?;
+    let scale = window.scale_factor();
+    let size = window.inner_size().to_logical::<f64>(scale);
+    let toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
+    let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
+    let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
-    let menu = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Menu, dark)?;
-    let suggest = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Suggest, dark)?;
-    let preview = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Preview, dark)?;
+    let popups = Popups::new(&event_loop, &window, dark, brand);
 
     let p_thumb = proxy.clone();
     let thumbs_tx = thumbs::spawn(dir.clone(), move |tab, img| {
         let _ = p_thumb.send_event(UserEvent::Thumb(tab, img));
+    });
+
+    let p_frame = proxy.clone();
+    let pacer = pacer::Pacer::spawn(move || {
+        let _ = p_frame.send_event(UserEvent::Frame);
+    });
+
+    let p_icon = proxy.clone();
+    let icons_tx = favicons::spawn(move |url, img| {
+        let _ = p_icon.send_event(UserEvent::IconLoaded(url, img));
     });
 
     let p_suggest = proxy.clone();
@@ -1765,26 +2085,31 @@ fn main() -> wry::Result<()> {
 
     let mut browser = Browser {
         window,
-        chrome,
+        toolbar,
+        surface,
+        frame: Pixmap::new(1, 1).expect("1x1 pixmap"),
+        next_frame: None,
+        pacer,
+        mouse: (-1.0, -1.0),
+        mods: ModifiersState::empty(),
+        cursor: CursorIcon::Default,
+        laid_out: (0, 0, 0.0),
+        icons_tx,
         tabs: Vec::new(),
         spare: None,
         active: 0,
         next_id: 1,
-        panel_height: 0.0,
         history,
+        prefs,
         https_upgrades: 0,
         context,
         data_dir: dir,
         proxy,
         quit: false,
         dark,
-        menu,
+        popups,
         menu_actions: Vec::new(),
-        menu_open: false,
-        menu_focused: false,
-        preview,
         thumbs_tx,
-        suggest,
         suggest_tx,
         suggest_seq: 0,
         suggest_query: String::new(),
@@ -1799,16 +2124,96 @@ fn main() -> wry::Result<()> {
         Some(resolved.url)
     });
     browser.open_tab(start, None, true)?;
+    browser.layout();
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
         match event {
-            Event::UserEvent(ev) => browser.handle(ev),
+            Event::UserEvent(ev) => {
+                browser.handle(ev);
+                browser.flush_toolbar();
+            }
             Event::WindowEvent { window_id, event, .. } => browser.handle_window(window_id, event),
+            Event::RedrawRequested(id) if id == browser.window.id() => browser.redraw(),
+            Event::RedrawRequested(id) => {
+                if let Some(kind) = browser.popups.owns(id) {
+                    browser.popups.redraw(kind);
+                }
+            }
+            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => browser.window.request_redraw(),
             _ => {}
         }
+        // Animations are driven by the pacer (accurate frame timing); only slow timers such as the
+        // caret blink or the hover-card delay use the event loop's own timeout.
+        let now = Instant::now();
+        let next = match (browser.next_frame, browser.popups.tick(now)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let animating = next.is_some_and(|t| t <= now + pacer::FRAME * 3);
+        browser.pacer.set(animating);
+        *control_flow = match next {
+            Some(t) if !animating => ControlFlow::WaitUntil(t),
+            _ => ControlFlow::Wait,
+        };
         if browser.quit {
             *control_flow = ControlFlow::Exit;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brand_display_url_and_unmask() {
+        let raw = "https://search.brave.com/search?q=rust";
+        assert_eq!(
+            display_url(raw, Brand::Cederic),
+            "https://search.cederic.com/search?q=rust"
+        );
+        assert_eq!(
+            display_url(raw, Brand::Uzaki),
+            "https://search.uzaki.com/search?q=rust"
+        );
+        assert_eq!(unmask("https://search.cederic.com/search?q=rust"), raw);
+        assert_eq!(unmask("https://search.uzaki.com/search?q=rust"), raw);
+    }
+
+    #[test]
+    fn prefs_bookmark_and_brand_persistence() {
+        let dir = std::env::temp_dir().join(format!(
+            "cederic_prefs_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut prefs = Prefs::open(&dir);
+        assert_eq!(prefs.brand, Brand::Cederic);
+        assert!(prefs.bookmarks.is_empty());
+
+        assert!(prefs.toggle_bookmark("Rust Lang", "https://www.rust-lang.org/"));
+        assert!(prefs.is_bookmarked("https://www.rust-lang.org/"));
+        prefs.brand = Brand::Uzaki;
+        prefs.save();
+
+        let reloaded = Prefs::open(&dir);
+        assert_eq!(reloaded.brand, Brand::Uzaki);
+        assert_eq!(reloaded.bookmarks.len(), 1);
+        assert_eq!(reloaded.bookmarks[0].title, "Rust Lang");
+
+        let mut reloaded = reloaded;
+        assert!(!reloaded.toggle_bookmark("Rust Lang", "https://www.rust-lang.org/"));
+        assert!(!reloaded.is_bookmarked("https://www.rust-lang.org/"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shortcut_parsing_includes_pip_and_bookmarks() {
+        assert!(matches!(Shortcut::parse("pip"), Some(Shortcut::Pip)));
+        assert!(matches!(Shortcut::parse("bookmark"), Some(Shortcut::Bookmark)));
+        assert!(matches!(Shortcut::parse("bookmarks"), Some(Shortcut::Bookmarks)));
+    }
 }

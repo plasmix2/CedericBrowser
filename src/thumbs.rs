@@ -15,6 +15,9 @@ use tungstenite::{Message, WebSocket};
 
 use crate::devtools;
 
+/// Thumbnail width in CSS pixels; the card shows it at about this size.
+const WIDTH: f64 = 320.0;
+
 pub enum Request {
     /// The tab now on screen (`None` while nothing should be captured, e.g. minimized).
     Active(Option<u32>),
@@ -27,7 +30,7 @@ pub enum Request {
     EvalGesture(u32, String),
 }
 
-pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, String) + Send + 'static) -> mpsc::Sender<Request> {
+pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send + 'static) -> mpsc::Sender<Request> {
     let (tx, rx) = mpsc::channel::<Request>();
     std::thread::spawn(move || {
         let mut targets: HashMap<u32, String> = HashMap::new();
@@ -128,22 +131,25 @@ fn find_target(port: u16, tab: u32) -> Option<String> {
     })
 }
 
-/// A JPEG snapshot of what the tab currently shows, as a data URL.
-/// Avoids passing `clip` to `Page.captureScreenshot`, because Chromium implements `clip.scale` by
-/// overriding device emulation metrics on the live renderer, which flashes the viewport white.
-fn capture(port: u16, target: &str) -> Option<String> {
+/// A small snapshot of what the tab currently shows.
+fn capture(port: u16, target: &str) -> Option<tiny_skia::Pixmap> {
+    capture_at(port, target, WIDTH)
+}
+
+/// Like `capture`, scaled to at most `width` pixels wide.
+///
+/// The screenshot is taken at the page's own size and shrunk here: asking the engine for a scaled
+/// `clip` makes it re-render the page at another size, which shows as the page resizing or flashing.
+fn capture_at(port: u16, target: &str, width: f64) -> Option<tiny_skia::Pixmap> {
     let mut s = Session::open(port, target)?;
-    let m = s.call("Page.getLayoutMetrics", json!({}))?;
-    let vp = &m["cssVisualViewport"];
-    let (w, h) = (vp["clientWidth"].as_f64()?, vp["clientHeight"].as_f64()?);
-    if w < 2.0 || h < 2.0 {
-        return None;
-    }
-    let r = s.call(
-        "Page.captureScreenshot",
-        json!({ "format": "jpeg", "quality": 45, "optimizeForSpeed": true }),
-    )?;
-    Some(format!("data:image/jpeg;base64,{}", r["data"].as_str()?))
+    let r = s.call("Page.captureScreenshot", json!({ "format": "png", "optimizeForSpeed": true }))?;
+    let full = tiny_skia::Pixmap::decode_png(&crate::favicons::base64_decode(r["data"].as_str()?)?).ok()?;
+    let k = (width as f32 / full.width() as f32).min(1.0);
+    let (tw, th) = (((full.width() as f32 * k).round() as u32).max(1), ((full.height() as f32 * k).round() as u32).max(1));
+    let mut small = tiny_skia::Pixmap::new(tw, th)?;
+    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+    small.draw_pixmap(0, 0, full.as_ref(), &paint, tiny_skia::Transform::from_scale(k, k), None);
+    Some(small)
 }
 
 /// Evaluates `js` in `target` with a synthesized user gesture (`userGesture: true`).
@@ -177,9 +183,19 @@ mod tests {
                 .and_then(|mut s| s.call("Runtime.evaluate", json!({ "expression": js, "returnByValue": true, "awaitPromise": true, "userGesture": true })));
             println!("{id}: {}", r.map(|v| v["result"]["value"].to_string()).unwrap_or_default());
         }
+        // CEDERIC_SHOT=<dir>: also save a full-size PNG of every page, so a page's own
+        // rendering can be inspected without capturing the screen.
+        if let Ok(dir) = std::env::var("CEDERIC_SHOT") {
+            for id in devtools::page_targets(port).expect("targets") {
+                let Some(img) = capture_at(port, &id, 4000.0) else { continue };
+                let path = std::path::Path::new(&dir).join(format!("{id}.png"));
+                img.save_png(&path).unwrap();
+                println!("saved {}", path.display());
+            }
+        }
         for tab in 1..=3 {
             let shot = find_target(port, tab).and_then(|id| capture(port, &id));
-            println!("tab {tab} thumbnail: {} bytes", shot.map_or(0, |s| s.len()));
+            println!("tab {tab} thumbnail: {:?}", shot.map(|s| (s.width(), s.height())));
         }
     }
 }
