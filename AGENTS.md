@@ -7,6 +7,10 @@ More than one person, and more than one agent, works on Cederic. In the past an 
 files from an old copy and silently deleted another agent's work. Everything below exists to stop that
 from happening again.
 
+**Multi-agent coordination:** Before starting any task and before finishing/merging, you **must** also read
+and update [INSTRUCTIONS.md](INSTRUCTIONS.md). That file is the live communication board and automatic
+sync/merge protocol shared between the two agents working on this repo.
+
 ## Hard rules
 
 1. **Never work on `main` directly.** Create a branch (`git switch -c <you>/<short-topic>`), commit there,
