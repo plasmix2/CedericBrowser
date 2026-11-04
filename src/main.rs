@@ -316,6 +316,7 @@ const BRAND_SCRIPT: &str = r#"
     let count = 0;
     for (const a of document.body.querySelectorAll('a[href^="https://"]')) {
       if (!a.href.includes('brave.com')) {
+        a.rel = 'noreferrer noopener';
         window.__cedericPreconnect(a.href);
         if (++count >= 6) break;
       }
@@ -348,9 +349,13 @@ const BRAND_SCRIPT: &str = r#"
     }
   };
   window.__cedericSetBrand(window.__cedericBrand || 'cederic');
+  const meta = document.createElement('meta');
+  meta.name = 'referrer';
+  meta.content = 'no-referrer';
   const attach = () => {
     const root = document.head || document.documentElement;
     if (root && !style.isConnected) root.appendChild(style);
+    if (root && !meta.isConnected) root.appendChild(meta);
   };
   attach();
   const pending = new Set();
@@ -1241,25 +1246,29 @@ impl Browser {
         self.show_menu(items, x, y);
     }
 
-    /// Recent searches, newest first, as a dropdown under the history button.
+    /// Recent anonymous session searches, newest first, as a dropdown under the history button.
     fn history_menu(&mut self, right: f64, y: f64) {
-        const MAX: usize = 12;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
-        let mut items: Vec<MenuItem> = self
-            .history
-            .entries()
-            .iter()
-            .rev()
-            .take(MAX)
-            .map(|e| MenuItem::new(e.query.clone(), MenuAction::OpenUrl(e.url.clone())).hint(ago(now, e.timestamp_ms)))
-            .collect();
-        if items.is_empty() {
-            items.push(MenuItem::new("No searches yet", MenuAction::ClearHistory).enabled(false));
+        const MAX: usize = 10;
+        let entries = self.history.entries();
+        let has_entries = !entries.is_empty();
+        let mut items = vec![
+            MenuItem::new("Anonymous session", MenuAction::ClearHistory)
+                .hint("Auto-clears")
+                .enabled(false),
+            MenuItem::new("Clear search history", MenuAction::ClearHistory)
+                .hint("Ctrl+H")
+                .enabled(has_entries),
+            MenuItem::sep(),
+        ];
+        if !has_entries {
+            items.push(MenuItem::new("No searches in session", MenuAction::ClearHistory).enabled(false));
         } else {
-            items.push(MenuItem::sep());
-            items.push(MenuItem::new("Clear history", MenuAction::ClearHistory));
+            items.extend(
+                entries
+                    .iter()
+                    .take(MAX)
+                    .map(|e| MenuItem::new(e.query.clone(), MenuAction::OpenUrl(e.url.clone())).hint("Anonymous")),
+            );
         }
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
@@ -1711,7 +1720,7 @@ impl Browser {
             }
             ChromeCmd::ClearHistory => {
                 self.history.clear();
-                if let Some(t) = self.active_tab() {
+                for t in &self.tabs {
                     let _ = t.view.clear_all_browsing_data();
                 }
                 self.sync_ui();
@@ -2169,17 +2178,6 @@ impl Browser {
     }
 }
 
-/// "now", "5m", "3h", "2d": how long ago `then_ms` was.
-fn ago(now_ms: u64, then_ms: u64) -> String {
-    let s = now_ms.saturating_sub(then_ms) / 1000;
-    match s {
-        0..60 => "now".into(),
-        60..3600 => format!("{}m", s / 60),
-        3600..86400 => format!("{}h", s / 3600),
-        _ => format!("{}d", s / 86400),
-    }
-}
-
 fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
     Rect { position: LogicalPosition::new(x, y).into(), size: LogicalSize::new(w, h).into() }
 }
@@ -2245,7 +2243,8 @@ fn main() -> wry::Result<()> {
     // of it is invalidated, and since the window does not clip its children that paints over the
     // pages and makes them flash. Everything that is not a page is drawn by `Browser::redraw`.
 
-    let history = HistoryStore::open(&dir);
+    let mut history = HistoryStore::open(&dir);
+    history.clear();
     let context = WebContext::new(Some(dir.clone()));
 
     let scale = window.scale_factor();
@@ -2353,6 +2352,10 @@ fn main() -> wry::Result<()> {
             _ => ControlFlow::Wait,
         };
         if browser.quit {
+            browser.history.clear();
+            for t in &browser.tabs {
+                let _ = t.view.clear_all_browsing_data();
+            }
             *control_flow = ControlFlow::Exit;
         }
     });
