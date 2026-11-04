@@ -123,6 +123,11 @@ fn find_target(port: u16, tab: u32) -> Option<String> {
 
 /// A small JPEG of what the tab currently shows, as a data URL.
 fn capture(port: u16, target: &str) -> Option<String> {
+    capture_at(port, target, WIDTH)
+}
+
+/// Like `capture`, scaled to at most `width` CSS pixels wide.
+fn capture_at(port: u16, target: &str, width: f64) -> Option<String> {
     let mut s = Session::open(port, target)?;
     let m = s.call("Page.getLayoutMetrics", json!({}))?;
     let vp = &m["cssVisualViewport"];
@@ -135,7 +140,7 @@ fn capture(port: u16, target: &str) -> Option<String> {
         "y": vp["pageY"].as_f64().unwrap_or(0.0),
         "width": w,
         "height": h,
-        "scale": (WIDTH / w).min(1.0),
+        "scale": (width / w).min(1.0),
     });
     let r = s.call("Page.captureScreenshot", json!({ "format": "jpeg", "quality": 60, "clip": clip }))?;
     Some(format!("data:image/jpeg;base64,{}", r["data"].as_str()?))
@@ -157,6 +162,17 @@ mod tests {
             let r = Session::open(port, &id)
                 .and_then(|mut s| s.call("Runtime.evaluate", json!({ "expression": js, "returnByValue": true, "awaitPromise": true })));
             println!("{id}: {}", r.map(|v| v["result"]["value"].to_string()).unwrap_or_default());
+        }
+        // CEDERIC_SHOT=<dir>: also save a full-size JPEG (base64) of every page, so a page's own
+        // rendering can be inspected without capturing the screen.
+        if let Ok(dir) = std::env::var("CEDERIC_SHOT") {
+            for id in devtools::page_targets(port).expect("targets") {
+                let Some(img) = capture_at(port, &id, 4000.0) else { continue };
+                let b64 = img.trim_start_matches("data:image/jpeg;base64,");
+                let path = std::path::Path::new(&dir).join(format!("{id}.b64"));
+                std::fs::write(&path, b64).unwrap();
+                println!("saved {}", path.display());
+            }
         }
         for tab in 1..=3 {
             let shot = find_target(port, tab).and_then(|id| capture(port, &id));

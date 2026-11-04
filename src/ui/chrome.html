@@ -41,7 +41,7 @@
   .tab.active .bg::before { right: -10px; background: radial-gradient(circle at 100% 0, transparent 9.5px, var(--toolbar) 10px); }
   .tab.active .bg::after { left: -10px; background: radial-gradient(circle at 0 0, transparent 9.5px, var(--toolbar) 10px); }
   /* separators between inactive tabs */
-  .tab::after { content: ""; position: absolute; right: 0; top: 10px; bottom: 10px; width: 1px;
+  .tab::after { content: ""; position: absolute; right: 0; top: 10px; bottom: 10px; width: var(--hair, 1px);
     background: var(--border); transition: opacity .15s; }
   .tab.nosep::after { opacity: 0; }
   .tab .content { position: relative; display: flex; align-items: center; gap: 8px; height: 100%;
@@ -92,7 +92,7 @@
 
   /* ---------- toolbar ---------- */
   #toolbar { position: relative; display: flex; align-items: center; gap: 2px; height: 44px; padding: 0 8px;
-    background: var(--toolbar); border-bottom: 1px solid var(--border); }
+    background: var(--toolbar); border-bottom: var(--hair, 1px) solid var(--border); }
   .btn { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; flex: none;
     transition: background-color .12s, opacity .2s, transform .18s var(--spring), color .15s; }
   .btn:hover:not(:disabled) { background: var(--btn-hover); }
@@ -188,6 +188,15 @@
     return $('titlebar').clientWidth - $('winctl').offsetWidth - 38 - 40 - PAD * 2;
   }
 
+  // With display scaling (e.g. 125%) a CSS pixel isn't a whole screen pixel; snapping tab edges to
+  // screen pixels keeps titles and separators crisp instead of smeared across two pixels.
+  const snap = (v) => Math.round(v * devicePixelRatio) / devicePixelRatio;
+  const slotX = (i) => snap(PAD + i * tabW);
+  function setHairline() {
+    document.documentElement.style.setProperty('--hair', 1 / devicePixelRatio + 'px');
+  }
+  setHairline();
+
   function layoutTabs() {
     const ids = order.filter((id) => els.has(id));
     const n = Math.max(1, ids.length);
@@ -197,16 +206,16 @@
     const activeAt = state ? slots.indexOf(state.active) : -1, hoverAt = slots.indexOf(hoverId);
     slots.forEach((id, i) => {
       const el = els.get(id);
-      el.style.width = tabW + 'px';
-      if (!(drag && drag.active && drag.id === id)) el.style.transform = `translateX(${PAD + i * tabW}px)`;
+      el.style.width = slotX(i + 1) - slotX(i) + 'px';
+      if (!(drag && drag.active && drag.id === id)) el.style.transform = `translateX(${slotX(i)}px)`;
       el.classList.toggle('narrow', tabW < NARROW_W);
       // No separator next to the active or hovered tab, nor after the last one.
       const nosep = i === activeAt || i === activeAt - 1 || i === hoverAt || i === hoverAt - 1 || i === slots.length - 1;
       el.classList.toggle('nosep', nosep);
     });
-    tabsBox.style.width = (PAD * 2 + slots.length * tabW) + 'px';
+    tabsBox.style.width = slotX(slots.length) + PAD + 'px';
   }
-  window.addEventListener('resize', () => { frozenW = null; layoutTabs(); });
+  window.addEventListener('resize', () => { frozenW = null; setHairline(); layoutTabs(); });
   // After closing tabs with the mouse, widths stay put until the pointer leaves the strip, so the
   // next close button lands under the cursor.
   $('titlebar').addEventListener('pointerleave', () => { if (frozenW) { frozenW = null; layoutTabs(); } });
@@ -277,7 +286,7 @@
     }
     const n = order.filter((id) => els.has(id)).length;
     const x = Math.max(PAD, Math.min(PAD + (n - 1) * tabW, PAD + drag.from * tabW + dx));
-    drag.el.style.transform = `translateX(${x}px)`;
+    drag.el.style.transform = `translateX(${snap(x)}px)`;
     const to = Math.max(0, Math.min(n - 1, Math.round((x - PAD) / tabW)));
     if (to !== drag.to) { drag.to = to; layoutTabs(); }
   }
@@ -375,7 +384,7 @@
         // Start collapsed at its future slot, so it grows in place while neighbours slide over.
         const at = incoming.indexOf(t.id);
         el.style.width = '0px';
-        el.style.transform = `translateX(${PAD + at * tabW}px)`;
+        el.style.transform = `translateX(${slotX(at)}px)`;
         tabsBox.append(el);
       }
       updateTab(el, t, t.id === s.active);

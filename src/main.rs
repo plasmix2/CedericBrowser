@@ -618,13 +618,14 @@ impl Browser {
             }
         };
         let at = at.unwrap_or(self.tabs.len()).min(self.tabs.len());
-        if foreground {
-            self.hide_active();
-        }
+        let previous = self.active_tab().map(|t| t.id);
         self.tabs.insert(at, tab);
         if foreground {
             self.active = at;
             self.show_active();
+            if let Some(id) = previous {
+                self.hide_tab(id);
+            }
             if url.is_none() {
                 self.focus_address();
             }
@@ -644,37 +645,57 @@ impl Browser {
             return;
         }
         let was_active = idx == self.active;
+        if self.tabs.len() == 1 {
+            // Last tab: open the replacement first so the window is never empty.
+            let closing = self.tabs[idx].id;
+            let _ = self.open_tab(None, None, true);
+            if let Some(i) = self.index_of(closing) {
+                self.close_tab(i);
+            }
+            return;
+        }
+        if was_active {
+            // The right neighbour takes over (the left one at the end), shown before the closed
+            // tab disappears so nothing flashes in between.
+            self.active = if idx + 1 < self.tabs.len() { idx + 1 } else { idx - 1 };
+            self.show_active();
+        }
         // Dropping the WebView tears down its renderer and frees its memory.
         let _ = self.thumbs_tx.send(thumbs::Request::Forget(self.tabs[idx].id));
         drop(self.tabs.remove(idx));
-        if self.tabs.is_empty() {
-            self.active = 0;
-            let _ = self.open_tab(None, None, true);
-            return;
+        if idx < self.active {
+            self.active -= 1;
         }
-        if idx < self.active || self.active >= self.tabs.len() {
-            self.active = self.active.saturating_sub(1).min(self.tabs.len() - 1);
-        }
-        if was_active {
-            self.show_active();
-        } else {
-            self.sync_ui();
-        }
+        self.sync_ui();
     }
 
     fn close_where(&mut self, keep: impl Fn(usize, &Tab) -> bool) {
-        let active_id = self.active_tab().map(|t| t.id);
+        let kept: Vec<bool> = self.tabs.iter().enumerate().map(|(i, t)| keep(i, t)).collect();
+        if !kept.contains(&true) {
+            return;
+        }
+        // If the visible tab is closing, show the nearest kept tab before anything is dropped.
+        if !kept[self.active] {
+            let next = (0..self.tabs.len())
+                .filter(|&i| kept[i])
+                .min_by_key(|&i| i.abs_diff(self.active))
+                .unwrap_or(0);
+            self.active = next;
+            self.show_active();
+        }
+        let active_id = self.tabs[self.active].id;
+        for (i, t) in self.tabs.iter().enumerate() {
+            if !kept[i] {
+                let _ = self.thumbs_tx.send(thumbs::Request::Forget(t.id));
+            }
+        }
         let mut i = 0;
-        self.tabs.retain(|t| {
-            let k = keep(i, t);
+        self.tabs.retain(|_| {
             i += 1;
-            k
+            kept[i - 1]
         });
-        self.active = active_id
-            .and_then(|id| self.index_of(id))
-            .unwrap_or(0)
-            .min(self.tabs.len().saturating_sub(1));
-        self.show_active();
+        self.active = self.index_of(active_id).unwrap_or(0);
+        self.sync_ui();
     }
 
     fn move_tab(&mut self, id: TabId, to: usize) {
@@ -688,16 +709,19 @@ impl Browser {
 
     fn switch_to(&mut self, idx: usize) {
         if idx < self.tabs.len() && idx != self.active {
-            self.hide_active();
+            let previous = self.tabs[self.active].id;
             self.active = idx;
             self.show_active();
+            self.hide_tab(previous);
         }
     }
 
-    fn hide_active(&self) {
-        if let Some(cur) = self.tabs.get(self.active) {
-            let _ = cur.view.set_visible(false);
-            let _ = cur.view.set_memory_usage_level(MemoryUsageLevel::Low);
+    /// Hides a background tab. Always called after the next tab is shown, never before, so the
+    /// bare window never shows through for a frame.
+    fn hide_tab(&self, id: TabId) {
+        if let Some(t) = self.index_of(id).map(|i| &self.tabs[i]) {
+            let _ = t.view.set_visible(false);
+            let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
         }
     }
 
