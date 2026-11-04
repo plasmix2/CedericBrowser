@@ -32,7 +32,7 @@ pub fn spawn(on_done: impl Fn(String, Option<Pixmap>) + Send + 'static) -> mpsc:
 fn bytes(agent: &Agent, url: &str) -> Option<Vec<u8>> {
     if let Some(rest) = url.strip_prefix("data:") {
         let (meta, data) = rest.split_once(',')?;
-        return meta.ends_with(";base64").then(|| base64(data))?;
+        return meta.ends_with(";base64").then(|| base64_decode(data))?;
     }
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return None;
@@ -67,7 +67,7 @@ fn decode(b: &[u8]) -> Option<Pixmap> {
     None
 }
 
-fn base64(s: &str) -> Option<Vec<u8>> {
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => c - b'A',
@@ -95,7 +95,7 @@ fn base64(s: &str) -> Option<Vec<u8>> {
 mod tests {
     #[test]
     fn decodes_base64() {
-        assert_eq!(super::base64("aGVsbG8gd29ybGQ=").unwrap(), b"hello world");
-        assert_eq!(super::base64("YQ==").unwrap(), b"a");
+        assert_eq!(super::base64_decode("aGVsbG8gd29ybGQ=").unwrap(), b"hello world");
+        assert_eq!(super::base64_decode("YQ==").unwrap(), b"a");
     }
 }

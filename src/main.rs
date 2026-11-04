@@ -459,6 +459,9 @@ struct Browser {
     mouse: (f64, f64),
     mods: ModifiersState,
     cursor: CursorIcon,
+    /// Last laid-out window size, so repeated `Resized` events with an unchanged size (Windows sends
+    /// them on focus and frame changes) don't resize every page.
+    laid_out: (u32, u32, f64),
     icons_tx: Sender<String>,
     tabs: Vec<Tab>,
     /// A hidden, already-rendered new tab so Ctrl+T appears instantly.
@@ -1445,10 +1448,16 @@ impl Browser {
         }
         match event {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                self.close_suggest();
-                self.close_menu();
-                self.hide_preview();
-                self.layout();
+                let size = self.window.inner_size();
+                let now = (size.width, size.height, self.window.scale_factor());
+                if now != self.laid_out {
+                    self.laid_out = now;
+                    self.close_suggest();
+                    self.close_menu();
+                    self.hide_preview();
+                    self.layout();
+                }
+                // Maximize/restore also arrives here; refresh the toolbar either way.
                 self.sync_ui();
             }
             WindowEvent::Moved(_) => {
@@ -1682,8 +1691,9 @@ fn main() -> wry::Result<()> {
         .expect("failed to create window"),
     );
     let dark = window.theme() == Theme::Dark;
-    let frame: Rgba = if dark { (24, 25, 29, 255) } else { (223, 225, 230, 255) };
-    window.set_background_color(Some(frame));
+    // No background color on the main window: tao would fill the whole window with it whenever part
+    // of it is invalidated, and since the window does not clip its children that paints over the
+    // pages and makes them flash. Everything that is not a page is drawn by `Browser::redraw`.
 
     let dir = data_dir();
     let history = HistoryStore::open(&dir);
@@ -1725,6 +1735,7 @@ fn main() -> wry::Result<()> {
         mouse: (-1.0, -1.0),
         mods: ModifiersState::empty(),
         cursor: CursorIcon::Default,
+        laid_out: (0, 0, 0.0),
         icons_tx,
         tabs: Vec::new(),
         spare: None,

@@ -18,7 +18,7 @@ use crate::devtools;
 /// Thumbnail width in CSS pixels; the card shows it at about this size.
 const WIDTH: f64 = 320.0;
 /// While a tab stays active, refresh its thumbnail this often.
-const REFRESH: Duration = Duration::from_secs(4);
+const REFRESH: Duration = Duration::from_secs(10);
 
 pub enum Request {
     /// The tab now on screen (`None` while nothing should be captured, e.g. minimized).
@@ -121,34 +121,49 @@ fn find_target(port: u16, tab: u32) -> Option<String> {
     })
 }
 
-/// A small JPEG of what the tab currently shows, as a data URL.
+/// A small PNG of what the tab currently shows, as a data URL.
 fn capture(port: u16, target: &str) -> Option<String> {
     capture_at(port, target, WIDTH)
 }
 
-/// Like `capture`, scaled to at most `width` CSS pixels wide.
+/// Like `capture`, scaled to at most `width` pixels wide.
+///
+/// The screenshot is taken at the page's own size and shrunk here: asking the engine for a scaled
+/// `clip` makes it re-render the page at another size, which shows as the page resizing or flashing.
 fn capture_at(port: u16, target: &str, width: f64) -> Option<String> {
     let mut s = Session::open(port, target)?;
-    let m = s.call("Page.getLayoutMetrics", json!({}))?;
-    let vp = &m["cssVisualViewport"];
-    let (w, h) = (vp["clientWidth"].as_f64()?, vp["clientHeight"].as_f64()?);
-    if w < 1.0 || h < 1.0 {
-        return None;
+    let r = s.call("Page.captureScreenshot", json!({ "format": "png", "optimizeForSpeed": true }))?;
+    let full = tiny_skia::Pixmap::decode_png(&crate::favicons::base64_decode(r["data"].as_str()?)?).ok()?;
+    let k = (width as f32 / full.width() as f32).min(1.0);
+    let (tw, th) = (((full.width() as f32 * k).round() as u32).max(1), ((full.height() as f32 * k).round() as u32).max(1));
+    let mut small = tiny_skia::Pixmap::new(tw, th)?;
+    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+    small.draw_pixmap(0, 0, full.as_ref(), &paint, tiny_skia::Transform::from_scale(k, k), None);
+    Some(format!("data:image/png;base64,{}", base64_encode(&small.encode_png().ok()?)))
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
     }
-    let clip = json!({
-        "x": vp["pageX"].as_f64().unwrap_or(0.0),
-        "y": vp["pageY"].as_f64().unwrap_or(0.0),
-        "width": w,
-        "height": h,
-        "scale": (width / w).min(1.0),
-    });
-    let r = s.call("Page.captureScreenshot", json!({ "format": "jpeg", "quality": 60, "clip": clip }))?;
-    Some(format!("data:image/jpeg;base64,{}", r["data"].as_str()?))
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_roundtrip() {
+        for s in [&b""[..], b"a", b"ab", b"abc", b"hello world"] {
+            assert_eq!(crate::favicons::base64_decode(&base64_encode(s)).unwrap(), s);
+        }
+    }
 
     /// Drives a running Cederic through its debug port: `CEDERIC_EVAL='<js>' cargo test -- --ignored live_eval`.
     /// Evaluates the JS in every page target and prints the results, then captures tab 1.
@@ -163,12 +178,12 @@ mod tests {
                 .and_then(|mut s| s.call("Runtime.evaluate", json!({ "expression": js, "returnByValue": true, "awaitPromise": true })));
             println!("{id}: {}", r.map(|v| v["result"]["value"].to_string()).unwrap_or_default());
         }
-        // CEDERIC_SHOT=<dir>: also save a full-size JPEG (base64) of every page, so a page's own
+        // CEDERIC_SHOT=<dir>: also save a full-size PNG (base64) of every page, so a page's own
         // rendering can be inspected without capturing the screen.
         if let Ok(dir) = std::env::var("CEDERIC_SHOT") {
             for id in devtools::page_targets(port).expect("targets") {
                 let Some(img) = capture_at(port, &id, 4000.0) else { continue };
-                let b64 = img.trim_start_matches("data:image/jpeg;base64,");
+                let b64 = img.trim_start_matches("data:image/png;base64,");
                 let path = std::path::Path::new(&dir).join(format!("{id}.b64"));
                 std::fs::write(&path, b64).unwrap();
                 println!("saved {}", path.display());
