@@ -227,6 +227,7 @@ enum ChromeCmd {
     Switch { id: TabId },
     MoveTab { id: TabId, to: usize },
     TabMenu { id: TabId, x: f64, y: f64 },
+    HistoryMenu { x: f64, y: f64 },
     Query { text: String, x: f64, y: f64, w: f64 },
     SuggestSelect { index: usize },
     SuggestClose,
@@ -341,13 +342,15 @@ enum MenuAction {
     Reload,
     ViewSource,
     Inspect,
+    OpenUrl(String),
+    ClearHistory,
 }
 
 #[derive(Serialize)]
 struct MenuItem {
     label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    hint: Option<&'static str>,
+    hint: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     disabled: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -360,8 +363,8 @@ impl MenuItem {
     fn new(label: impl Into<String>, action: MenuAction) -> Self {
         Self { label: label.into(), hint: None, disabled: false, sep: false, action: Some(action) }
     }
-    fn hint(mut self, hint: &'static str) -> Self {
-        self.hint = Some(hint);
+    fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
         self
     }
     fn enabled(mut self, on: bool) -> Self {
@@ -816,6 +819,29 @@ impl Browser {
         self.show_menu(items, x, y);
     }
 
+    /// Recent searches, newest first, as a dropdown under the history button.
+    fn history_menu(&mut self, right: f64, y: f64) {
+        const MAX: usize = 12;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let mut items: Vec<MenuItem> = self
+            .history
+            .entries()
+            .iter()
+            .rev()
+            .take(MAX)
+            .map(|e| MenuItem::new(e.query.clone(), MenuAction::OpenUrl(e.url.clone())).hint(ago(now, e.timestamp_ms)))
+            .collect();
+        if items.is_empty() {
+            items.push(MenuItem::new("No searches yet", MenuAction::ClearHistory).enabled(false));
+        } else {
+            items.push(MenuItem::sep());
+            items.push(MenuItem::new("Clear history", MenuAction::ClearHistory));
+        }
+        self.show_menu(items, (right - 248.0).max(0.0), y);
+    }
+
     fn page_menu(&mut self, id: TabId, r: ContextRequest) {
         let Some(tab) = self.active_tab().filter(|t| t.id == id) else { return };
         let mut items = Vec::new();
@@ -907,6 +933,8 @@ impl Browser {
                     self.toggle_devtools();
                 }
             }
+            MenuAction::OpenUrl(url) => self.navigate_active(&url),
+            MenuAction::ClearHistory => self.handle_chrome(ChromeCmd::ClearHistory),
         }
     }
 
@@ -1084,6 +1112,7 @@ impl Browser {
             }
             ChromeCmd::MoveTab { id, to } => self.move_tab(id, to),
             ChromeCmd::TabMenu { id, x, y } => self.tab_menu(id, x, y),
+            ChromeCmd::HistoryMenu { x, y } => self.history_menu(x, y),
             ChromeCmd::Query { text, x, y, w } => self.query(text, x, y, w),
             ChromeCmd::SuggestSelect { index } => {
                 let _ = self.suggest.view.evaluate_script(&format!("window.select({index})"));
@@ -1156,8 +1185,7 @@ impl Browser {
             Shortcut::CloseTab => self.close_tab(self.active),
             Shortcut::FocusAddress => self.focus_address(),
             Shortcut::History => {
-                let _ = self.chrome.focus();
-                let _ = self.chrome.evaluate_script("window.toggleHistoryDrawer && window.toggleHistoryDrawer()");
+                let _ = self.chrome.evaluate_script("window.openHistory && window.openHistory()");
             }
             Shortcut::Reload => self.handle_chrome(ChromeCmd::Reload),
             Shortcut::NextTab => self.switch_to((self.active + 1) % n),
@@ -1347,6 +1375,17 @@ impl Browser {
             }
             _ => {}
         }
+    }
+}
+
+/// "now", "5m", "3h", "2d": how long ago `then_ms` was.
+fn ago(now_ms: u64, then_ms: u64) -> String {
+    let s = now_ms.saturating_sub(then_ms) / 1000;
+    match s {
+        0..60 => "now".into(),
+        60..3600 => format!("{}m", s / 60),
+        3600..86400 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
     }
 }
 
