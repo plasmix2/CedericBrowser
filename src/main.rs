@@ -213,15 +213,22 @@ const SHORTCUT_SCRIPT: &str = r#"
       window.__cedericTogglePip(false).then((ok) => { if (!ok) window.ipc.postMessage('pip'); });
       return;
     }
-    if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); }
+    if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); return; }
+    if (!e.ctrlKey && !e.altKey && !e.metaKey && (location.protocol === 'about:' || location.protocol === 'data:')) {
+      const a = document.activeElement;
+      const inField = a && a.closest && a.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])');
+      if (!inField && (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Enter')) {
+        e.preventDefault(); e.stopPropagation();
+        window.ipc.postMessage(JSON.stringify({ nt: 'auto_key', key: e.key }));
+      }
+    }
   }, true);
-  // Popups never take focus, so a click or focus into the page is what closes an open menu.
+  // Popups never take focus, so a click in the page is what closes an open menu.
   window.addEventListener('pointerdown', (e) => {
     const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
     if (a && a.href) preconnect(a.href);
     window.ipc.postMessage('dismiss');
   }, true);
-  window.addEventListener('focusin', () => window.ipc.postMessage('dismiss'), true);
 
   // Bubble phase: pages with their own context menu call preventDefault first and keep it.
   // Editable fields keep the engine's menu so cut/paste/spellcheck work.
@@ -468,6 +475,7 @@ enum NewTabCmd {
     OpenBookmark { url: String },
     DeleteBookmark { url: String },
     SetBrand { brand: Brand },
+    AutoKey { key: String },
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -1006,18 +1014,28 @@ impl Browser {
 
     fn show_active(&mut self) {
         let bounds = self.content_bounds();
-        if let Some(tab) = self.tabs.get(self.active) {
+        let is_newtab = if let Some(tab) = self.tabs.get(self.active) {
             let _ = tab.view.set_memory_usage_level(MemoryUsageLevel::Normal);
             let _ = tab.view.set_bounds(bounds);
             let _ = tab.view.set_visible(true);
-            let _ = tab.view.focus();
             if tab.is_newtab {
                 Self::push_newtab_state(&tab.view, &self.prefs);
+            } else {
+                let _ = tab.view.focus();
             }
             let _ = self.thumbs_tx.send(thumbs::Request::Active(Some(tab.id)));
-        }
+            tab.is_newtab
+        } else {
+            false
+        };
         self.hide_preview();
+        if !is_newtab {
+            self.toolbar.blur_address();
+        }
         self.sync_ui();
+        if is_newtab {
+            self.focus_address();
+        }
         if self.devtools.open {
             self.attach_devtools();
         }
@@ -1033,9 +1051,22 @@ impl Browser {
 
     fn focus_address(&mut self) {
         self.toolbar.focus_address();
-        self.with_active(|v| v.focus_parent());
-        self.window.set_focus();
+        self.ensure_chrome_focus();
         self.window.request_redraw();
+    }
+
+    /// Moves Win32 keyboard focus from any child WebView back to the main browser window while
+    /// the address bar is being edited.
+    fn ensure_chrome_focus(&self) {
+        if self.toolbar.is_editing() {
+            for t in &self.tabs {
+                let _ = t.view.focus_parent();
+            }
+            if let Some(spare) = &self.spare {
+                let _ = spare.view.focus_parent();
+            }
+            self.window.set_focus();
+        }
     }
 
     fn push_newtab_state(view: &WebView, prefs: &Prefs) {
@@ -1653,8 +1684,7 @@ impl Browser {
             ChromeCmd::NextTab => self.handle_shortcut(Shortcut::NextTab),
             ChromeCmd::PrevTab => self.handle_shortcut(Shortcut::PrevTab),
             ChromeCmd::FocusChrome => {
-                self.with_active(|v| v.focus_parent());
-                self.window.set_focus();
+                self.ensure_chrome_focus();
             }
             ChromeCmd::FocusPage => self.with_active(|v| v.focus()),
             ChromeCmd::MoveTab { id, to } => self.move_tab(id, to),
@@ -1759,7 +1789,18 @@ impl Browser {
             return;
         }
         match cmd {
-            NewTabCmd::Ready => Self::push_newtab_state(&self.tabs[i].view, &self.prefs),
+            NewTabCmd::Ready => {
+                Self::push_newtab_state(&self.tabs[i].view, &self.prefs);
+                self.ensure_chrome_focus();
+            }
+            NewTabCmd::AutoKey { key } => {
+                if i != self.active {
+                    self.switch_to(i);
+                }
+                self.toolbar.auto_key(&key);
+                self.ensure_chrome_focus();
+                self.window.request_redraw();
+            }
             NewTabCmd::Search { input } => {
                 if i != self.active {
                     self.switch_to(i);
@@ -1872,6 +1913,7 @@ impl Browser {
                 {
                     let _ = spare.view.set_memory_usage_level(MemoryUsageLevel::Low);
                     self.spare = Some(spare);
+                    self.ensure_chrome_focus();
                 }
             }
             UserEvent::Suggestions(res) => {
@@ -1949,6 +1991,9 @@ impl Browser {
                         let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
                     }
                 }
+                if is_newtab && i == self.active {
+                    self.ensure_chrome_focus();
+                }
                 self.sync_ui();
             }
         }
@@ -1982,6 +2027,9 @@ impl Browser {
                 self.close_suggest();
                 self.close_menu();
                 self.hide_preview();
+            }
+            WindowEvent::Focused(true) => {
+                self.ensure_chrome_focus();
             }
             WindowEvent::Focused(false) => {
                 // Popups never take focus, so losing it means the user switched away.
