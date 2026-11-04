@@ -314,7 +314,12 @@ impl Canvas<'_> {
     pub fn image(&mut self, img: &Pixmap, x: f32, y: f32, w: f32, h: f32, alpha: f32) {
         let sx = w * self.s / img.width() as f32;
         let sy = h * self.s / img.height() as f32;
-        let paint = PixmapPaint { opacity: alpha, quality: tiny_skia::FilterQuality::Bicubic, ..PixmapPaint::default() };
+        let quality = if w > 64.0 {
+            tiny_skia::FilterQuality::Bilinear
+        } else {
+            tiny_skia::FilterQuality::Bicubic
+        };
+        let paint = PixmapPaint { opacity: alpha, quality, ..PixmapPaint::default() };
         let t = Transform::from_row(sx, 0.0, 0.0, sy, x * self.s, y * self.s);
         self.pm.draw_pixmap(0, 0, img.as_ref(), &paint, t, None);
     }

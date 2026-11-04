@@ -160,6 +160,7 @@ pub struct Toolbar {
     card_shown: bool,
     card_leave: Option<Instant>,
     last_frame: Instant,
+    bg: Option<Pixmap>,
     /// Requests for the browser, drained after each event.
     pub cmds: Vec<ChromeCmd>,
 }
@@ -256,6 +257,7 @@ impl Toolbar {
             card_shown: false,
             card_leave: None,
             last_frame: now,
+            bg: None,
             cmds: Vec::new(),
         }
     }
@@ -266,6 +268,10 @@ impl Toolbar {
         self.theme = Theme::for_brand(dark, brand);
         self.model.brand = brand;
         self.pretty = None;
+    }
+
+    pub fn set_background(&mut self, bg: Option<Pixmap>) {
+        self.bg = bg;
     }
 
     pub fn set_size(&mut self, scale: f32, width: f32) {
@@ -1023,6 +1029,11 @@ impl Toolbar {
         let mut c = Canvas { pm, s };
         c.rect(0.0, 0.0, self.width, TITLE_H, th.strip);
         c.rect(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar);
+        if let Some(bg) = &self.bg {
+            c.image(bg, 0.0, 0.0, self.width, HEIGHT, 0.44);
+            c.rect(0.0, 0.0, self.width, TITLE_H, th.strip.with_alpha(0.56));
+            c.rect(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar.with_alpha(0.74));
+        }
 
         self.draw_tabs(&mut c, &th);
         let g = self.geo();

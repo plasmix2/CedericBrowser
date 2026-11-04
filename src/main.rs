@@ -196,6 +196,70 @@ const SHORTCUT_SCRIPT: &str = r#"
       } catch (_) {}
     }
   }, true);
+
+  const sendBg = (rawUrl, keepRaw) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      let data = rawUrl;
+      if (!keepRaw) {
+        try {
+          const maxW = 1920, maxH = 1080;
+          let w = img.naturalWidth || 1920, h = img.naturalHeight || 1080;
+          const r = Math.min(1, maxW / w, maxH / h);
+          w = Math.max(1, Math.round(w * r));
+          h = Math.max(1, Math.round(h * r));
+          const c = document.createElement('canvas');
+          c.width = w; c.height = h;
+          c.getContext('2d').drawImage(img, 0, 0, w, h);
+          data = c.toDataURL('image/jpeg', 0.88);
+        } catch (_) {}
+      }
+      let strip = '';
+      try {
+        const sc = document.createElement('canvas');
+        sc.width = 640; sc.height = 84;
+        const sx = sc.getContext('2d');
+        const iw = img.naturalWidth || img.width || 640;
+        const ih = img.naturalHeight || img.height || 360;
+        const scale = Math.max(sc.width / iw, sc.height / ih);
+        const dw = iw * scale, dh = ih * scale;
+        sx.filter = 'blur(3px)';
+        sx.drawImage(img, (sc.width - dw) / 2, (sc.height - dh) * 0.2, dw, dh);
+        strip = sc.toDataURL('image/png');
+      } catch (_) {}
+      window.ipc.postMessage(JSON.stringify({ nt: 'set_background', data, strip }));
+    };
+    img.onerror = () => {
+      if (rawUrl) window.ipc.postMessage(JSON.stringify({ nt: 'set_background', data: rawUrl, strip: '' }));
+    };
+    img.src = rawUrl;
+  };
+  if (!window.__cedericApplyBgUrl) window.__cedericApplyBgUrl = (u) => sendBg(u, false);
+  if (!window.__cedericOpenBgPicker) {
+    window.__cedericOpenBgPicker = () => {
+      const existing = document.getElementById('bg-file');
+      if (existing) { existing.click(); return; }
+      const inp = document.createElement('input');
+      inp.type = 'file';
+      inp.accept = 'image/*';
+      inp.style.display = 'none';
+      inp.onchange = () => {
+        const f = inp.files && inp.files[0];
+        if (f && f.type.startsWith('image/')) {
+          const reader = new FileReader();
+          const keepGif = f.type === 'image/gif' && f.size <= 4 * 1024 * 1024;
+          reader.onload = () => {
+            if (typeof reader.result === 'string') sendBg(reader.result, keepGif);
+          };
+          reader.readAsDataURL(f);
+        }
+        inp.remove();
+      };
+      (document.body || document.documentElement).appendChild(inp);
+      inp.click();
+    };
+  }
 })();
 "#;
 
@@ -367,6 +431,12 @@ enum NewTabCmd {
     OpenBookmark { url: String },
     DeleteBookmark { url: String },
     SetBrand { brand: Brand },
+    SetBackground {
+        #[serde(default)]
+        data: String,
+        #[serde(default)]
+        strip: String,
+    },
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -464,6 +534,9 @@ enum MenuAction {
     ToggleBookmark,
     DeleteBookmark(String),
     SetBrand(Brand),
+    ChooseBackground,
+    SetBackgroundUrl(String),
+    ClearBackground,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -482,18 +555,39 @@ struct PrefsData {
 
 struct Prefs {
     path: PathBuf,
+    bg_path: PathBuf,
+    strip_path: PathBuf,
     brand: Brand,
     bookmarks: Vec<Bookmark>,
+    background: Option<String>,
+    bg_strip: Option<Pixmap>,
 }
 
 impl Prefs {
     fn open(data_dir: &std::path::Path) -> Self {
         let path = data_dir.join("prefs.json");
+        let bg_path = data_dir.join("background.txt");
+        let strip_path = data_dir.join("background_strip.png");
         let data: PrefsData = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        Self { path, brand: data.brand, bookmarks: data.bookmarks }
+        let background = std::fs::read_to_string(&bg_path)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let bg_strip = std::fs::read(&strip_path)
+            .ok()
+            .and_then(|b| Pixmap::decode_png(&b).ok());
+        Self {
+            path,
+            bg_path,
+            strip_path,
+            brand: data.brand,
+            bookmarks: data.bookmarks,
+            background,
+            bg_strip,
+        }
     }
 
     fn save(&self) {
@@ -506,6 +600,36 @@ impl Prefs {
             if std::fs::write(&tmp, json).is_ok() {
                 let _ = std::fs::rename(&tmp, &self.path);
             }
+        }
+    }
+
+    fn set_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
+        let clean = data
+            .map(|s| s.trim().to_owned())
+            .filter(|s| s.starts_with("data:image/") || s.starts_with("https://") || s.starts_with("http://"));
+        if let Some(bg) = clean {
+            if let Some(p) = self.bg_path.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = std::fs::write(&self.bg_path, &bg);
+            self.background = Some(bg);
+            if let Some(b64) = strip_png.map(str::trim).filter(|s| !s.is_empty()) {
+                let raw = b64.strip_prefix("data:image/png;base64,").unwrap_or(b64);
+                if let Some(bytes) = favicons::base64_decode(raw)
+                    && let Ok(pm) = Pixmap::decode_png(&bytes)
+                {
+                    let _ = std::fs::write(&self.strip_path, &bytes);
+                    self.bg_strip = Some(pm);
+                }
+            } else {
+                let _ = std::fs::remove_file(&self.strip_path);
+                self.bg_strip = None;
+            }
+        } else {
+            let _ = std::fs::remove_file(&self.bg_path);
+            let _ = std::fs::remove_file(&self.strip_path);
+            self.background = None;
+            self.bg_strip = None;
         }
     }
 
@@ -600,6 +724,7 @@ struct NewTabState<'a> {
     brand: Brand,
     bookmarks: &'a [Bookmark],
     history: &'a [HistoryEntry],
+    background: Option<&'a str>,
 }
 
 struct Devtools {
@@ -934,6 +1059,7 @@ impl Browser {
             brand: prefs.brand,
             bookmarks: &prefs.bookmarks,
             history: history.entries(),
+            background: prefs.background.as_deref(),
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -1183,16 +1309,39 @@ impl Browser {
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
-    /// Theme & persona dropdown under the palette button: switch between Cederic (Orange) and Uzaki (Slate Blue).
+    /// Theme & persona dropdown under the palette button: switch between Cederic (Orange) and Uzaki (Slate Blue),
+    /// or choose / clear a custom background image.
     fn theme_menu(&mut self, right: f64, y: f64) {
         let cur = self.prefs.brand;
         let c_check = if cur == Brand::Cederic { "✓  Cederic (Orange)" } else { "   Cederic (Orange)" };
         let u_check = if cur == Brand::Uzaki { "✓  Uzaki (Slate Blue)" } else { "   Uzaki (Slate Blue)" };
+        let has_bg = self.prefs.background.is_some();
+        let bg_label = if has_bg { "Change background image…" } else { "Set background image…" };
         let items = vec![
             MenuItem::new(c_check, MenuAction::SetBrand(Brand::Cederic)).hint("Default"),
             MenuItem::new(u_check, MenuAction::SetBrand(Brand::Uzaki)).hint("Slate Blue"),
+            MenuItem::sep(),
+            MenuItem::new(bg_label, MenuAction::ChooseBackground),
+            MenuItem::new("Remove background image", MenuAction::ClearBackground).enabled(has_bg),
         ];
         self.show_menu(items, (right - 248.0).max(0.0), y);
+    }
+
+    fn apply_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
+        self.prefs.set_background(data, strip_png);
+        self.toolbar.set_background(self.prefs.bg_strip.clone());
+        self.sync_all_newtabs();
+        self.sync_ui();
+    }
+
+    fn choose_background(&mut self) {
+        let Some(id) = self.active_tab().map(|t| t.id) else { return };
+        let js = "window.__cedericOpenBgPicker && window.__cedericOpenBgPicker()".to_owned();
+        if devtools::port(&self.data_dir).is_some() {
+            let _ = self.thumbs_tx.send(thumbs::Request::EvalGesture(id, js));
+        } else {
+            self.with_active(|v| v.evaluate_script(&js));
+        }
     }
 
     fn set_brand(&mut self, brand: Brand) {
@@ -1241,7 +1390,8 @@ impl Browser {
         }
         if !r.image.is_empty() {
             items.push(MenuItem::new("Open image in new tab", MenuAction::OpenBackground(r.image.clone())));
-            items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image)));
+            items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image.clone())));
+            items.push(MenuItem::new("Set image as background", MenuAction::SetBackgroundUrl(r.image)));
             items.push(MenuItem::sep());
         }
         if r.video || r.pip || tab.pip {
@@ -1340,6 +1490,15 @@ impl Browser {
                 }
             }
             MenuAction::SetBrand(brand) => self.set_brand(brand),
+            MenuAction::ChooseBackground => self.choose_background(),
+            MenuAction::SetBackgroundUrl(url) => {
+                self.apply_background(Some(url.clone()), None);
+                if let Ok(u) = serde_json::to_string(&url) {
+                    let js = format!("window.__cedericApplyBgUrl && window.__cedericApplyBgUrl({u})");
+                    self.with_active(|v| v.evaluate_script(&js));
+                }
+            }
+            MenuAction::ClearBackground => self.apply_background(None, None),
         }
     }
 
@@ -1623,6 +1782,12 @@ impl Browser {
     }
 
     fn handle_newtab(&mut self, id: TabId, cmd: NewTabCmd) {
+        if let NewTabCmd::SetBackground { data, strip } = cmd {
+            let d = (!data.trim().is_empty()).then_some(data);
+            let s = (!strip.trim().is_empty()).then_some(strip);
+            self.apply_background(d, s.as_deref());
+            return;
+        }
         if let Some(spare) = &self.spare
             && spare.id == id
         {
@@ -1663,6 +1828,7 @@ impl Browser {
                 }
             }
             NewTabCmd::SetBrand { brand } => self.set_brand(brand),
+            NewTabCmd::SetBackground { .. } => {}
         }
     }
 
@@ -2066,7 +2232,8 @@ fn main() -> wry::Result<()> {
 
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
-    let toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
+    let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
+    toolbar.set_background(prefs.bg_strip.clone());
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
