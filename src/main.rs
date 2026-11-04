@@ -5,12 +5,9 @@ mod devtools;
 mod history;
 mod input;
 mod suggest;
+mod thumbs;
 
-use std::{
-    path::PathBuf,
-    sync::mpsc::Sender,
-    time::{Duration, Instant},
-};
+use std::{path::PathBuf, sync::mpsc::Sender};
 
 use history::{HistoryEntry, HistoryStore};
 use serde::{Deserialize, Serialize};
@@ -81,9 +78,12 @@ const SHORTCUT_SCRIPT: &str = r#"
     return null;
   };
   window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') window.ipc.postMessage('dismiss');
     const cmd = map(e);
     if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); }
   }, true);
+  // Popups never take focus, so a click in the page is what closes an open menu.
+  window.addEventListener('pointerdown', () => window.ipc.postMessage('dismiss'), true);
 
   // Bubble phase: pages with their own context menu call preventDefault first and keep it.
   // Editable fields keep the engine's menu so cut/paste/spellcheck work.
@@ -120,17 +120,21 @@ const SHORTCUT_SCRIPT: &str = r#"
 const BRAND_SCRIPT: &str = r#"
 (() => {
   if (location.hostname !== 'search.brave.com') return;
+  // Every Brave logo is an <img> named brave-logo-* or alt "Brave logo"; the link around it gets
+  // the Cederic wordmark instead. Links to Brave's own products are hidden rather than renamed.
   const css = `
-    img[alt="Brave logo"], .download-cta { display: none !important; }
-    a.ntp-logo, a.nav-logo, a.logo-wrapper { display: inline-flex !important; align-items: center;
+    img[src*="brave-logo" i], img[alt*="Brave logo" i], picture:has(img[alt*="Brave logo" i]) source,
+    .download-cta, .ask-brave-logo-divider, a[href*="//brave.com/"] { display: none !important; }
+    a:has(img[alt*="Brave logo" i]) { display: inline-flex !important; align-items: center;
       justify-content: center; text-decoration: none !important; }
-    a.ntp-logo::after, a.nav-logo::after { content: "Cederic"; font: 700 26px/1 "Segoe UI Variable Display", "Segoe UI", system-ui;
-      letter-spacing: -.8px; background: linear-gradient(90deg, #ff6a3d, #ffb03d);
-      -webkit-background-clip: text; background-clip: text; color: transparent; }
-    a.ntp-logo::after { font-size: 64px; letter-spacing: -2.5px; padding-bottom: 6px; }
-    a.logo-wrapper::after { content: "C"; display: grid; place-items: center; width: 26px; height: 26px;
-      border-radius: 8px; background: linear-gradient(135deg, #ff6a3d, #ffb03d); color: #fff;
-      font: 700 16px/1 "Segoe UI Variable Display", "Segoe UI", system-ui; }`;
+    a:has(img[alt*="Brave logo" i])::after { content: "Cederic"; font: 700 24px/1 "Segoe UI Variable Display", "Segoe UI", system-ui;
+      letter-spacing: -.7px; background: linear-gradient(90deg, #ff6a3d, #ffb03d);
+      -webkit-background-clip: text; background-clip: text; color: transparent; padding: 2px 0; }
+    a.ntp-logo:has(img[alt*="Brave logo" i])::after { font-size: 64px; letter-spacing: -2.5px; padding-bottom: 6px; }
+    a.logo-wrapper:has(img[alt*="Brave logo" i])::after { content: "C"; display: grid; place-items: center;
+      width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(135deg, #ff6a3d, #ffb03d);
+      -webkit-background-clip: border-box; background-clip: border-box; color: #fff; font-size: 16px;
+      letter-spacing: 0; padding: 0; }`;
   const style = document.createElement('style');
   style.textContent = css;
   // Rename "Brave" in visible text and labels, but never inside what the user typed.
@@ -205,8 +209,8 @@ enum UserEvent {
     Shortcut(Shortcut),
     NewTab(TabId, NewTabCmd),
     PageMenu(TabId, ContextRequest),
-    /// A popup message, and whether it came from the menu (vs. the suggestions popup).
-    Popup(PopupCmd, bool),
+    Popup(PopupCmd, PopupKind),
+    Thumb(TabId, String),
     UpgradeHttps(TabId, String),
     Title(TabId, String),
     Load(TabId, PageLoadEvent, String),
@@ -228,6 +232,9 @@ enum ChromeCmd {
     MoveTab { id: TabId, to: usize },
     TabMenu { id: TabId, x: f64, y: f64 },
     HistoryMenu { x: f64, y: f64 },
+    TabHover { id: TabId, x: f64, y: f64 },
+    TabHoverEnd,
+    Dismiss,
     Query { text: String, x: f64, y: f64, w: f64 },
     SuggestSelect { index: usize },
     SuggestClose,
@@ -278,6 +285,7 @@ enum Shortcut {
     Back,
     Forward,
     Devtools,
+    Dismiss,
 }
 
 impl Shortcut {
@@ -293,6 +301,7 @@ impl Shortcut {
             "back" => Self::Back,
             "forward" => Self::Forward,
             "devtools" => Self::Devtools,
+            "dismiss" => Self::Dismiss,
             _ => return None,
         })
     }
@@ -392,6 +401,8 @@ struct Tab {
     is_newtab: bool,
     /// Still painted in the new-tab page color; switches to white once a real page loads.
     newtab_bg: bool,
+    /// Small screenshot for the hover card, as a data URL.
+    thumb: String,
 }
 
 #[derive(Serialize)]
@@ -421,12 +432,19 @@ struct NewTabState<'a> {
     history: &'a [HistoryEntry],
 }
 
+/// Popups are shown once at creation without taking focus and then only moved: tao can show a
+/// window without activating it only at creation, and an active window gets the accent border.
+/// Hidden ones are parked off-screen.
 struct Popup {
     window: Window,
     view: WebView,
-    /// Never-hidden popups are parked off-screen instead: tao can only show a window without
-    /// activating it at creation, and the suggestions must not steal the address bar's focus.
-    parked: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PopupKind {
+    Menu,
+    Suggest,
+    Preview,
 }
 
 struct Devtools {
@@ -457,7 +475,9 @@ struct Browser {
     dark: bool,
     menu: Popup,
     menu_actions: Vec<Option<MenuAction>>,
-    menu_shown: Instant,
+    menu_open: bool,
+    preview: Popup,
+    thumbs_tx: Sender<thumbs::Request>,
     suggest: Popup,
     suggest_tx: Sender<suggest::Request>,
     suggest_seq: u64,
@@ -526,6 +546,9 @@ impl Browser {
             .with_visible(false)
             .with_initialization_script(SHORTCUT_SCRIPT)
             .with_initialization_script(BRAND_SCRIPT)
+            .with_initialization_script(format!(
+                "Object.defineProperty(window, '__cedericTab', {{ value: {id} }});"
+            ))
             .with_additional_browser_args(BROWSER_ARGS)
             .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
             .with_devtools(true)
@@ -576,6 +599,7 @@ impl Browser {
             loading: url.is_some(),
             is_newtab: url.is_none(),
             newtab_bg: url.is_none(),
+            thumb: String::new(),
         })
     }
 
@@ -616,6 +640,7 @@ impl Browser {
         }
         let was_active = idx == self.active;
         // Dropping the WebView tears down its renderer and frees its memory.
+        let _ = self.thumbs_tx.send(thumbs::Request::Forget(self.tabs[idx].id));
         drop(self.tabs.remove(idx));
         if self.tabs.is_empty() {
             self.active = 0;
@@ -678,7 +703,9 @@ impl Browser {
             let _ = tab.view.set_bounds(bounds);
             let _ = tab.view.set_visible(true);
             let _ = tab.view.focus();
+            let _ = self.thumbs_tx.send(thumbs::Request::Active(Some(tab.id)));
         }
+        self.hide_preview();
         self.sync_ui();
         if self.devtools.open {
             self.attach_devtools();
@@ -773,17 +800,17 @@ impl Browser {
         popup.window.set_inner_size(LogicalSize::new(w, h));
         popup.window.set_outer_position(pos);
         let _ = popup.view.set_bounds(rect(0.0, 0.0, w, h));
-        if !popup.parked {
-            popup.window.set_visible(true);
-        }
     }
 
     fn hide_popup(popup: &Popup) {
         let _ = popup.view.evaluate_script("window.hideAll && window.hideAll()");
-        if popup.parked {
-            popup.window.set_outer_position(PARKED);
-        } else {
-            popup.window.set_visible(false);
+        popup.window.set_outer_position(PARKED);
+    }
+
+    fn close_menu(&mut self) {
+        if self.menu_open {
+            self.menu_open = false;
+            Self::hide_popup(&self.menu);
         }
     }
 
@@ -796,10 +823,31 @@ impl Browser {
         let y = if y + h > size.height { (size.height - h).max(0.0) } else { y };
         let Ok(json) = serde_json::to_string(&items) else { return };
         self.menu_actions = items.into_iter().map(|i| i.action).collect();
+        self.hide_preview();
         Self::show_popup(&self.menu, &format!("window.showMenu({json})"), self.to_screen(x, y), W, h);
-        self.menu_shown = Instant::now();
-        self.menu.window.set_focus();
-        let _ = self.menu.view.focus();
+        self.menu_open = true;
+    }
+
+    /// Hover card under a tab: title, site and (for background tabs) a snapshot of the page.
+    fn show_preview(&mut self, id: TabId, x: f64, y: f64) {
+        const W: f64 = 280.0;
+        if self.menu_open {
+            return;
+        }
+        let Some(tab) = self.index_of(id).map(|i| &self.tabs[i]) else { return };
+        let active = self.active_tab().map(|t| t.id) == Some(id);
+        let img = if active { "" } else { tab.thumb.as_str() };
+        let shown = display_url(&tab.url);
+        let host = host_of(&shown).unwrap_or_default();
+        let title = if tab.title.is_empty() { "New Tab" } else { &tab.title };
+        let card = serde_json::json!({ "title": title, "host": host, "img": img });
+        let h = if img.is_empty() { 62.0 } else { 62.0 + 158.0 };
+        let x = x.clamp(0.0, (self.logical_size().width - W).max(0.0));
+        Self::show_popup(&self.preview, &format!("window.showPreview({card})"), self.to_screen(x, y), W, h);
+    }
+
+    fn hide_preview(&self) {
+        Self::hide_popup(&self.preview);
     }
 
     fn tab_menu(&mut self, id: TabId, x: f64, y: f64) {
@@ -938,11 +986,6 @@ impl Browser {
         }
     }
 
-    /// Gives keyboard focus back to the page after a menu closes.
-    fn refocus_page(&self) {
-        self.window.set_focus();
-        self.with_active(|v| v.focus());
-    }
 
     // ---------- search suggestions ----------
 
@@ -1113,6 +1156,9 @@ impl Browser {
             ChromeCmd::MoveTab { id, to } => self.move_tab(id, to),
             ChromeCmd::TabMenu { id, x, y } => self.tab_menu(id, x, y),
             ChromeCmd::HistoryMenu { x, y } => self.history_menu(x, y),
+            ChromeCmd::TabHover { id, x, y } => self.show_preview(id, x, y),
+            ChromeCmd::TabHoverEnd => self.hide_preview(),
+            ChromeCmd::Dismiss => self.close_menu(),
             ChromeCmd::Query { text, x, y, w } => self.query(text, x, y, w),
             ChromeCmd::SuggestSelect { index } => {
                 let _ = self.suggest.view.evaluate_script(&format!("window.select({index})"));
@@ -1154,21 +1200,18 @@ impl Browser {
         }
     }
 
-    fn handle_popup(&mut self, cmd: PopupCmd, from_menu: bool) {
-        match (cmd, from_menu) {
-            (PopupCmd::Close, true) => {
-                Self::hide_popup(&self.menu);
-                self.refocus_page();
-            }
-            (PopupCmd::Close, false) => self.close_suggest(),
-            (PopupCmd::Pick { index }, true) => {
-                Self::hide_popup(&self.menu);
-                self.refocus_page();
+    fn handle_popup(&mut self, cmd: PopupCmd, kind: PopupKind) {
+        match (cmd, kind) {
+            (_, PopupKind::Preview) => {}
+            (PopupCmd::Close, PopupKind::Menu) => self.close_menu(),
+            (PopupCmd::Close, PopupKind::Suggest) => self.close_suggest(),
+            (PopupCmd::Pick { index }, PopupKind::Menu) => {
+                self.close_menu();
                 if let Some(Some(action)) = self.menu_actions.get(index).cloned() {
                     self.run_menu_action(action);
                 }
             }
-            (PopupCmd::Pick { index }, false) => {
+            (PopupCmd::Pick { index }, PopupKind::Suggest) => {
                 if let Some(text) = self.suggestions.get(index).map(|s| s.text.clone()) {
                     let _ = self.chrome.evaluate_script("window.blurAddress && window.blurAddress()");
                     self.window.set_focus();
@@ -1193,6 +1236,7 @@ impl Browser {
             Shortcut::Back => self.handle_chrome(ChromeCmd::Back),
             Shortcut::Forward => self.handle_chrome(ChromeCmd::Forward),
             Shortcut::Devtools => self.toggle_devtools(),
+            Shortcut::Dismiss => self.close_menu(),
         }
     }
 
@@ -1238,7 +1282,12 @@ impl Browser {
             UserEvent::Shortcut(s) => self.handle_shortcut(s),
             UserEvent::NewTab(id, cmd) => self.handle_newtab(id, cmd),
             UserEvent::PageMenu(id, r) => self.page_menu(id, r),
-            UserEvent::Popup(cmd, from_menu) => self.handle_popup(cmd, from_menu),
+            UserEvent::Popup(cmd, kind) => self.handle_popup(cmd, kind),
+            UserEvent::Thumb(id, img) => {
+                if let Some(i) = self.index_of(id) {
+                    self.tabs[i].thumb = img;
+                }
+            }
             UserEvent::UpgradeHttps(id, https_url) => {
                 self.https_upgrades += 1;
                 if let Some((query, engine)) = input::extract_search(&https_url) {
@@ -1324,6 +1373,7 @@ impl Browser {
                     tab.title = host_of(&tab.url).unwrap_or("New Tab").to_owned();
                 }
                 if !started {
+                    let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
                     let proxy = self.proxy.clone();
                     let _ = tab.view.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
                         if let Some(icon) = parse_favicon(&res) {
@@ -1337,34 +1387,30 @@ impl Browser {
     }
 
     fn handle_window(&mut self, id: WindowId, event: WindowEvent) {
-        if id == self.menu.window.id() {
-            if let WindowEvent::Focused(false) = event {
-                // Right after a right-click the page grabs focus back once; keep the menu up
-                // and take focus again instead of closing it.
-                if self.menu_shown.elapsed() < Duration::from_millis(400) {
-                    self.menu.window.set_focus();
-                    let _ = self.menu.view.focus();
-                } else {
-                    Self::hide_popup(&self.menu);
-                }
-            }
-            return;
-        }
-        if id == self.suggest.window.id() {
-            // The suggestions popup must never take focus from the address bar.
+        if id != self.window.id() {
+            // Popups must never keep focus; hand it straight back if one ever gets it.
             if let WindowEvent::Focused(true) = event {
                 self.window.set_focus();
-                let _ = self.chrome.focus();
             }
             return;
         }
         match event {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.close_suggest();
+                self.close_menu();
+                self.hide_preview();
                 self.layout();
                 self.sync_ui();
             }
-            WindowEvent::Moved(_) => self.close_suggest(),
+            WindowEvent::Moved(_) => {
+                self.close_suggest();
+                self.close_menu();
+                self.hide_preview();
+            }
+            WindowEvent::Focused(false) => {
+                self.close_menu();
+                self.hide_preview();
+            }
             WindowEvent::CloseRequested => self.quit = true,
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f64>(self.window.scale_factor());
@@ -1435,7 +1481,7 @@ fn build_popup(
     owner: &Window,
     context: &mut WebContext,
     proxy: EventLoopProxy<UserEvent>,
-    is_menu: bool,
+    kind: PopupKind,
     dark: bool,
 ) -> wry::Result<Popup> {
     let card: Rgba = if dark { (43, 44, 50, 255) } else { (255, 255, 255, 255) };
@@ -1444,9 +1490,9 @@ fn build_popup(
         .with_undecorated_shadow(true)
         .with_background_color(card)
         .with_resizable(false)
-        .with_visible(!is_menu)
+        .with_visible(true)
         .with_focused(false)
-        .with_focusable(is_menu)
+        .with_focusable(false)
         .with_position(PARKED)
         .with_skip_taskbar(true)
         .with_owner_window(owner.hwnd())
@@ -1461,11 +1507,11 @@ fn build_popup(
         .with_hotkeys_zoom(false)
         .with_ipc_handler(move |req| {
             if let Ok(cmd) = serde_json::from_str::<PopupCmd>(req.body()) {
-                let _ = proxy.send_event(UserEvent::Popup(cmd, is_menu));
+                let _ = proxy.send_event(UserEvent::Popup(cmd, kind));
             }
         })
         .build(&window)?;
-    Ok(Popup { window, view, parked: !is_menu })
+    Ok(Popup { window, view })
 }
 
 fn main() -> wry::Result<()> {
@@ -1505,8 +1551,14 @@ fn main() -> wry::Result<()> {
         })
         .build_as_child(&window)?;
 
-    let menu = build_popup(&event_loop, &window, &mut context, proxy.clone(), true, dark)?;
-    let suggest = build_popup(&event_loop, &window, &mut context, proxy.clone(), false, dark)?;
+    let menu = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Menu, dark)?;
+    let suggest = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Suggest, dark)?;
+    let preview = build_popup(&event_loop, &window, &mut context, proxy.clone(), PopupKind::Preview, dark)?;
+
+    let p_thumb = proxy.clone();
+    let thumbs_tx = thumbs::spawn(dir.clone(), move |tab, img| {
+        let _ = p_thumb.send_event(UserEvent::Thumb(tab, img));
+    });
 
     let p_suggest = proxy.clone();
     let suggest_tx = suggest::spawn(move |res| {
@@ -1532,7 +1584,9 @@ fn main() -> wry::Result<()> {
         dark,
         menu,
         menu_actions: Vec::new(),
-        menu_shown: Instant::now(),
+        menu_open: false,
+        preview,
+        thumbs_tx,
         suggest,
         suggest_tx,
         suggest_seq: 0,

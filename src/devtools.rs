@@ -57,6 +57,12 @@ fn get(port: u16, path: &str) -> Option<String> {
     None
 }
 
+/// Ids of all page targets (tabs, the toolbar, popups).
+pub fn page_targets(port: u16) -> Option<Vec<String>> {
+    let targets: Vec<Target> = serde_json::from_str(&get(port, "/json/list")?).ok()?;
+    Some(targets.into_iter().filter(|t| t.kind == "page").map(|t| t.id).collect())
+}
+
 fn host(url: &str) -> &str {
     url.split_once("://").map_or("", |(_, r)| r.split(['/', '?', '#']).next().unwrap_or(""))
 }

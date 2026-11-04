@@ -24,30 +24,33 @@
   /* ---------- title bar / tab strip ---------- */
   #titlebar { position: relative; display: flex; align-items: stretch; height: 40px; background: var(--strip); }
   #grip { position: absolute; inset: 0 0 auto 0; height: 4px; cursor: n-resize; z-index: 5; }
-  #tabs { display: flex; align-items: flex-end; flex: 0 1 auto; min-width: 0; padding: 0 10px;
-    overflow-x: auto; scrollbar-width: none; }
+  /* Tabs are absolutely positioned by JS (left edge + width), so every move is an animated transform. */
+  #tabs { position: relative; flex: none; height: 40px; width: 16px; transition: width .24s var(--ease); }
   #drag { flex: 1 1 0; min-width: 48px; display: flex; align-items: center; }
 
-  .tab { position: relative; display: flex; align-items: center; gap: 8px; height: 33px;
-    flex: 0 1 236px; min-width: 44px; padding: 0 6px 0 12px; border-radius: 9px 9px 0 0;
-    color: var(--dim); overflow: hidden; contain: layout paint;
-    transition: flex-basis .22s var(--ease), min-width .22s var(--ease), padding .22s var(--ease),
-      opacity .18s var(--ease), background-color .15s, color .15s, transform .2s var(--ease); }
-  .tab::after { content: ""; position: absolute; right: 0; top: 9px; bottom: 9px; width: 1px;
-    background: var(--border); transition: opacity .15s; }
-  .tab:hover { background: var(--tab-hover); color: var(--fg); }
-  .tab:hover::after, .tab.active::after, .tab:has(+ .tab.active)::after,
-  .tab:has(+ .tab:hover)::after { opacity: 0; }
-  .tab.active { background: var(--toolbar); color: var(--fg); overflow: visible; z-index: 2; }
+  .tab { position: absolute; left: 0; bottom: 0; height: 34px; color: var(--dim); cursor: default;
+    transition: transform .24s var(--ease), width .24s var(--ease), opacity .2s var(--ease), color .15s; }
+  .tab .bg { position: absolute; inset: 0; border-radius: 10px 10px 0 0; transition: background-color .15s; }
+  .tab:hover .bg { background: var(--tab-hover); }
+  .tab:hover { color: var(--fg); }
+  .tab.active { color: var(--fg); z-index: 2; }
+  .tab.active .bg { background: var(--toolbar); }
   /* curved "feet" joining the active tab to the toolbar */
-  .tab.active::before, .tab.active .foot { content: ""; position: absolute; bottom: 0; width: 10px; height: 10px;
+  .tab.active .bg::before, .tab.active .bg::after { content: ""; position: absolute; bottom: 0; width: 10px; height: 10px;
     background: radial-gradient(circle at 0 0, transparent 9.5px, var(--toolbar) 10px); }
-  .tab.active::before { right: -10px; }
-  .tab.active .foot { left: -10px; transform: scaleX(-1); }
-  .tab.enter, .tab.leave { flex-basis: 0; min-width: 0; padding-left: 0; padding-right: 0; opacity: 0; }
-  .tab.leave { pointer-events: none; }
-  .tab.dragging { transition: background-color .15s, box-shadow .15s; z-index: 4; cursor: grabbing;
-    box-shadow: 0 4px 14px rgba(0,0,0,.3); background: var(--toolbar); color: var(--fg); }
+  .tab.active .bg::before { right: -10px; }
+  .tab.active .bg::after { left: -10px; transform: scaleX(-1); }
+  /* separators between inactive tabs */
+  .tab::after { content: ""; position: absolute; right: 0; top: 10px; bottom: 10px; width: 1px;
+    background: var(--border); transition: opacity .15s; }
+  .tab.nosep::after { opacity: 0; }
+  .tab .content { position: relative; display: flex; align-items: center; gap: 8px; height: 100%;
+    padding: 0 7px 0 12px; overflow: hidden; }
+  .tab.enter { opacity: 0; }
+  .tab.leave { opacity: 0; pointer-events: none; }
+  .tab.dragging { transition: width .24s var(--ease), opacity .2s; z-index: 5; color: var(--fg); }
+  .tab.dragging .bg { background: var(--toolbar); box-shadow: 0 6px 18px rgba(0,0,0,.35); border-radius: 10px; }
+  .tab.dragging .bg::before, .tab.dragging .bg::after { display: none; }
   .tab.dragging::after { opacity: 0; }
 
   .icon { position: relative; width: 16px; height: 16px; flex: none; }
@@ -62,13 +65,16 @@
   @keyframes spin { to { rotate: 360deg; } }
 
   .tab .t { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap;
-    mask-image: linear-gradient(90deg, #000 calc(100% - 22px), transparent); }
-  .tab .x { flex: none; width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center;
-    opacity: 0; transform: scale(.7); transition: opacity .15s, transform .2s var(--spring), background-color .12s; }
-  .tab .x svg { width: 12px; height: 12px; stroke-width: 2.2; }
-  .tab:hover .x, .tab.active .x { opacity: .75; transform: scale(1); }
+    mask-image: linear-gradient(90deg, #000 calc(100% - 20px), transparent); }
+  .tab .x { flex: none; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center;
+    opacity: 0; transform: scale(.6); transition: opacity .15s, transform .2s var(--spring), background-color .12s; }
+  .tab .x svg { width: 11px; height: 11px; stroke-width: 2.4; }
+  .tab:hover .x, .tab.active .x { opacity: .7; transform: scale(1); }
   .tab .x:hover { opacity: 1; background: var(--btn-hover); }
-  .tab .x:active { background: var(--btn-press); transform: scale(.88); }
+  .tab .x:active { background: var(--btn-press); transform: scale(.85); }
+  /* narrow tabs: icon only, centered; the active one keeps its close button */
+  .tab.narrow .t { display: none; }
+  .tab.narrow .content { justify-content: center; padding: 0 4px; }
   .tab.narrow:not(.active) .x { display: none; }
 
   #new { flex: none; width: 30px; height: 30px; margin: 0 4px; border-radius: 8px; display: grid; place-items: center;
@@ -173,37 +179,92 @@
     restore: '<svg viewBox="0 0 10 10"><rect x=".5" y="2.5" width="7" height="7"/><path d="M2.5 2.5V.5h7v7h-2"/></svg>',
   };
 
-  // Animate a freshly inserted element from its "from" class to its resting state.
-  const enter = (el) => { el.classList.add('enter'); el.offsetWidth; el.classList.remove('enter'); };
+
+  // ---- tab strip: JS owns the order and places each tab at x = PAD + i * width ----
+  const PAD = 8, MAX_W = 240, MIN_W = 48, NARROW_W = 88;
+  let order = [], tabW = MAX_W, frozenW = null, hoverId = null, keepOrderUntil = 0;
+
+  function availableWidth() {
+    return $('titlebar').clientWidth - $('winctl').offsetWidth - 38 - 40 - PAD * 2;
+  }
+
+  function layoutTabs() {
+    const ids = order.filter((id) => els.has(id));
+    const n = Math.max(1, ids.length);
+    tabW = frozenW || Math.max(MIN_W, Math.min(MAX_W, Math.floor(availableWidth() / n)));
+    let slots = ids;
+    if (drag && drag.active) { slots = ids.filter((id) => id !== drag.id); slots.splice(drag.to, 0, drag.id); }
+    const activeAt = state ? slots.indexOf(state.active) : -1, hoverAt = slots.indexOf(hoverId);
+    slots.forEach((id, i) => {
+      const el = els.get(id);
+      el.style.width = tabW + 'px';
+      if (!(drag && drag.active && drag.id === id)) el.style.transform = `translateX(${PAD + i * tabW}px)`;
+      el.classList.toggle('narrow', tabW < NARROW_W);
+      // No separator next to the active or hovered tab, nor after the last one.
+      const nosep = i === activeAt || i === activeAt - 1 || i === hoverAt || i === hoverAt - 1 || i === slots.length - 1;
+      el.classList.toggle('nosep', nosep);
+    });
+    tabsBox.style.width = (PAD * 2 + slots.length * tabW) + 'px';
+  }
+  window.addEventListener('resize', () => { frozenW = null; layoutTabs(); });
+  // After closing tabs with the mouse, widths stay put until the pointer leaves the strip, so the
+  // next close button lands under the cursor.
+  $('titlebar').addEventListener('pointerleave', () => { if (frozenW) { frozenW = null; layoutTabs(); } });
 
   function makeTab(t) {
     const el = document.createElement('div');
-    el.className = 'tab';
-    el.innerHTML = '<span class="foot"></span><span class="icon"><img alt=""><span class="globe">' + ICONS.globe +
-      '</span><span class="spin"></span></span><span class="t"></span><button class="x" title="Close tab (Ctrl+W)">' + ICONS.x + '</button>';
+    el.className = 'tab enter';
+    el.innerHTML = '<div class="bg"></div><div class="content"><span class="icon"><img alt=""><span class="globe">' + ICONS.globe +
+      '</span><span class="spin"></span></span><span class="t"></span><button class="x" title="Close tab (Ctrl+W)">' + ICONS.x + '</button></div>';
     const img = el.querySelector('img');
     img.onerror = () => el.classList.remove('has-icon');
     img.onload = () => el.classList.add('has-icon');
-    el.querySelector('.x').onclick = (e) => { e.stopPropagation(); closeTab(t.id); };
+    el.querySelector('.x').addEventListener('pointerdown', (e) => e.stopPropagation());
+    el.querySelector('.x').onclick = (e) => { e.stopPropagation(); closeTab(t.id, true); };
     el.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('.x')) return;
-      if (e.button === 1) { e.preventDefault(); closeTab(t.id); return; }
+      endHover();
+      if (e.button === 1) { e.preventDefault(); closeTab(t.id, true); return; }
       if (e.button !== 0) return;
       send({ cmd: 'switch', id: t.id });
-      drag = { el, id: t.id, startX: e.clientX, active: false };
+      const i = order.indexOf(t.id);
+      drag = { el, id: t.id, startX: e.clientX, from: i, to: i, active: false };
       el.setPointerCapture(e.pointerId);
     });
     el.addEventListener('pointermove', onDragMove);
     el.addEventListener('pointerup', onDragEnd);
     el.addEventListener('pointercancel', onDragEnd);
+    el.addEventListener('pointerenter', () => { hoverId = t.id; layoutTabs(); startHover(t.id, el); });
+    el.addEventListener('pointerleave', () => { if (hoverId === t.id) hoverId = null; layoutTabs(); leaveHover(); });
     el.addEventListener('contextmenu', (e) => {
       e.preventDefault();
+      endHover();
       send({ cmd: 'tab_menu', id: t.id, x: e.clientX, y: e.clientY });
     });
     return el;
   }
 
-  // ---- drag to reorder: other tabs slide out of the way, the dragged one follows the pointer ----
+  // ---- hover cards: appear after a short pause, then follow the pointer from tab to tab instantly ----
+  let hoverTimer = 0, cardShown = false;
+  function startHover(id, el) {
+    if (drag && drag.active) return;
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(() => {
+      const r = el.getBoundingClientRect();
+      send({ cmd: 'tab_hover', id, x: r.left, y: r.bottom + 2 });
+      cardShown = true;
+    }, cardShown ? 0 : 500);
+  }
+  function leaveHover() {
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(endHover, 150);
+  }
+  function endHover() {
+    clearTimeout(hoverTimer);
+    if (cardShown) send({ cmd: 'tab_hover_end' });
+    cardShown = false;
+  }
+
+  // ---- drag to reorder: the tab follows the pointer, the others glide to their new slots ----
   let drag = null;
   function onDragMove(e) {
     if (!drag) return;
@@ -211,58 +272,53 @@
     if (!drag.active) {
       if (Math.abs(dx) < 5) return;
       drag.active = true;
-      drag.order = [...tabsBox.children].filter((c) => !c.classList.contains('leave'));
-      drag.rects = drag.order.map((c) => c.getBoundingClientRect());
-      drag.from = drag.to = drag.order.indexOf(drag.el);
       drag.el.classList.add('dragging');
+      endHover();
     }
-    const { order, rects, from, el } = drag;
-    const me = rects[from], last = rects[rects.length - 1];
-    const x = Math.max(rects[0].left - me.left, Math.min(last.right - me.right, dx));
-    el.style.transform = `translateX(${x}px)`;
-    const center = me.left + me.width / 2 + x;
-    let to = 0;
-    rects.forEach((r, j) => { if (j !== from && r.left + r.width / 2 < center) to++; });
-    if (to === drag.to) return;
-    drag.to = to;
-    order.forEach((c, j) => {
-      if (j === from) return;
-      const shift = from < to && j > from && j <= to ? -me.width : from > to && j >= to && j < from ? me.width : 0;
-      c.style.transform = shift ? `translateX(${shift}px)` : '';
-    });
+    const n = order.filter((id) => els.has(id)).length;
+    const x = Math.max(PAD, Math.min(PAD + (n - 1) * tabW, PAD + drag.from * tabW + dx));
+    drag.el.style.transform = `translateX(${x}px)`;
+    const to = Math.max(0, Math.min(n - 1, Math.round((x - PAD) / tabW)));
+    if (to !== drag.to) { drag.to = to; layoutTabs(); }
   }
   function onDragEnd() {
     if (!drag) return;
-    const d = drag; drag = null;
+    const d = drag;
+    drag = null;
     if (!d.active) return;
-    const before = d.el.getBoundingClientRect().left;
-    for (const c of d.order) { c.style.transition = 'none'; c.style.transform = ''; }
-    const rest = d.order.filter((c) => c !== d.el);
-    tabsBox.insertBefore(d.el, rest[d.to] || null);
-    const after = d.el.getBoundingClientRect().left;
-    d.el.style.transform = `translateX(${before - after}px)`;
-    d.el.offsetWidth;
-    for (const c of d.order) c.style.transition = '';
+    order = order.filter((id) => id !== d.id);
+    order.splice(d.to, 0, d.id);
     d.el.classList.remove('dragging');
-    d.el.style.transform = '';
-    if (d.to !== d.from) send({ cmd: 'move_tab', id: d.id, to: d.to });
+    layoutTabs();
+    if (d.to !== d.from) {
+      keepOrderUntil = performance.now() + 500;
+      send({ cmd: 'move_tab', id: d.id, to: d.to });
+    }
   }
 
   function removeTab(id) {
     const el = els.get(id);
     if (!el) return;
     els.delete(id);
+    order = order.filter((x) => x !== id);
+    if (hoverId === id) hoverId = null;
     el.classList.add('leave');
-    el.addEventListener('transitionend', () => el.remove(), { once: true });
-    setTimeout(() => el.remove(), 300);
+    el.style.width = '0px';
+    setTimeout(() => el.remove(), 260);
+    layoutTabs();
   }
   // Collapse the tab right away; the browser confirms with the next render.
-  function closeTab(id) { removeTab(id); send({ cmd: 'close_tab', id }); }
+  function closeTab(id, byMouse) {
+    if (byMouse) frozenW = tabW;
+    endHover();
+    removeTab(id);
+    send({ cmd: 'close_tab', id });
+  }
 
   function updateTab(el, t, active) {
     el.classList.toggle('active', active);
     el.classList.toggle('loading', t.loading);
-    el.title = t.title;
+    el.title = '';
     const title = el.querySelector('.t');
     const text = t.title || 'New Tab';
     if (title.textContent !== text) title.textContent = text;
@@ -305,22 +361,35 @@
   window.render = (s) => {
     const switched = !state || state.active !== s.active;
     state = s;
-    const ids = new Set(s.tabs.map((t) => t.id));
+    const incoming = s.tabs.map((t) => t.id);
+    const ids = new Set(incoming);
     for (const id of [...els.keys()]) if (!ids.has(id)) removeTab(id);
 
-    let prev = null;
+    const fresh = [];
     for (const t of s.tabs) {
       let el = els.get(t.id);
-      const fresh = !el;
-      if (fresh) { el = makeTab(t); els.set(t.id, el); }
-      const want = prev ? prev.nextSibling : tabsBox.firstChild;
-      if (want !== el && !(drag && drag.active)) tabsBox.insertBefore(el, want);
+      if (!el) {
+        el = makeTab(t);
+        els.set(t.id, el);
+        fresh.push(el);
+        // Start collapsed at its future slot, so it grows in place while neighbours slide over.
+        const at = incoming.indexOf(t.id);
+        el.style.width = '0px';
+        el.style.transform = `translateX(${PAD + at * tabW}px)`;
+        tabsBox.append(el);
+      }
       updateTab(el, t, t.id === s.active);
-      if (fresh) enter(el);
-      prev = el;
     }
-    const narrow = tabsBox.clientWidth / Math.max(1, s.tabs.length) < 90;
-    for (const el of els.values()) el.classList.toggle('narrow', narrow);
+    // While a drag is in progress (or just ended), the strip's own order wins.
+    if (drag && drag.active || performance.now() < keepOrderUntil) {
+      order = order.filter((id) => ids.has(id)).concat(incoming.filter((id) => !order.includes(id)));
+    } else {
+      order = incoming;
+    }
+    if (fresh.length) frozenW = null;
+    tabsBox.offsetWidth;
+    for (const el of fresh) el.classList.remove('enter');
+    layoutTabs();
 
     if (!editing || switched) addr.value = s.url;
     omni.classList.toggle('empty', !s.url);
@@ -389,7 +458,6 @@
     if (e.button !== 0 || !isDragArea(e.target)) return;
     send({ cmd: e.detail === 2 ? 'maximize' : 'drag' });
   });
-  tabsBox.addEventListener('wheel', (e) => { tabsBox.scrollLeft += e.deltaY; }, { passive: true });
 
   window.addEventListener('keydown', (e) => {
     const c = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
@@ -403,6 +471,9 @@
     if (cmd) { e.preventDefault(); send(cmd); }
   });
   document.addEventListener('contextmenu', (e) => { if (e.target !== addr) e.preventDefault(); });
+  // Popups never take focus, so a click here is what closes an open menu.
+  window.addEventListener('pointerdown', () => send({ cmd: 'dismiss' }), true);
+  window.addEventListener('keydown', (e) => { if (e.key === 'Escape') send({ cmd: 'dismiss' }); }, true);
   send({ cmd: 'ready' });
 </script>
 </body>

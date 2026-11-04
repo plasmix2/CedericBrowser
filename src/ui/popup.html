@@ -32,6 +32,14 @@
   .suggest .row b { font-weight: 600; }
   .suggest .row .hint { opacity: 0; transition: opacity .1s; }
   .suggest .row.sel .hint, .suggest .row:hover .hint { opacity: 1; }
+  #card.preview { padding: 0; display: flex; flex-direction: column; }
+  .preview .shot { height: 158px; flex: none; background: #000 center / cover no-repeat;
+    border-bottom: 1px solid var(--border); }
+  .preview .text { padding: 11px 14px 0; display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .preview .title { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .preview .host { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .preview .host svg { width: 12px; height: 12px; }
 </style>
 </head>
 <body>
@@ -44,6 +52,27 @@
     url: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>',
   };
   let rows = [], sel = -1, kind = '';
+
+  // Hover card for a tab. Moving between tabs only swaps the content, without replaying the fade.
+  window.showPreview = (p) => {
+    const wasOpen = kind === 'preview' && card.classList.contains('show');
+    kind = 'preview'; rows = [];
+    card.textContent = '';
+    if (p.img) {
+      const shot = document.createElement('div');
+      shot.className = 'shot';
+      shot.style.backgroundImage = `url("${p.img}")`;
+      card.append(shot);
+    }
+    const text = document.createElement('div'); text.className = 'text';
+    const title = document.createElement('div'); title.className = 'title'; title.textContent = p.title;
+    const host = document.createElement('div'); host.className = 'host';
+    host.innerHTML = ICONS.url;
+    host.append(p.host || 'New tab');
+    text.append(title, host);
+    card.append(text);
+    if (wasOpen) card.className = 'preview show'; else animateIn('preview');
+  };
 
   function animateIn(cls) {
     card.className = cls;
