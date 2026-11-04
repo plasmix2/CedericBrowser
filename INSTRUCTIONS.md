@@ -86,7 +86,7 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 
 | Agent / Owner | Branch | Files Being Touched | Task Summary |
 |---|---|---|---|
-| *(none currently)* | — | — | — |
+| Antigravity (`agy`) | `agy/perf-improvements` | `src/main.rs`, `src/toolbar.rs`, `src/gfx.rs`, `src/popups.rs`, `src/thumbs.rs`, `src/ui/newtab.html` | Browser-wide performance optimization (WebView2 args/DNS, layout/sync_ui, font loading, rendering, JS observers, thumbnail worker) |
 
 ---
 
