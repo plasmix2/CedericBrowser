@@ -570,4 +570,39 @@ mod tests {
             pm.save_png(dir.join(format!("{name}.png"))).unwrap();
         }
     }
+
+    /// Opens real windows and shows each popup in them, so a window-level artifact can be looked at:
+    /// `cargo test -- --ignored live_popups` and screenshot the screen while it runs.
+    #[test]
+    #[ignore]
+    fn live_popups() {
+        use tao::{
+            event::Event,
+            event_loop::{ControlFlow, EventLoopBuilder},
+            platform::{run_return::EventLoopExtRunReturn, windows::EventLoopBuilderExtWindows},
+        };
+        let mut el = EventLoopBuilder::new().with_any_thread(true).build();
+        let main = WindowBuilder::new().with_decorations(false).with_inner_size(LogicalSize::new(900.0, 500.0)).with_position(LogicalPosition::new(0.0, 0.0)).build(&el).unwrap();
+        let mut popups = Popups::new(&el, &main, true, Brand::Cederic);
+        let entry = |label: &str, hint: Option<&str>| MenuEntry { label: label.into(), hint: hint.map(Into::into), disabled: false, sep: false };
+        popups.show(Kind::Menu, Content::Menu(vec![entry("Bookmark this page", Some("Ctrl+D")), entry("No saved bookmarks yet", None)]), LogicalPosition::new(150.0, 100.0), 248.0);
+        popups.show(Kind::Suggest, Content::Suggest { query: "dsda".into(), items: (0..4).map(|i| SuggestEntry { text: format!("suggestion {i}"), url: false }).collect() }, LogicalPosition::new(150.0, 260.0), 500.0);
+        for p in [&popups.menu, &popups.suggest] {
+            let w = &p.window;
+            eprintln!("POPUP {:?} inner={:?} outer={:?} inner_pos={:?} outer_pos={:?} scale={} decorated={}", p.kind, w.inner_size(), w.outer_size(), w.inner_position(), w.outer_position(), w.scale_factor(), w.is_decorated());
+        }
+        let start = Instant::now();
+        el.run_return(|event, _, flow| {
+            *flow = ControlFlow::WaitUntil(Instant::now() + std::time::Duration::from_millis(50));
+            popups.tick(Instant::now());
+            if let Event::RedrawRequested(id) = event {
+                if let Some(kind) = popups.owns(id) {
+                    popups.redraw(kind);
+                }
+            }
+            if start.elapsed() > std::time::Duration::from_secs(8) {
+                *flow = ControlFlow::Exit;
+            }
+        });
+    }
 }
