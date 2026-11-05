@@ -20,8 +20,8 @@ Pushing a version tag builds Persona on GitHub Actions and publishes it as a rel
 (`.github/workflows/release.yml`). The tag must match `version` in `Cargo.toml`:
 
 ```
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Installed copies check this repository's releases about 15 seconds after starting. If there is a

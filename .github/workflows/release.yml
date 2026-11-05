@@ -1,9 +1,9 @@
 # Builds Persona for Windows and publishes it as a GitHub release when a version tag is pushed:
 #
-#   git tag v0.3.0 && git push origin v0.3.0
+#   git tag v0.2.0 && git push origin v0.2.0        -> release "Persona V0.2.0"
+#   git tag v0.2.0-pre && git push origin v0.2.0-pre -> the same, as a pre-release
 #
-# The tag must match `version` in Cargo.toml. Tags with a suffix (v0.3.1-beta.1) become
-# pre-releases. Installed copies of Persona pick the new release up automatically (src/update.rs).
+# The tag must match `version` in Cargo.toml; anything after a '-' marks a pre-release. Installed copies of Persona pick the new release up automatically (src/update.rs).
 name: Release
 
 on:
@@ -20,6 +20,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Tag matches Cargo.toml version
+        id: version
         shell: bash
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
@@ -27,6 +28,7 @@ jobs:
             echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version $version" >&2
             exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -44,7 +46,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          name: Persona ${{ github.ref_name }}
+          name: Persona V${{ steps.version.outputs.version }}
           files: Persona-${{ github.ref_name }}.exe
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
