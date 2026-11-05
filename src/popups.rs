@@ -34,12 +34,16 @@ const PAD: f32 = 5.0;
 pub const CARD_W: f32 = 280.0;
 const SHOT_H: f32 = 158.0;
 const CARD_TEXT_H: f32 = 62.0;
+const TIP_H: f32 = 28.0;
+const TIP_FONT: f32 = 12.5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Menu,
     Suggest,
     Preview,
+    /// Toolbar button tooltips; its own window so it never fights the hover card.
+    Tip,
 }
 
 pub struct MenuEntry {
@@ -66,6 +70,8 @@ pub enum Content {
     Menu(Vec<MenuEntry>),
     Suggest { items: Vec<SuggestEntry>, query: String },
     Preview(Card),
+    /// One-line tooltip under a toolbar button.
+    Tip(String),
 }
 
 /// A row laid out for drawing and hit-testing.
@@ -114,6 +120,7 @@ pub struct Popups {
     pub menu: Popup,
     pub suggest: Popup,
     pub preview: Popup,
+    pub tip: Popup,
     last_frame: Instant,
 }
 
@@ -126,6 +133,7 @@ impl Popups {
             menu: make(Kind::Menu),
             suggest: make(Kind::Suggest),
             preview: make(Kind::Preview),
+            tip: make(Kind::Tip),
             theme,
             last_frame: Instant::now(),
         }
@@ -139,7 +147,7 @@ impl Popups {
     pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor) {
         self.theme = Theme::for_persona(dark, color);
         let c = self.theme.card;
-        for p in [&self.menu, &self.suggest, &self.preview] {
+        for p in [&self.menu, &self.suggest, &self.preview, &self.tip] {
             p.window.set_background_color(Some((c.0, c.1, c.2, 255)));
             if p.open {
                 p.window.request_redraw();
@@ -152,7 +160,15 @@ impl Popups {
             Kind::Menu => &mut self.menu,
             Kind::Suggest => &mut self.suggest,
             Kind::Preview => &mut self.preview,
+            Kind::Tip => &mut self.tip,
         }
+    }
+
+    /// Window width that fits a tooltip showing `text`, measured with the real font.
+    pub fn tip_width(&mut self, text: &str) -> f32 {
+        let s = self.tip.window.scale_factor() as f32;
+        let b = self.fonts.line(text, TIP_FONT, Weight::NORMAL, s);
+        (text_width(&b, s) + 22.0).ceil()
     }
 
     pub fn is_open(&self, kind: Kind) -> bool {
@@ -160,6 +176,7 @@ impl Popups {
             Kind::Menu => self.menu.open,
             Kind::Suggest => self.suggest.open,
             Kind::Preview => self.preview.open,
+            Kind::Tip => self.tip.open,
         }
     }
 
@@ -183,15 +200,17 @@ impl Popups {
         p.v.size = (w, h);
         p.open = true;
         if fresh {
-            // Resizing exposes unpainted pixels (white slivers, stale content). Keep the window
-            // off-screen until `redraw` has painted it at the new size, then move it into place.
+            // Resizing exposes unpainted pixels. Keep the window off-screen while it is resized and
+            // painted, and only then move it into place (`redraw` applies `pending_pos`).
             p.window.set_outer_position(PARKED);
             p.window.set_inner_size(LogicalSize::new(w as f64, h as f64));
             p.pending_pos = Some(pos);
         } else {
             p.window.set_outer_position(pos);
         }
-        p.window.request_redraw();
+        // Paint now rather than waiting for the OS to deliver a redraw request: a popup must never
+        // appear with stale or missing content.
+        self.redraw(kind);
         h
     }
 
@@ -214,7 +233,7 @@ impl Popups {
     }
 
     pub fn owns(&self, id: WindowId) -> Option<Kind> {
-        [&self.menu, &self.suggest, &self.preview].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
+        [&self.menu, &self.suggest, &self.preview, &self.tip].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
     }
 
     /// Mouse input on a popup window. Returns a pick when a row was clicked.
@@ -271,7 +290,8 @@ impl Popups {
         self.last_frame = now;
         let k = 1.0 - (-dt * 30.0).exp();
         let mut busy = false;
-        for p in [&mut self.menu, &mut self.suggest, &mut self.preview] {
+        let mut dirty = Vec::new();
+        for p in [&mut self.menu, &mut self.suggest, &mut self.preview, &mut self.tip] {
             if !p.open {
                 continue;
             }
@@ -290,9 +310,13 @@ impl Popups {
                 }
             }
             if moved {
-                p.window.request_redraw();
+                dirty.push(p.kind);
                 busy = true;
             }
+        }
+        // Animation frames are painted directly; OS redraw requests can be coalesced or dropped.
+        for kind in dirty {
+            self.redraw(kind);
         }
         busy.then(|| now + crate::pacer::FRAME)
     }
@@ -305,6 +329,7 @@ impl Popups {
             Kind::Menu => &mut self.menu,
             Kind::Suggest => &mut self.suggest,
             Kind::Preview => &mut self.preview,
+            Kind::Tip => &mut self.tip,
         };
         if !p.open {
             return;
@@ -340,6 +365,10 @@ impl Popup {
         let window = Rc::new(
             WindowBuilder::new()
                 .with_decorations(false)
+                // tao turns the shadow frame on by default for undecorated windows. That frame
+                // reserves an unpainted strip on the left, right and bottom of the client area,
+                // which showed as black edges and stale content around every popup.
+                .with_undecorated_shadow(false)
                 .with_background_color((card.0, card.1, card.2, 255))
                 .with_resizable(false)
                 .with_visible(true)
@@ -423,6 +452,11 @@ fn layout(fonts: &mut Fonts, content: &Content, s: f32) -> (Vec<Row>, f32) {
             rows.push(Row { y: img_h, h: CARD_TEXT_H, label: Some(title), hint: Some(host), enabled: false });
             return (rows, img_h + CARD_TEXT_H);
         }
+        Content::Tip(text) => {
+            let label = fonts.line(text, TIP_FONT, Weight::NORMAL, s);
+            rows.push(Row { y: 0.0, h: TIP_H, label: Some(label), hint: None, enabled: false });
+            return (rows, TIP_H);
+        }
     }
     (rows, y + PAD)
 }
@@ -485,6 +519,13 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
                 {
                     c.text(fonts, b, w - PAD - 12.0 - hint_w, y + (r.h - 11.5 * 1.35) / 2.0, th.dim.with_alpha(a), w, 0.0);
                 }
+            }
+        }
+        Content::Tip(_) => {
+            if let Some(r) = p.rows.first_mut()
+                && let Some(b) = &mut r.label
+            {
+                c.text(fonts, b, 11.0, r.y + dy + (TIP_H - TIP_FONT * 1.35) / 2.0, th.fg.with_alpha(a), w - 6.0, 0.0);
             }
         }
         Content::Preview(card) => {
@@ -587,7 +628,9 @@ mod tests {
         let entry = |label: &str, hint: Option<&str>| MenuEntry { label: label.into(), hint: hint.map(Into::into), disabled: false, sep: false };
         popups.show(Kind::Menu, Content::Menu(vec![entry("Bookmark this page", Some("Ctrl+D")), entry("No saved bookmarks yet", None)]), LogicalPosition::new(150.0, 100.0), 248.0);
         popups.show(Kind::Suggest, Content::Suggest { query: "dsda".into(), items: (0..4).map(|i| SuggestEntry { text: format!("suggestion {i}"), url: false }).collect() }, LogicalPosition::new(150.0, 260.0), 500.0);
-        for p in [&popups.menu, &popups.suggest] {
+        let tw = popups.tip_width("Developer tools (F12)");
+        popups.show(Kind::Tip, Content::Tip("Developer tools (F12)".into()), LogicalPosition::new(500.0, 100.0), tw);
+        for p in [&popups.menu, &popups.suggest, &popups.tip] {
             let w = &p.window;
             eprintln!("POPUP {:?} inner={:?} outer={:?} inner_pos={:?} outer_pos={:?} scale={} decorated={}", p.kind, w.inner_size(), w.outer_size(), w.inner_position(), w.outer_position(), w.scale_factor(), w.is_decorated());
         }

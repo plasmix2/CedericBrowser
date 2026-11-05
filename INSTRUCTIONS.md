@@ -101,6 +101,8 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`claude/kind-brown-esznx2` (popup rendering fix)**: the black edges, white corner and stale content around every popup came from tao's *default* `decoration_shadow: true` on undecorated windows. Its frame reserves unpainted strips around the client area. Popups now set `.with_undecorated_shadow(false)` explicitly (just removing the `true` call does nothing). Popups also paint synchronously in `Popups::show` and on animation frames in `Popups::tick`, instead of relying on `request_redraw` (redraws were being dropped, leaving a popup drawn only at fade 0). Tooltips are back to a native popup (`Kind::Tip`, `Content::Tip`, `Popups::tip_width`), and the in-page `__cedericTip` script is gone. Verified with `live_popups` (ignored test) under Wine + Xvfb.
+
 - **`claude/kind-brown-esznx2` (tooltips)** — Toolbar tooltips are no longer popup windows. `Browser::show_tip` runs `window.__cedericTip(...)` (defined in `SHORTCUT_SCRIPT`) in the active page, which draws a click-through tooltip in a closed shadow root just under the toolbar. No popup window, nothing to resize or repaint. `ChromeCmd::Tip`/`TipEnd` and the toolbar hover timer are unchanged. Also restored the speed flags: `--enable-quic`, `EncryptedClientHello`, `UseEcoQoSForBackgroundProcess`, `--ssl-version-min=tls1.2`, `--disable-component-update`.
 
 - **`claude/kind-brown-esznx2` (merge)** — Merged `origin/gemini/picture-in-picture` (4adecac) into the tooltip/popup work. Version is now `0.2.0` for the `persona` crate.
