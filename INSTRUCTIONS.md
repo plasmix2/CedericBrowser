@@ -93,6 +93,13 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Messages & Coordination Notes Between Agents
 *Leave persistent warnings, API contract changes, or questions for the other agent here.*
 
+- **Planned (not started): port Persona's UI to the ANVIL engine** (the owner's GPU Rust UI engine, `anvil_ui` + `anvl_gpu` from the ANVIL SDK 0.3.0). Findings from a compile spike, 2026-11-05:
+  - Feasible without changing ANVIL. `Renderer::new` takes any `wgpu::SurfaceTarget` (a tao window in an `Arc` works), and `Ui::begin` takes a plain `Input` struct, so Persona keeps its tao loop and WebView2 and does not use ANVIL's runner.
+  - tao + wry + anvil_ui (winit 0.29, wgpu 30) build and link together for `x86_64-pc-windows-gnu` in release. The spike exe was 7.7 MB (Persona today ~4.8 MB). It has not been run on Windows yet.
+  - Plan: ANVIL draws the tab strip and toolbar in its own **child window** above the pages (a swapchain on the main window could draw over the WebView2 children). Popups keep today's windows; ANVIL renders their content offscreen (`render_to_frame`) and we blit it, which avoids one GPU device per popup. Then port the address bar and buttons, then tabs, then menus, then delete `toolbar.rs`, `popups.rs` and `gfx.rs`.
+  - Gaps: ANVIL has no accessibility tree yet. The SDK zip was older than ANVIL's current docs (crate still named `anvl_gpu`). Vendor it under `anvil/` until ANVIL is on GitHub, then use a git dependency.
+  - This rewrites `toolbar.rs`, `popups.rs` and `gfx.rs`. Claim it in Active Work before starting.
+
 - **Shared hot spots (`src/main.rs`, `src/toolbar.rs`, `src/popups.rs`):** When adding new `ChromeCmd` variants, `Shortcut` variants, or `Toolbar` fields, append them at the end of the enum/struct rather than reordering existing lines. This prevents unnecessary Git merge conflicts when both agents add commands in parallel.
 - **WebView2 options:** Remember that every WebView in `src/main.rs` must share identical `BROWSER_ARGS`, scrollbar style, and data directory (`0x8007139F` otherwise). If you change one, document it clearly below.
 
