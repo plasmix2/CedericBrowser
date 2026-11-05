@@ -1,5 +1,5 @@
 //! Native popups: the right-click menu, the address-bar suggestions and the tab hover card. Each is
-//! a small owned window drawn with tiny-skia, like the toolbar.
+//! a small owned window drawn by the ANVL engine (`anvil.rs`), like the toolbar.
 //!
 //! The windows are created once, shown without taking focus, and then only moved: hidden ones are
 //! parked off-screen. tao can show a window without activating it only at creation, and an active
@@ -12,7 +12,6 @@ use std::{
     time::Instant,
 };
 
-use cosmic_text::{Buffer, Shaping, Weight};
 use tao::{
     dpi::{LogicalPosition, LogicalSize, PhysicalPosition},
     event::{ElementState, MouseButton, WindowEvent},
@@ -22,7 +21,10 @@ use tao::{
 };
 use tiny_skia::{FillRule, Mask, Paint, Pixmap, PixmapPaint, Stroke, Transform};
 
-use crate::gfx::{Brand, Canvas, Fonts, Icon, PersonaColor, Rgba, Theme, attrs, rrect_path, text_width};
+use crate::{
+    anvil::{Engine, Weight},
+    gfx::{Brand, Icon, PersonaColor, Rgba, Theme, rrect_path},
+};
 
 /// Where hidden popups wait. Physical pixels: a logical position this far out would be scaled past
 /// what Windows accepts at high DPI, and the window would land at the screen's top-left instead.
@@ -125,8 +127,10 @@ pub enum Content {
 struct Row {
     y: f32,
     h: f32,
-    label: Option<Buffer>,
-    hint: Option<Buffer>,
+    label: Option<String>,
+    /// Text drawn right after `label` in a heavier weight (the part of a suggestion that was not typed).
+    tail: String,
+    hint: Option<String>,
     enabled: bool,
 }
 
@@ -141,6 +145,8 @@ struct View {
     hover_fade: Vec<f32>,
     selected: usize,
     pressed: Option<usize>,
+    /// Whether the preview snapshot of the current content is on the GPU.
+    shot_ready: bool,
 }
 
 pub struct Popup {
@@ -166,7 +172,8 @@ pub enum Pick {
 }
 
 pub struct Popups {
-    fonts: Fonts,
+    /// Draws every popup; `None` only when the machine has no usable GPU.
+    engine: Option<Engine>,
     theme: Theme,
     pub menu: Popup,
     pub suggest: Popup,
@@ -180,7 +187,7 @@ impl Popups {
         let theme = Theme::for_brand(dark, brand);
         let make = |kind| Popup::new(target, owner, kind, theme.card);
         Self {
-            fonts: Fonts::load(),
+            engine: Engine::new(),
             menu: make(Kind::Menu),
             suggest: make(Kind::Suggest),
             preview: make(Kind::Preview),
@@ -218,8 +225,11 @@ impl Popups {
     /// Window width that fits a tooltip showing `text`, measured with the real font.
     pub fn tip_width(&mut self, text: &str) -> f32 {
         let s = self.tip.window.scale_factor() as f32;
-        let b = self.fonts.line(text, TIP_FONT, Weight::NORMAL, s);
-        (text_width(&b, s) + 22.0).ceil()
+        let w = match &mut self.engine {
+            Some(e) => e.text_width(text, TIP_FONT, Weight::Regular, s),
+            None => text.chars().count() as f32 * TIP_FONT * 0.55,
+        };
+        (w + 22.0).ceil()
     }
 
     pub fn is_open(&self, kind: Kind) -> bool {
@@ -234,8 +244,7 @@ impl Popups {
     /// Shows `content` with its top-left at `pos` (logical screen coordinates), `w` wide.
     /// Returns the height it needs, already applied.
     pub fn show(&mut self, kind: Kind, content: Content, pos: LogicalPosition<f64>, w: f32) -> f32 {
-        let s = self.get(kind).window.scale_factor() as f32;
-        let (rows, h) = layout(&mut self.fonts, &content, s);
+        let (rows, h) = layout(&content);
         let p = self.get(kind);
         let fresh = !p.open || p.v.size != (w, h);
         // Moving between hover cards or refreshing suggestions only swaps the content, without replaying the entrance.
@@ -247,6 +256,7 @@ impl Popups {
         p.v.pressed = None;
         p.v.hover_fade = vec![0.0; rows.len()];
         p.v.rows = rows;
+        p.v.shot_ready = false;
         p.v.content = content;
         p.v.size = (w, h);
         p.open = true;
@@ -382,7 +392,7 @@ impl Popups {
     /// Draws a popup and puts it on screen.
     pub fn redraw(&mut self, kind: Kind) {
         let th = self.theme;
-        let fonts = &mut self.fonts;
+        let engine = &mut self.engine;
         let p = match kind {
             Kind::Menu => &mut self.menu,
             Kind::Suggest => &mut self.suggest,
@@ -404,7 +414,7 @@ impl Popups {
             let Some(pm) = Pixmap::new(cw, ch) else { return };
             p.card = pm;
         }
-        draw(&mut p.v, &mut p.card, fonts, &th, s);
+        draw(&mut p.v, &mut p.card, engine, &th, s);
         compose(&p.card, &mut p.pm, &mut p.frame, margins(kind), corner_radius(kind), s, &th);
         let (w_u32, h_u32) = (w.get(), h.get());
         if p.surface_size != (w_u32, h_u32) {
@@ -470,6 +480,7 @@ impl Popup {
                 hover: None,
                 hover_fade: Vec::new(),
                 selected: 0,
+                shot_ready: false,
                 pressed: None,
             },
         }
@@ -477,62 +488,66 @@ impl Popup {
 }
 
 /// Lays out rows (with their text) and returns them with the total height.
-fn layout(fonts: &mut Fonts, content: &Content, s: f32) -> (Vec<Row>, f32) {
+fn layout(content: &Content) -> (Vec<Row>, f32) {
     let mut rows = Vec::new();
     let mut y = PAD;
+    let row = |y: f32, h: f32, label: Option<String>, hint: Option<String>, enabled: bool| Row { y, h, label, tail: String::new(), hint, enabled };
     match content {
         Content::Empty => return (rows, 1.0),
         Content::Menu(items) => {
             for it in items {
                 if it.sep {
-                    rows.push(Row { y, h: MENU_SEP, label: None, hint: None, enabled: false });
+                    rows.push(row(y, MENU_SEP, None, None, false));
                     y += MENU_SEP;
                     continue;
                 }
-                let label = fonts.line(&it.label, 13.0, Weight::NORMAL, s);
-                let hint = it.hint.as_deref().map(|h| fonts.line(h, 11.5, Weight::NORMAL, s));
-                rows.push(Row { y, h: MENU_ROW, label: Some(label), hint, enabled: !it.disabled });
+                rows.push(row(y, MENU_ROW, Some(it.label.clone()), it.hint.clone(), !it.disabled));
                 y += MENU_ROW;
             }
         }
         Content::Suggest { items, query } => {
             let q = query.to_lowercase();
             for (i, it) in items.iter().enumerate() {
-                let mut label = fonts.line("", 13.5, Weight::NORMAL, s);
                 // The part after what was typed is emphasised, as most browsers do.
                 let typed = i > 0 && !q.is_empty() && it.text.to_lowercase().starts_with(&q) && it.text.is_char_boundary(q.len());
                 let (head, tail) = if typed { it.text.split_at(q.len()) } else { (it.text.as_str(), "") };
-                label.set_rich_text(
-                    [(head, attrs(Weight::NORMAL)), (tail, attrs(Weight::SEMIBOLD))],
-                    &attrs(Weight::NORMAL),
-                    Shaping::Advanced,
-                    None,
-                );
-                label.shape_until_scroll(&mut fonts.system, false);
-                let hint = fonts.line(if it.url { "Open site" } else { "Search" }, 11.5, Weight::NORMAL, s);
-                rows.push(Row { y, h: SUGGEST_ROW, label: Some(label), hint: Some(hint), enabled: true });
+                let hint = if it.url { "Open site" } else { "Search" };
+                let mut r = row(y, SUGGEST_ROW, Some(head.to_owned()), Some(hint.to_owned()), true);
+                r.tail = tail.to_owned();
+                rows.push(r);
                 y += SUGGEST_ROW;
             }
         }
         Content::Preview(card) => {
             let img_h = if card.img.is_some() { SHOT_H } else { 0.0 };
-            let title = fonts.line(&card.title, 13.0, Weight::SEMIBOLD, s);
-            let host = fonts.line(if card.host.is_empty() { "New tab" } else { &card.host }, 12.0, Weight::NORMAL, s);
-            rows.push(Row { y: img_h, h: CARD_TEXT_H, label: Some(title), hint: Some(host), enabled: false });
+            let host = if card.host.is_empty() { "New tab" } else { &card.host };
+            rows.push(row(img_h, CARD_TEXT_H, Some(card.title.clone()), Some(host.to_owned()), false));
             return (rows, img_h + CARD_TEXT_H);
         }
         Content::Tip(text) => {
-            let label = fonts.line(text, TIP_FONT, Weight::NORMAL, s);
-            rows.push(Row { y: 0.0, h: TIP_H, label: Some(label), hint: None, enabled: false });
+            rows.push(row(0.0, TIP_H, Some(text.clone()), None, false));
             return (rows, TIP_H);
         }
     }
     (rows, y + PAD)
 }
 
-fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
-    let dark = th.fg.0 > 128;
+fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, th: &Theme, s: f32) {
     let bg = th.card;
+    let Some(engine) = engine.as_mut() else {
+        pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
+        return;
+    };
+    // The page snapshot goes to the GPU once per time the card is shown.
+    if let Content::Preview(card) = &p.content
+        && let Some(img) = &card.img
+        && !p.shot_ready
+    {
+        engine.forget_texture("popup:shot");
+        engine.ensure_texture("popup:shot", img);
+        p.shot_ready = true;
+    }
+    let dark = th.fg.0 > 128;
     let hover_bg = if dark { Rgba(255, 255, 255, 20) } else { Rgba(0, 0, 0, 14) };
     let (w, h) = p.size;
     // Entrance: content eases in from slightly above while fading in over the card.
@@ -540,86 +555,95 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
     let dy = -3.0 * (1.0 - t);
     let a = t;
     // Paint the whole buffer: the window can briefly be larger than `p.size` while it resizes.
-    pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
-    let mut c = Canvas { pm, s };
-    c.rect(0.0, 0.0, w, h, bg);
-    match &p.content {
-        Content::Empty => {}
-        Content::Menu(_) => {
-            for (i, r) in p.rows.iter_mut().enumerate() {
-                let y = r.y + dy;
-                if r.label.is_none() {
-                    c.hairline_h(PAD + 6.0, y + MENU_SEP / 2.0, w - 2.0 * (PAD + 6.0), th.border.with_alpha(a));
-                    continue;
-                }
-                let f = p.hover_fade.get(i).copied().unwrap_or(0.0);
-                if f > 0.0 {
-                    let bg = if p.pressed == Some(i) { hover_bg.with_alpha(1.6) } else { hover_bg.with_alpha(f) };
-                    c.rrect(PAD, y, w - 2.0 * PAD, r.h, [7.0; 4], bg.with_alpha(a));
-                }
-                let fg = if r.enabled { th.fg } else { th.dim.with_alpha(0.55) }.with_alpha(a);
-                let ty = y + (r.h - 13.0 * 1.35) / 2.0;
-                let hint_w = r.hint.as_ref().map_or(0.0, |b| text_width(b, s));
-                if let Some(b) = &mut r.label {
-                    c.text(fonts, b, PAD + 10.0, ty, fg, w - PAD - 16.0 - hint_w, 12.0);
-                }
-                if let Some(b) = &mut r.hint {
-                    c.text(fonts, b, w - PAD - 10.0 - hint_w, y + (r.h - 11.5 * 1.35) / 2.0, th.dim.with_alpha(a), w, 0.0);
+    let (pw, ph) = (pm.width(), pm.height());
+    let frame = engine.frame(pw, ph, s, bg, |c| {
+        c.rect(0.0, 0.0, w, h, bg);
+        match &p.content {
+            Content::Empty => {}
+            Content::Menu(_) => {
+                for (i, r) in p.rows.iter().enumerate() {
+                    let y = r.y + dy;
+                    let Some(label) = &r.label else {
+                        c.hairline_h(PAD + 6.0, y + MENU_SEP / 2.0, w - 2.0 * (PAD + 6.0), th.border.with_alpha(a));
+                        continue;
+                    };
+                    let f = p.hover_fade.get(i).copied().unwrap_or(0.0);
+                    if f > 0.0 {
+                        let bg = if p.pressed == Some(i) { hover_bg.with_alpha(1.6) } else { hover_bg.with_alpha(f) };
+                        c.rrect(PAD, y, w - 2.0 * PAD, r.h, 7.0, bg.with_alpha(a));
+                    }
+                    let fg = if r.enabled { th.fg } else { th.dim.with_alpha(0.55) }.with_alpha(a);
+                    let hint_w = r.hint.as_deref().map_or(0.0, |h| c.text_width(h, 11.5, Weight::Regular));
+                    let ty = y + (r.h - c.line_height(13.0, Weight::Regular)) / 2.0;
+                    c.text(label, PAD + 10.0, ty, 13.0, Weight::Regular, fg, w - PAD - 16.0 - hint_w);
+                    if let Some(hint) = &r.hint {
+                        let hy = y + (r.h - c.line_height(11.5, Weight::Regular)) / 2.0;
+                        c.text(hint, w - PAD - 10.0 - hint_w, hy, 11.5, Weight::Regular, th.dim.with_alpha(a), w);
+                    }
                 }
             }
-        }
-        Content::Suggest { items, .. } => {
-            for (i, r) in p.rows.iter_mut().enumerate() {
-                let y = r.y + dy;
-                let sel = i == p.selected;
-                if sel {
-                    c.rrect(PAD, y, w - 2.0 * PAD, r.h, [9.0; 4], th.accent.with_alpha(0.16 * a));
-                } else if let Some(f) = p.hover_fade.get(i).filter(|f| **f > 0.0) {
-                    c.rrect(PAD, y, w - 2.0 * PAD, r.h, [9.0; 4], hover_bg.with_alpha(*f * a));
+            Content::Suggest { items, .. } => {
+                for (i, r) in p.rows.iter().enumerate() {
+                    let y = r.y + dy;
+                    let sel = i == p.selected;
+                    if sel {
+                        c.rrect(PAD, y, w - 2.0 * PAD, r.h, 9.0, th.accent.with_alpha(0.16 * a));
+                    } else if let Some(f) = p.hover_fade.get(i).filter(|f| **f > 0.0) {
+                        c.rrect(PAD, y, w - 2.0 * PAD, r.h, 9.0, hover_bg.with_alpha(*f * a));
+                    }
+                    let icon = if items.get(i).is_some_and(|it| it.url) { Icon::Globe } else { Icon::Search };
+                    c.icon(icon, PAD + 11.0, y + (r.h - 18.0) / 2.0, 18.0, if sel { th.accent } else { th.fg.with_alpha(0.8) }.with_alpha(a));
+                    let hint_w = r.hint.as_deref().map_or(0.0, |h| c.text_width(h, 11.5, Weight::Regular));
+                    if let Some(label) = &r.label {
+                        let ty = y + (r.h - c.line_height(13.5, Weight::Regular)) / 2.0;
+                        let right = w - PAD - 20.0 - hint_w;
+                        let mut x = PAD + 40.0;
+                        x += c.text(label, x, ty, 13.5, Weight::Regular, th.fg.with_alpha(a), right);
+                        if !r.tail.is_empty() && x < right {
+                            c.text(&r.tail, x, ty, 13.5, Weight::SemiBold, th.fg.with_alpha(a), right);
+                        }
+                    }
+                    if (sel || p.hover == Some(i))
+                        && let Some(hint) = &r.hint
+                    {
+                        let hy = y + (r.h - c.line_height(11.5, Weight::Regular)) / 2.0;
+                        c.text(hint, w - PAD - 12.0 - hint_w, hy, 11.5, Weight::Regular, th.dim.with_alpha(a), w);
+                    }
                 }
-                let icon = if items.get(i).is_some_and(|it| it.url) { Icon::Globe } else { Icon::Search };
-                c.icon(icon, PAD + 11.0, y + (r.h - 18.0) / 2.0, 18.0, if sel { th.accent } else { th.fg.with_alpha(0.8) }.with_alpha(a));
-                let hint_w = r.hint.as_ref().map_or(0.0, |b| text_width(b, s));
-                if let Some(b) = &mut r.label {
-                    c.text(fonts, b, PAD + 40.0, y + (r.h - 13.5 * 1.35) / 2.0, th.fg.with_alpha(a), w - PAD - 20.0 - hint_w, 16.0);
-                }
-                if (sel || p.hover == Some(i))
-                    && let Some(b) = &mut r.hint
+            }
+            Content::Tip(_) => {
+                if let Some(r) = p.rows.first()
+                    && let Some(label) = &r.label
                 {
-                    c.text(fonts, b, w - PAD - 12.0 - hint_w, y + (r.h - 11.5 * 1.35) / 2.0, th.dim.with_alpha(a), w, 0.0);
+                    let ty = r.y + dy + (TIP_H - c.line_height(TIP_FONT, Weight::Regular)) / 2.0;
+                    c.text(label, 11.0, ty, TIP_FONT, Weight::Regular, th.fg.with_alpha(a), w - 6.0);
+                }
+            }
+            Content::Preview(card) => {
+                if let Some(img) = &card.img {
+                    // Cover-fit the snapshot into the top of the card.
+                    let k = (w / img.width() as f32 * s).max(SHOT_H / img.height() as f32 * s);
+                    let (iw, ih) = (img.width() as f32 * k / s, img.height() as f32 * k / s);
+                    c.rect(0.0, 0.0, w, SHOT_H, Rgba(0, 0, 0, 255));
+                    c.image("popup:shot", (w - iw) / 2.0, 0.0, iw, ih, a);
+                    // Anything taller than the slot is covered by the text area below it.
+                    c.rect(0.0, SHOT_H, w, h - SHOT_H, bg);
+                    c.hairline_h(0.0, SHOT_H, w, th.border);
+                }
+                if let Some(r) = p.rows.first() {
+                    let y = r.y + dy;
+                    if let Some(title) = &r.label {
+                        c.text(title, 14.0, y + 11.0, 13.0, Weight::SemiBold, th.fg.with_alpha(a), w - 14.0);
+                    }
+                    c.icon(Icon::Globe, 14.0, y + 36.0, 12.0, th.dim.with_alpha(a));
+                    if let Some(host) = &r.hint {
+                        c.text(host, 32.0, y + 33.5, 12.0, Weight::Regular, th.dim.with_alpha(a), w - 14.0);
+                    }
                 }
             }
         }
-        Content::Tip(_) => {
-            if let Some(r) = p.rows.first_mut()
-                && let Some(b) = &mut r.label
-            {
-                c.text(fonts, b, 11.0, r.y + dy + (TIP_H - TIP_FONT * 1.35) / 2.0, th.fg.with_alpha(a), w - 6.0, 0.0);
-            }
-        }
-        Content::Preview(card) => {
-            if let Some(img) = &card.img {
-                // Cover-fit the snapshot into the top of the card.
-                let k = (w / img.width() as f32 * s).max(SHOT_H / img.height() as f32 * s);
-                let (iw, ih) = (img.width() as f32 * k / s, img.height() as f32 * k / s);
-                c.rect(0.0, 0.0, w, SHOT_H, Rgba(0, 0, 0, 255));
-                c.image(img, (w - iw) / 2.0, 0.0, iw, ih, a);
-                // Anything taller than the slot is covered by the text area below it.
-                c.rect(0.0, SHOT_H, w, h - SHOT_H, bg);
-                c.hairline_h(0.0, SHOT_H, w, th.border);
-            }
-            if let Some(r) = p.rows.first_mut() {
-                let y = r.y + dy;
-                if let Some(b) = &mut r.label {
-                    c.text(fonts, b, 14.0, y + 11.0, th.fg.with_alpha(a), w - 14.0, 18.0);
-                }
-                c.icon(Icon::Globe, 14.0, y + 36.0, 12.0, th.dim.with_alpha(a));
-                if let Some(b) = &mut r.hint {
-                    c.text(fonts, b, 32.0, y + 33.5, th.dim.with_alpha(a), w - 14.0, 18.0);
-                }
-            }
-        }
-    }
+    });
+    crate::anvil::copy_to_pixmap(&frame, pm);
 }
 
 /// Background the system paints before the first frame: transparent when popups are rounded.
@@ -686,7 +710,7 @@ mod tests {
     #[ignore]
     fn render_popups() {
         let dir = std::path::PathBuf::from(std::env::var("CEDERIC_SHOT").expect("CEDERIC_SHOT"));
-        let mut fonts = Fonts::load();
+        let mut engine = Engine::new();
         let th = Theme::new(true);
         let s = 2.0;
         let entry = |label: &str, hint: Option<&str>, disabled| MenuEntry { label: label.into(), hint: hint.map(Into::into), disabled, sep: false };
@@ -714,7 +738,7 @@ mod tests {
             ("popup-card", CARD_W, Content::Preview(Card { title: "Rust Programming Language".into(), host: "rust-lang.org".into(), img: Some(thumb) })),
         ];
         for (name, w, content) in cases {
-            let (rows, h) = layout(&mut fonts, &content, s);
+            let (rows, h) = layout(&content);
             let mut v = View {
                 hover_fade: (0..rows.len()).map(|i| if i == 1 { 1.0 } else { 0.0 }).collect(),
                 rows,
@@ -724,9 +748,10 @@ mod tests {
                 hover: Some(1),
                 selected: 2,
                 pressed: None,
+                shot_ready: false,
             };
             let mut pm = Pixmap::new((w * s) as u32, (h * s) as u32).unwrap();
-            draw(&mut v, &mut pm, &mut fonts, &th, s);
+            draw(&mut v, &mut pm, &mut engine, &th, s);
             let m = margins(Kind::Menu);
             let mut out = Pixmap::new(((w + m.l + m.r) * s) as u32, ((h + m.t + m.b) * s) as u32).unwrap();
             compose(&pm, &mut out, &mut None, m, corner_radius(Kind::Menu), s, &th);
@@ -775,21 +800,21 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_popup() {
-        let mut fonts = Fonts::load();
+        let mut engine = Engine::new();
         let th = Theme::new(true);
         let s = 2.0;
         let items = (0..8).map(|i| MenuEntry { label: format!("Menu entry {i}"), hint: Some("Ctrl+X".into()), disabled: false, sep: false }).collect();
         let content = Content::Menu(items);
-        let (rows, h) = layout(&mut fonts, &content, s);
+        let (rows, h) = layout(&content);
         let w = 248.0;
-        let mut v = View { hover_fade: vec![0.0; rows.len()], rows, content, size: (w, h), enter: 0.5, hover: Some(1), selected: 0, pressed: None };
+        let mut v = View { hover_fade: vec![0.0; rows.len()], rows, content, size: (w, h), enter: 0.5, hover: Some(1), selected: 0, pressed: None, shot_ready: false };
         let m = margins(Kind::Menu);
         let mut card = Pixmap::new((w * s) as u32, (h * s) as u32).unwrap();
         let mut out = Pixmap::new(((w + m.l + m.r) * s) as u32, ((h + m.t + m.b) * s) as u32).unwrap();
         let mut cache = None;
         let start = Instant::now();
         for _ in 0..120 {
-            draw(&mut v, &mut card, &mut fonts, &th, s);
+            draw(&mut v, &mut card, &mut engine, &th, s);
             compose(&card, &mut out, &mut cache, m, corner_radius(Kind::Menu), s, &th);
         }
         println!("popup frame (draw + compose at 2x): {:?}", start.elapsed() / 120);

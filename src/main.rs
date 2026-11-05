@@ -3,6 +3,7 @@
 mod crypto;
 mod devtools;
 mod favicons;
+mod anvil;
 mod gfx;
 mod history;
 mod input;
@@ -3594,8 +3595,6 @@ fn load_app_icon() -> Option<WinIcon> {
 }
 
 fn main() -> wry::Result<()> {
-    // Read the UI fonts on another thread while the window and the first WebView are created.
-    std::thread::spawn(gfx::warm_fonts);
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     update::cleanup();
@@ -3814,7 +3813,7 @@ mod tests {
         // Prefs written before the setup screen existed already have personas: not shown again.
         let dir = tmp("old");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut p = Prefs::open(&dir);
+        let p = Prefs::open(&dir);
         p.save();
         let json = std::fs::read_to_string(dir.join("prefs.json")).unwrap();
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();

@@ -40,10 +40,8 @@ Cederic is a Windows browser written in Rust. The window, the browser UI and all
 Rust (`unsafe` is forbidden in `Cargo.toml`); only web pages are rendered by the system's WebView2
 engine, through [wry](https://github.com/tauri-apps/wry) and [tao](https://github.com/tauri-apps/tao).
 The whole browser UI (tab strip, toolbar, menus, suggestions, hover cards) is **not** HTML: it is drawn
-by our own code with
-[tiny-skia](https://github.com/linebender/tiny-skia) and [cosmic-text](https://github.com/pop-os/cosmic-text)
-and shown with [softbuffer](https://github.com/rust-windowing/softbuffer).
-(This is moving to the ANVL SDK; see [Native UI: moving to the ANVL SDK](#native-ui-moving-to-the-anvl-sdk).)
+by the [ANVL SDK](#native-ui-the-anvl-sdk) (rendered off-screen) and shown with
+[softbuffer](https://github.com/rust-windowing/softbuffer).
 
 ```
 cargo run --release                      # opens a new tab
@@ -57,7 +55,9 @@ Note that building replaces `target/release/Persona.exe`, so any running Persona
 |---|---|
 | `src/main.rs` | Window, tabs, DevTools pane, event loop; decides what menus/suggestions/cards show |
 | `src/toolbar.rs` | Native tab strip, window controls, buttons and address bar: layout, input, animation, drawing |
-| `src/gfx.rs` | Drawing helpers for the native UI: shapes, vector icons, text, theme colors |
+| `src/anvil.rs` | Bridge to the ANVL SDK: headless engine, `Painter`, chrome icon drawings |
+| `src/gfx.rs` | Shared native-UI types: colors, themes, icon names |
+| `vendor/anvil` | The ANVL SDK crates (`anvl_gpu`, `anvil_ui`) and docs |
 | `src/popups.rs` | Native popup windows: right-click menu, suggestion dropdown, tab hover card |
 | `src/pacer.rs` | Frame timing for animations (see below) |
 | `src/favicons.rs` | Fetches and decodes tab favicons (PNG/ICO) for the native tab strip |
@@ -68,42 +68,48 @@ Note that building replaces `target/release/Persona.exe`, so any running Persona
 | `src/history.rs`, `src/crypto.rs` | Search history, encrypted on disk |
 | `src/ui/newtab.html` | New-tab page, including the first-run setup screen (`#setup`, shown while `setup_done` is false) |
 
-## Native UI: moving to the ANVL SDK
+## Native UI: the ANVL SDK
 
-The native UI is being moved from our own `tiny-skia` + `cosmic-text` + `softbuffer` drawing code to the
-**ANVL SDK** (`anvl_gpu` renderer on wgpu, `anvil_ui` element tree, version 0.3.0). **This is a direction,
-not done yet: nothing in `src/` uses the SDK today, and the SDK is not in this repository.** Do not claim
-otherwise in the UI, README or PR text.
+The native UI (tab strip, toolbar, address bar, menus, suggestions, tooltips, hover cards) is drawn by the
+**ANVL SDK 0.3.0** (`anvl_gpu` renderer on wgpu, `anvil_ui`), vendored in `vendor/anvil` (only those two
+crates plus its docs). `tiny-skia` is no longer used to draw text, icons or shapes; it only holds pixel buffers
+(`Pixmap`) and the popup shadow/clip in `popups::compose`.
 
-Before writing any ANVL code, read the SDK's `ANVIL_AGENT_GUIDE.md`, then `ANVIL-UI-2.md` and `ADL-V3.md`
-for the model and the design tokens. Its rule applies here too: if a widget is not listed under "Built",
-it does not exist; build it from `div` and `canvas` and say so in the PR.
+Read `vendor/anvil/ANVIL_AGENT_GUIDE.md` (then `ANVIL-UI-2.md`, `ADL-V3.md`) before writing ANVL code. Its rule
+applies: if a widget is not listed under "Built", it does not exist; build it from `div` and `canvas`.
 
-How the current pieces map (so new code can be written in the SDK's shape now):
+How it is wired today (`src/anvil.rs`):
 
-| Today | In the SDK |
-|---|---|
-| `gfx::Canvas` shapes, `gfx::Icon` vector icons | `div()` styling, `icon(Icon::X)` (Lucide atlas); custom shapes inside a `canvas(...)` closure |
-| `gfx::Fonts` (Segoe UI from `%WINDIR%`) | Inter / Noto Sans / Fira Mono compiled into `anvl_gpu` (no system font scan) |
-| `gfx::Theme`, `PersonaColor` | `Theme` tokens (`Tok::Bg Card Primary ...`); persona colors become the primary token |
-| `toolbar.rs` buttons, address bar, tab strip | `toolbar`, `icon_button`, `text_input`; the tab strip (drag to reorder, animated close) has no SDK component and stays custom, in a `canvas` |
-| `popups.rs` menu, suggestions, tooltip | `menu`, `list_item`, `tooltip`. The hover card with a page snapshot is custom (`img` + `uniform_list`) |
-| `ChromeCmd` out of the toolbar | one `Msg` enum per screen: `.on_click(Msg::X)`, then `ui.take_actions::<Msg>()` and `update` |
-| `Toolbar::tick` returns the next wake time | `ui.next_wake()`; only request another frame while it is `Some` |
+- `anvil::Engine` is a **headless** ANVL renderer (`Renderer::new_headless`) plus a `Ui`. `Engine::frame` draws one
+  frame off-screen and returns RGBA; `copy_to_pixmap` puts it in the `Pixmap` that `Browser::redraw` already
+  presents with softbuffer. So window creation, input (tao events), focus handling and "only the toolbar strip is
+  presented" are unchanged. Do not switch to presenting an ANVL swap chain over the main window: pages are child
+  windows and it would flicker over them.
+- `anvil::Painter` has logical-pixel drawing calls (`rect`, `rrect`, `rrect_top`, `circle`, `icon`, `text`,
+  `image`, `foot`, `spinner`, `fill_polygon`). The chrome icons are our own vector drawings (`icon_def`) stroked
+  by ANVL's GPU path renderer; text is Inter from the SDK (no system font scan, no Segoe UI).
+- `Toolbar` keeps its own hit-testing, animation and `ChromeCmd` output; only painting and the address-bar text
+  model moved (`anvil_ui::Editor` for caret/selection, ANVL text measurement for caret x and click-to-index).
+  `Popups` has one shared `Engine` for all four popup windows.
+- Pictures (favicons, logo, wallpaper strip, persona picture, tab snapshot) are uploaded once with
+  `Engine::ensure_texture(key, &Pixmap)`. `Engine::forget_texture` frees them.
+- If there is no GPU adapter, `Engine::new()` is `None`: the toolbar paints only its background color and popups
+  paint a flat card. DX12 (with WARP) should always provide one on Windows.
 
-Rules for the move:
+Still to do (not done, do not claim otherwise): the chrome is not yet an `anvil_ui` element tree with `Msg`
+actions; it is immediate-mode painting driven by `Toolbar`/`Popups`. Port screen by screen. The tab strip (drag to
+reorder, animated close) has no SDK component and will stay custom (`canvas`).
 
-1. **Spike first, then port one surface at a time.** The open question is how `anvl_gpu::Renderer` draws into
-   our `tao` window (the SDK's own runner owns a `winit` window and a UI thread) while WebView2 child windows
-   sit on top of it. Until a spike answers that, keep `tiny-skia`, and do not add the SDK to `Cargo.toml`.
-2. **Keep every item in "Things that look wrong but are deliberate".** In particular, presenting only the
-   toolbar strip, parked non-focusable popups and the no-idle-CPU rule must still hold on the GPU path.
-3. **Keep the IPC trust boundary.** `ChromeCmd` still comes only from native UI, and menu picks only from
-   native popups; an SDK `Msg` is never built from web content.
-4. **Follow the SDK's own rules:** unique stable ids on list rows, no `unwrap()`/`expect()` on runtime
-   paths (`Renderer::new` returns a `Result`), idle apps sleep, and a headless test per screen.
-5. **Say what you could not test.** The SDK needs a GPU backend (DX12 or WARP on Windows); agents without one
-   can only run its headless tests.
+Rules:
+
+1. **Keep every item in "Things that look wrong but are deliberate".**
+2. **Keep the IPC trust boundary.** `ChromeCmd` comes only from native UI; an ANVL `Msg` is never built from web content.
+3. **Follow the SDK's rules:** stable unique ids, no `unwrap()`/`expect()` on runtime paths, idle apps sleep
+   (`Toolbar::tick`), and a headless test per screen.
+4. **Do not edit `vendor/anvil` casually.** Changes there must be listed in `INSTRUCTIONS.md`. Adding a Lucide icon
+   means re-baking the atlas (`anvl_gpu` `bake_icons` example, not vendored here); prefer drawing it in `icon_def`.
+5. **Say what you could not test.** Headless ANVL needs a GPU adapter. In Linux containers install
+   `mesa-vulkan-drivers` (lavapipe) to render the `render_*` tests.
 
 ## What must keep working
 
@@ -168,7 +174,7 @@ CEDERIC_EVAL="document.title" cargo test --release live_eval -- --ignored --noca
 This runs the JavaScript in every page (popups, tabs) and prints the results. Dispatch DOM events
 from that JavaScript to simulate clicks or hovers inside Cederic's own pages.
 
-The native toolbar and popups can be rendered off-screen to PNGs, with no window at all, and a
+The native toolbar and popups can be rendered off-screen to PNGs (needs a GPU adapter), with no window at all, and a
 toolbar frame can be timed:
 
 ```

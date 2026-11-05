@@ -1,0 +1,30 @@
+[package]
+name = "anvl_gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ANVL_GPU: Anvil's renderer, text, icons and media"
+
+[dependencies]
+wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+cosmic-text.workspace = true
+
+# One GPU backend set per platform, so no app carries drivers it cannot use. DX12 also covers
+# machines without a GPU, through Windows' WARP rasterizer.
+[target.'cfg(windows)'.dependencies]
+wgpu = { workspace = true, features = ["dx12"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+wgpu = { workspace = true, features = ["vulkan", "gles"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { workspace = true, features = ["metal"] }
+
+[target.'cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))'.dependencies]
+wgpu = { workspace = true, features = ["vulkan", "gles"] }
+
+# Only the bake_icons example and the test that checks the baked atlas render SVG.
+[dev-dependencies]
+resvg.workspace = true
