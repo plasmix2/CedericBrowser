@@ -42,6 +42,8 @@ pub enum Kind {
     Menu,
     Suggest,
     Preview,
+    /// Toolbar button tooltips; kept apart from the hover card so each keeps its own window.
+    Tip,
 }
 
 pub struct MenuEntry {
@@ -118,6 +120,7 @@ pub struct Popups {
     pub menu: Popup,
     pub suggest: Popup,
     pub preview: Popup,
+    pub tip: Popup,
     last_frame: Instant,
 }
 
@@ -130,6 +133,7 @@ impl Popups {
             menu: make(Kind::Menu),
             suggest: make(Kind::Suggest),
             preview: make(Kind::Preview),
+            tip: make(Kind::Tip),
             theme,
             last_frame: Instant::now(),
         }
@@ -143,7 +147,7 @@ impl Popups {
     pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor) {
         self.theme = Theme::for_persona(dark, color);
         let c = self.theme.card;
-        for p in [&self.menu, &self.suggest, &self.preview] {
+        for p in [&self.menu, &self.suggest, &self.preview, &self.tip] {
             p.window.set_background_color(Some((c.0, c.1, c.2, 255)));
             if p.open {
                 p.window.request_redraw();
@@ -156,7 +160,15 @@ impl Popups {
             Kind::Menu => &mut self.menu,
             Kind::Suggest => &mut self.suggest,
             Kind::Preview => &mut self.preview,
+            Kind::Tip => &mut self.tip,
         }
+    }
+
+    /// Exact window width for a tooltip showing `text`.
+    pub fn tip_width(&mut self, text: &str) -> f32 {
+        let s = self.tip.window.scale_factor() as f32;
+        let b = self.fonts.line(text, 12.5, Weight::NORMAL, s);
+        (text_width(&b, s) + 22.0).ceil().max(48.0)
     }
 
     pub fn is_open(&self, kind: Kind) -> bool {
@@ -164,6 +176,7 @@ impl Popups {
             Kind::Menu => self.menu.open,
             Kind::Suggest => self.suggest.open,
             Kind::Preview => self.preview.open,
+            Kind::Tip => self.tip.open,
         }
     }
 
@@ -218,7 +231,7 @@ impl Popups {
     }
 
     pub fn owns(&self, id: WindowId) -> Option<Kind> {
-        [&self.menu, &self.suggest, &self.preview].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
+        [&self.menu, &self.suggest, &self.preview, &self.tip].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
     }
 
     /// Mouse input on a popup window. Returns a pick when a row was clicked.
@@ -275,7 +288,7 @@ impl Popups {
         self.last_frame = now;
         let k = 1.0 - (-dt * 30.0).exp();
         let mut busy = false;
-        for p in [&mut self.menu, &mut self.suggest, &mut self.preview] {
+        for p in [&mut self.menu, &mut self.suggest, &mut self.preview, &mut self.tip] {
             if !p.open {
                 continue;
             }
@@ -309,6 +322,7 @@ impl Popups {
             Kind::Menu => &mut self.menu,
             Kind::Suggest => &mut self.suggest,
             Kind::Preview => &mut self.preview,
+            Kind::Tip => &mut self.tip,
         };
         if !p.open {
             return;

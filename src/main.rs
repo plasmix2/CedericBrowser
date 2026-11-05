@@ -1846,6 +1846,7 @@ impl Browser {
             })
             .collect();
         self.hide_preview();
+        self.hide_tip();
         let pos = self.to_screen(x, y);
         self.popups.show(PopupKind::Menu, Content::Menu(entries), pos, W as f32);
     }
@@ -1876,20 +1877,23 @@ impl Browser {
         self.popups.show(PopupKind::Preview, Content::Preview(card), pos, w as f32);
     }
 
-    /// One-line tooltip for a toolbar button; shares the hover card's popup window.
+    /// One-line tooltip for a toolbar button; has its own popup window.
     fn show_tip(&mut self, text: String, cx: f64, y: f64) {
         if self.popups.is_open(PopupKind::Menu) {
             return;
         }
-        // Rough text width: the popup has no text measurement before it is laid out.
-        let w = (text.chars().count() as f64 * 6.6 + 22.0).max(60.0);
+        let w = self.popups.tip_width(&text) as f64;
         let x = (cx - w / 2.0).clamp(4.0, (self.logical_size().width - w - 4.0).max(4.0));
         let pos = self.to_screen(x, y);
-        self.popups.show(PopupKind::Preview, Content::Tip(text), pos, w as f32);
+        self.popups.show(PopupKind::Tip, Content::Tip(text), pos, w as f32);
     }
 
     fn hide_preview(&mut self) {
         self.popups.hide(PopupKind::Preview);
+    }
+
+    fn hide_tip(&mut self) {
+        self.popups.hide(PopupKind::Tip);
     }
 
     fn tab_menu(&mut self, id: TabId, x: f64, y: f64) {
@@ -2479,7 +2483,7 @@ impl Browser {
             ChromeCmd::TabHover { id, x, y } => self.show_preview(id, x, y),
             ChromeCmd::TabHoverEnd => self.hide_preview(),
             ChromeCmd::Tip { text, x, y } => self.show_tip(text, x, y),
-            ChromeCmd::TipEnd => self.hide_preview(),
+            ChromeCmd::TipEnd => self.hide_tip(),
             ChromeCmd::Dismiss => {
                 if self.fullscreen {
                     self.set_fullscreen(false, false);
