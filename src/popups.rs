@@ -338,7 +338,6 @@ impl Popup {
         let window = Rc::new(
             WindowBuilder::new()
                 .with_decorations(false)
-                .with_undecorated_shadow(true)
                 .with_background_color((card.0, card.1, card.2, 255))
                 .with_resizable(false)
                 .with_visible(true)
@@ -498,8 +497,6 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
                     c.text(fonts, b, 10.0, y + 5.5, th.fg.with_alpha(a), w - 10.0, 18.0);
                 }
             }
-            c.hairline_h(0.0, 0.0, w, th.border);
-            c.hairline_h(0.0, h - 1.0, w, th.border);
         }
         Content::Preview(card) => {
             if let Some(img) = &card.img {
@@ -524,6 +521,11 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
             }
         }
     }
+    // Own 1px border: the popups have no OS frame (the OS shadow frame left unpainted edges).
+    c.hairline_h(0.0, 0.0, w, th.border);
+    c.hairline_h(0.0, h - 1.0, w, th.border);
+    c.hairline_v(0.0, 0.0, h, th.border);
+    c.hairline_v(w - 1.0, 0.0, h, th.border);
 }
 
 #[cfg(test)]
