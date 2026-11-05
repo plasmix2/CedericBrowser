@@ -474,6 +474,13 @@ impl Canvas<'_> {
 
     /// Draws `icon` with its grid scaled into a `size`-wide box at (x, y).
     pub fn icon(&mut self, icon: Icon, x: f32, y: f32, size: f32, c: Rgba) {
+        // Snap the box to whole physical pixels. Icons are mostly straight strokes, and a stroke
+        // that starts on a pixel edge stays crisp instead of smearing across two pixel rows.
+        let (x, y, size) = (
+            (x * self.s).round() / self.s,
+            (y * self.s).round() / self.s,
+            ((size * self.s).round() / self.s).max(1.0 / self.s),
+        );
         let grid = if matches!(icon, Icon::WinMin | Icon::WinMax | Icon::WinRestore | Icon::WinClose) { 10.0 } else { 24.0 };
         let k = size / grid;
         let (strokes, fills, width) = cached_icon(icon);
@@ -519,9 +526,10 @@ impl Canvas<'_> {
         let fade_start = clip - (fade * self.s).round() as i32;
         let fade_px = (fade * self.s).max(1.0);
         let color = TextColor::rgba(c.0, c.1, c.2, c.3);
+        let lut = coverage_lut(is_light(c.0, c.1, c.2));
         let data = self.pm.data_mut();
         buf.draw(&mut fonts.system, &mut fonts.cache, color, |gx, gy, gw, gh, col| {
-            let ca = col.a();
+            let ca = lut[col.a() as usize];
             if ca == 0 {
                 return;
             }
@@ -550,7 +558,32 @@ impl Canvas<'_> {
 
 /// Source-over blend of a cosmic-text color into premultiplied RGBA pixel `i`.
 pub fn blend_px(data: &mut [u8], i: usize, c: TextColor) {
-    blend_u8(data, i, c.r(), c.g(), c.b(), c.a() as u32);
+    let a = coverage_lut(is_light(c.r(), c.g(), c.b()))[c.a() as usize];
+    blend_u8(data, i, c.r(), c.g(), c.b(), a as u32);
+}
+
+fn is_light(r: u8, g: u8, b: u8) -> bool {
+    // Rec. 709 luma on the sRGB values; only the light/dark split matters here.
+    (r as u32 * 2126 + g as u32 * 7152 + b as u32 * 722) / 10_000 >= 128
+}
+
+/// Glyph coverage curves. Blending text in sRGB space with plain coverage makes light text on a
+/// dark background look thin and ragged, and dark text on a light background look slightly heavy.
+/// A small power curve on the coverage compensates (the same idea as the contrast and gamma tables
+/// in Skia and DirectWrite): light text gets a fuller edge, dark text a slightly lighter one.
+fn coverage_lut(light: bool) -> &'static [u8; 256] {
+    static LUTS: std::sync::OnceLock<[[u8; 256]; 2]> = std::sync::OnceLock::new();
+    let luts = LUTS.get_or_init(|| {
+        let build = |exp: f32| {
+            let mut t = [0u8; 256];
+            for (i, v) in t.iter_mut().enumerate() {
+                *v = ((i as f32 / 255.0).powf(exp) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+            t
+        };
+        [build(1.08), build(0.74)]
+    });
+    &luts[light as usize]
 }
 
 /// Fast integer source-over blend of straight-alpha `(r, g, b, a)` into premultiplied RGBA pixel `i`.
@@ -784,24 +817,34 @@ pub struct Fonts {
 
 pub const UI_FAMILY: &str = "Segoe UI";
 
+/// The UI font database, read from disk once. The CJK and symbol fonts are several megabytes each,
+/// so `main` calls `warm_fonts` on a background thread before it creates the window; the reads then
+/// overlap with window and WebView creation instead of delaying the first frame.
+fn font_db() -> &'static cosmic_text::fontdb::Database {
+    static DB: std::sync::OnceLock<cosmic_text::fontdb::Database> = std::sync::OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = cosmic_text::fontdb::Database::new();
+        let dir = std::env::var_os("WINDIR")
+            .map_or_else(|| "C:\\Windows".into(), std::path::PathBuf::from)
+            .join("Fonts");
+        for f in [
+            "segoeui.ttf", "seguisb.ttf", "segoeuib.ttf", "seguisym.ttf", "seguiemj.ttf",
+            "msyh.ttc", "YuGothM.ttc", "malgun.ttf", "Nirmala.ttf", "ebrima.ttf", "tahoma.ttf",
+        ] {
+            let _ = db.load_font_file(dir.join(f));
+        }
+        db
+    })
+}
+
+/// Loads the font database now (see `font_db`). Safe to call from any thread, any number of times.
+pub fn warm_fonts() {
+    font_db();
+}
+
 impl Fonts {
     pub fn load() -> Self {
-        static DB: std::sync::OnceLock<cosmic_text::fontdb::Database> = std::sync::OnceLock::new();
-        let db = DB
-            .get_or_init(|| {
-                let mut db = cosmic_text::fontdb::Database::new();
-                let dir = std::env::var_os("WINDIR")
-                    .map_or_else(|| "C:\\Windows".into(), std::path::PathBuf::from)
-                    .join("Fonts");
-                for f in [
-                    "segoeui.ttf", "seguisb.ttf", "segoeuib.ttf", "seguisym.ttf", "seguiemj.ttf",
-                    "msyh.ttc", "YuGothM.ttc", "malgun.ttf", "Nirmala.ttf", "ebrima.ttf", "tahoma.ttf",
-                ] {
-                    let _ = db.load_font_file(dir.join(f));
-                }
-                db
-            })
-            .clone();
+        let db = font_db().clone();
         let locale = sys_locale().unwrap_or_else(|| "en-US".into());
         Self { system: FontSystem::new_with_locale_and_db(locale, db), cache: SwashCache::new() }
     }
@@ -828,4 +871,39 @@ fn sys_locale() -> Option<String> {
 /// Logical width of a laid-out single-line buffer.
 pub fn text_width(b: &Buffer, s: f32) -> f32 {
     b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) / s
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    #[test]
+    fn coverage_curves_keep_the_ends_and_stay_monotonic() {
+        for light in [false, true] {
+            let t = coverage_lut(light);
+            assert_eq!((t[0], t[255]), (0, 255));
+            assert!(t.windows(2).all(|w| w[0] <= w[1]));
+        }
+        // Light text gets fuller edges than dark text.
+        assert!(coverage_lut(true)[128] > 128);
+        assert!(coverage_lut(false)[128] <= 128);
+    }
+
+    #[test]
+    fn light_and_dark_text_colors_are_told_apart() {
+        assert!(is_light(236, 236, 240));
+        assert!(!is_light(29, 30, 34));
+    }
+
+    #[test]
+    fn icons_are_drawn_on_whole_pixels() {
+        // At 1.5x a 16px icon placed at x = 10.2 snaps to physical pixels, so rendering it at
+        // that spot and at the snapped spot gives identical pixels.
+        let draw = |x: f32| {
+            let mut pm = Pixmap::new(60, 60).unwrap();
+            Canvas { pm: &mut pm, s: 1.5 }.icon(Icon::Search, x, 10.0, 16.0, Rgba(255, 255, 255, 255));
+            pm.data().to_vec()
+        };
+        assert_eq!(draw(10.2), draw((10.2f32 * 1.5).round() / 1.5));
+    }
 }

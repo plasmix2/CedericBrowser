@@ -43,6 +43,7 @@ The whole browser UI (tab strip, toolbar, menus, suggestions, hover cards) is **
 by our own code with
 [tiny-skia](https://github.com/linebender/tiny-skia) and [cosmic-text](https://github.com/pop-os/cosmic-text)
 and shown with [softbuffer](https://github.com/rust-windowing/softbuffer).
+(This is moving to the ANVL SDK; see [Native UI: moving to the ANVL SDK](#native-ui-moving-to-the-anvl-sdk).)
 
 ```
 cargo run --release                      # opens a new tab
@@ -65,7 +66,44 @@ Note that building replaces `target/release/Persona.exe`, so any running Persona
 | `src/devtools.rs` | Finds tabs on the loopback DevTools port for the docked DevTools pane |
 | `src/thumbs.rs` | Tab snapshots for hover cards, over the same DevTools port |
 | `src/history.rs`, `src/crypto.rs` | Search history, encrypted on disk |
-| `src/ui/newtab.html` | New-tab page |
+| `src/ui/newtab.html` | New-tab page, including the first-run setup screen (`#setup`, shown while `setup_done` is false) |
+
+## Native UI: moving to the ANVL SDK
+
+The native UI is being moved from our own `tiny-skia` + `cosmic-text` + `softbuffer` drawing code to the
+**ANVL SDK** (`anvl_gpu` renderer on wgpu, `anvil_ui` element tree, version 0.3.0). **This is a direction,
+not done yet: nothing in `src/` uses the SDK today, and the SDK is not in this repository.** Do not claim
+otherwise in the UI, README or PR text.
+
+Before writing any ANVL code, read the SDK's `ANVIL_AGENT_GUIDE.md`, then `ANVIL-UI-2.md` and `ADL-V3.md`
+for the model and the design tokens. Its rule applies here too: if a widget is not listed under "Built",
+it does not exist; build it from `div` and `canvas` and say so in the PR.
+
+How the current pieces map (so new code can be written in the SDK's shape now):
+
+| Today | In the SDK |
+|---|---|
+| `gfx::Canvas` shapes, `gfx::Icon` vector icons | `div()` styling, `icon(Icon::X)` (Lucide atlas); custom shapes inside a `canvas(...)` closure |
+| `gfx::Fonts` (Segoe UI from `%WINDIR%`) | Inter / Noto Sans / Fira Mono compiled into `anvl_gpu` (no system font scan) |
+| `gfx::Theme`, `PersonaColor` | `Theme` tokens (`Tok::Bg Card Primary ...`); persona colors become the primary token |
+| `toolbar.rs` buttons, address bar, tab strip | `toolbar`, `icon_button`, `text_input`; the tab strip (drag to reorder, animated close) has no SDK component and stays custom, in a `canvas` |
+| `popups.rs` menu, suggestions, tooltip | `menu`, `list_item`, `tooltip`. The hover card with a page snapshot is custom (`img` + `uniform_list`) |
+| `ChromeCmd` out of the toolbar | one `Msg` enum per screen: `.on_click(Msg::X)`, then `ui.take_actions::<Msg>()` and `update` |
+| `Toolbar::tick` returns the next wake time | `ui.next_wake()`; only request another frame while it is `Some` |
+
+Rules for the move:
+
+1. **Spike first, then port one surface at a time.** The open question is how `anvl_gpu::Renderer` draws into
+   our `tao` window (the SDK's own runner owns a `winit` window and a UI thread) while WebView2 child windows
+   sit on top of it. Until a spike answers that, keep `tiny-skia`, and do not add the SDK to `Cargo.toml`.
+2. **Keep every item in "Things that look wrong but are deliberate".** In particular, presenting only the
+   toolbar strip, parked non-focusable popups and the no-idle-CPU rule must still hold on the GPU path.
+3. **Keep the IPC trust boundary.** `ChromeCmd` still comes only from native UI, and menu picks only from
+   native popups; an SDK `Msg` is never built from web content.
+4. **Follow the SDK's own rules:** unique stable ids on list rows, no `unwrap()`/`expect()` on runtime
+   paths (`Renderer::new` returns a `Result`), idle apps sleep, and a headless test per screen.
+5. **Say what you could not test.** The SDK needs a GPU backend (DX12 or WARP on Windows); agents without one
+   can only run its headless tests.
 
 ## What must keep working
 

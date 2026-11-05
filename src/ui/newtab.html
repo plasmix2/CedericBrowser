@@ -170,6 +170,31 @@
   .bm .del:hover { opacity: 1; color: var(--fg); background: rgba(128,128,128,.2); }
   p { margin: 0; color: var(--dim); font-size: 12.5px; }
   kbd { font: inherit; padding: 1px 6px; border: 1px solid var(--border); border-radius: 5px; }
+
+  /* First-run setup screen */
+  #setup { position: fixed; inset: 0; z-index: 80; display: none; place-items: center; padding: 20px; background: var(--bg); }
+  #setup.open { display: grid; animation: fadeIn .25s var(--ease); }
+  #setup::before { content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(40% 35% at 30% 20%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 70%),
+      radial-gradient(35% 30% at 75% 75%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 70%); }
+  .setup-card { position: relative; width: min(520px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow-y: auto;
+    background: var(--card); border: 1px solid var(--border); border-radius: 20px; box-shadow: 0 24px 60px rgba(0,0,0,.4);
+    padding: 30px; display: flex; flex-direction: column; gap: 20px; text-align: left; animation: scaleUp .3s var(--ease); }
+  .setup-card h2 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -.5px; }
+  .setup-card .lead { margin: 0; color: var(--dim); font-size: 13.5px; line-height: 1.5; text-shadow: none; }
+  .setup-dots { display: flex; gap: 6px; }
+  .setup-dots i { width: 22px; height: 4px; border-radius: 2px; background: var(--border); transition: background .25s; }
+  .setup-dots i.on { background: var(--accent); }
+  .setup-step { display: none; flex-direction: column; gap: 18px; }
+  .setup-step.on { display: flex; animation: rise .35s var(--ease) both; }
+  .setup-who { display: flex; align-items: center; gap: 16px; }
+  .setup-who .input-group { flex: 1; min-width: 0; }
+  .setup-tips { display: grid; grid-template-columns: auto 1fr; gap: 10px 14px; align-items: center; font-size: 13px; color: var(--dim); }
+  .setup-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 4px; }
+  .setup-foot .skip { border: 0; background: none; color: var(--dim); font: inherit; font-size: 12.5px; cursor: pointer; padding: 6px 4px; }
+  .setup-foot .skip:hover { color: var(--fg); }
+  .setup-foot .right { display: flex; gap: 8px; margin-left: auto; }
+  .setup-foot .btn-primary, .setup-foot .btn-subtle { height: 38px; padding: 0 20px; border-radius: 12px; font-size: 13px; }
   @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
 </style>
 </head>
@@ -323,6 +348,81 @@
 
     <div class="modal-actions" style="justify-content: flex-end;">
       <button id="settings-done-btn" class="btn-primary" type="button">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- First-run setup -->
+<div id="setup" role="dialog" aria-modal="true" aria-labelledby="setup-title">
+  <div class="setup-card">
+    <div class="setup-dots"><i></i><i></i><i></i></div>
+
+    <section class="setup-step" data-step="0">
+      <div>
+        <h2 id="setup-title">Welcome to Persona</h2>
+        <p class="lead">Each persona keeps its own sign-ins, bookmarks and look. Start by naming yours and picking a color. You can change both later.</p>
+      </div>
+      <div class="setup-who">
+        <div id="setup-avatar" class="avatar-lg"></div>
+        <div class="input-group">
+          <label class="input-label" for="setup-name">Persona name</label>
+          <input id="setup-name" class="text-input" type="text" maxlength="24" placeholder="e.g. Personal, Work" autocomplete="off">
+        </div>
+      </div>
+      <div class="input-group">
+        <label class="input-label">Color</label>
+        <div id="setup-swatches" class="swatches"></div>
+      </div>
+    </section>
+
+    <section class="setup-step" data-step="1">
+      <div>
+        <h2>Site permissions</h2>
+        <p class="lead">When a switch is on, websites can use that feature without a further prompt; when it is off, the request is blocked. You can change these any time from Settings on the New Tab page.</p>
+      </div>
+      <div class="settings-list">
+      <label class="setting-row" for="setup-perm-camera">
+        <div class="setting-icon"><svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg></div>
+        <div class="setting-info"><div class="setting-title">Camera &amp; Video</div><div class="setting-desc">Websites may use your webcam</div></div>
+        <div class="toggle-switch"><input type="checkbox" id="setup-perm-camera"><span class="toggle-slider"></span></div>
+      </label>
+      <label class="setting-row" for="setup-perm-microphone">
+        <div class="setting-icon"><svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg></div>
+        <div class="setting-info"><div class="setting-title">Microphone &amp; Audio</div><div class="setting-desc">Websites may use your microphone</div></div>
+        <div class="toggle-switch"><input type="checkbox" id="setup-perm-microphone"><span class="toggle-slider"></span></div>
+      </label>
+      <label class="setting-row" for="setup-perm-notifications">
+        <div class="setting-icon"><svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></div>
+        <div class="setting-info"><div class="setting-title">Notifications</div><div class="setting-desc">Sites may send desktop notifications</div></div>
+        <div class="toggle-switch"><input type="checkbox" id="setup-perm-notifications"><span class="toggle-slider"></span></div>
+      </label>
+      <label class="setting-row" for="setup-perm-geolocation">
+        <div class="setting-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg></div>
+        <div class="setting-info"><div class="setting-title">Location</div><div class="setting-desc">Websites may read your location</div></div>
+        <div class="toggle-switch"><input type="checkbox" id="setup-perm-geolocation"><span class="toggle-slider"></span></div>
+      </label>
+      </div>
+    </section>
+
+    <section class="setup-step" data-step="2">
+      <div>
+        <h2 id="setup-done-title">You're all set</h2>
+        <p class="lead">Search history lasts only for the session. Cookies are kept so you stay signed in. A few shortcuts to get going:</p>
+      </div>
+      <div class="setup-tips">
+        <span><kbd>Ctrl T</kbd></span><span>Open a new tab</span>
+        <span><kbd>Ctrl L</kbd></span><span>Jump to the address bar</span>
+        <span><kbd>Ctrl D</kbd></span><span>Bookmark this page</span>
+        <span><kbd>F12</kbd></span><span>Open developer tools</span>
+      </div>
+    </section>
+
+    <div class="setup-foot">
+      <button id="setup-skip" class="skip" type="button">Skip setup</button>
+      <div class="right">
+        <button id="setup-back" class="btn-subtle" type="button">Back</button>
+        <button id="setup-next" class="btn-primary" type="button">Continue</button>
+      </div>
     </div>
   </div>
 </div>
@@ -665,9 +765,95 @@
     if (q) send({ nt: 'search', input: q });
   });
 
+  // ----- First-run setup -----
+  const setupEl = document.getElementById('setup');
+  const SETUP_STEPS = 3;
+  let setupStep = 0;
+  let setupColor = 'orange';
+  let setupSeeded = false;
+  const SETUP_PERMS = ['camera', 'microphone', 'notifications', 'geolocation'];
+
+  const setupPreview = () => {
+    const name = document.getElementById('setup-name').value.trim() || 'Persona';
+    const c = COLOR_PALETTE.find(x => x.name === setupColor) || COLOR_PALETTE[0];
+    const av = document.getElementById('setup-avatar');
+    renderAvatarContent(av, name, c.hex, curState && curState.persona_pfp);
+    av.style.borderColor = c.hex;
+    setupEl.style.setProperty('--accent', c.hex);
+  };
+
+  const setupSwatches = () => {
+    const grid = document.getElementById('setup-swatches');
+    grid.textContent = '';
+    for (const c of COLOR_PALETTE) {
+      const sw = document.createElement('div');
+      sw.className = 'swatch' + (c.name === setupColor ? ' selected' : '');
+      sw.style.backgroundColor = c.hex;
+      sw.title = c.label;
+      sw.textContent = c.name === setupColor ? '✓' : '';
+      sw.onclick = () => { setupColor = c.name; setupSwatches(); setupPreview(); };
+      grid.append(sw);
+    }
+  };
+
+  const setupShow = (n) => {
+    setupStep = Math.max(0, Math.min(SETUP_STEPS - 1, n));
+    setupEl.querySelectorAll('.setup-step').forEach((el) => el.classList.toggle('on', Number(el.dataset.step) === setupStep));
+    setupEl.querySelectorAll('.setup-dots i').forEach((el, i) => el.classList.toggle('on', i <= setupStep));
+    document.getElementById('setup-back').style.visibility = setupStep === 0 ? 'hidden' : 'visible';
+    document.getElementById('setup-skip').style.visibility = setupStep === SETUP_STEPS - 1 ? 'hidden' : 'visible';
+    document.getElementById('setup-next').textContent = setupStep === SETUP_STEPS - 1 ? 'Start browsing' : 'Continue';
+  };
+
+  const setupFinish = () => {
+    setupEl.classList.remove('open');
+    send({ nt: 'finish_setup' });
+  };
+
+  document.getElementById('setup-name').addEventListener('input', setupPreview);
+  document.getElementById('setup-back').onclick = () => setupShow(setupStep - 1);
+  document.getElementById('setup-skip').onclick = setupFinish;
+  document.getElementById('setup-next').onclick = () => {
+    if (setupStep === 0 && curState && curState.active_persona_id) {
+      const name = document.getElementById('setup-name').value.trim() || 'Persona';
+      send({ nt: 'update_persona', id: curState.active_persona_id, name, color: setupColor, pfp: curState.persona_pfp || null });
+    }
+    if (setupStep === SETUP_STEPS - 1) setupFinish();
+    else setupShow(setupStep + 1);
+  };
+  SETUP_PERMS.forEach((k) => {
+    document.getElementById('setup-perm-' + k).addEventListener('change', () => {
+      const v = (n) => document.getElementById('setup-perm-' + n).checked;
+      send({ nt: 'set_permissions', camera: v('camera'), notifications: v('notifications'), microphone: v('microphone'), geolocation: v('geolocation') });
+    });
+  });
+  setupEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { e.preventDefault(); document.getElementById('setup-next').click(); }
+  });
+
+  // Called from renderNewTab with every state push.
+  window.__setupSync = (s) => {
+    const want = s.setup_done === false;
+    if (!want) { setupEl.classList.remove('open'); return; }
+    if (!setupSeeded) {
+      setupSeeded = true;
+      setupColor = s.persona_color || 'orange';
+      document.getElementById('setup-name').value = s.persona_name || '';
+      setupSwatches();
+      setupShow(0);
+      setTimeout(() => document.getElementById('setup-name').focus(), 50);
+    }
+    SETUP_PERMS.forEach((k) => {
+      if (typeof s['allow_' + k] === 'boolean') document.getElementById('setup-perm-' + k).checked = s['allow_' + k];
+    });
+    setupPreview();
+    setupEl.classList.add('open');
+  };
+
   // renderNewTab
   window.renderNewTab = (s) => {
     curState = s;
+    if (window.__setupSync) window.__setupSync(s);
     const personaName = s.persona_name || 'Persona';
     const accentHex = s.persona_color_hex || '#ff6a3d';
 

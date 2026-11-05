@@ -703,6 +703,8 @@ enum NewTabCmd {
         strip: String,
     },
     AutoKey { key: String },
+    /// The first-run setup screen was completed (or skipped).
+    FinishSetup,
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -980,6 +982,10 @@ struct PrefsData {
     bookmarks: Option<Vec<Bookmark>>,
     #[serde(default)]
     permissions: Option<SitePermissions>,
+    /// Whether the first-run setup screen has been completed. Absent in prefs written before the
+    /// setup screen existed; those users already have personas and are treated as set up.
+    #[serde(default)]
+    setup_done: Option<bool>,
 }
 
 struct Prefs {
@@ -988,6 +994,7 @@ struct Prefs {
     active_persona_id: String,
     personas: Vec<PersonaProfile>,
     permissions: SitePermissions,
+    setup_done: bool,
     bg_cache: HashMap<String, Option<String>>,
     strip_cache: HashMap<String, Option<Pixmap>>,
 }
@@ -1012,6 +1019,7 @@ impl Prefs {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
+        let setup_done = data.setup_done.unwrap_or(!data.personas.is_empty());
         let mut personas = data.personas;
         if personas.is_empty() {
             let mut cederic = PersonaProfile::new_cederic();
@@ -1045,18 +1053,11 @@ impl Prefs {
         let mut bg_cache = HashMap::new();
         let mut strip_cache = HashMap::new();
 
-        for p in &personas {
-            let bg_p = data_dir.join(format!("background_{}.txt", p.id));
-            let bg = std::fs::read_to_string(&bg_p)
-                .ok()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty());
+        // Backgrounds are data URLs that can be megabytes each, so only the active persona's is
+        // read before the window appears; the others load when that persona is selected.
+        if let Some(p) = personas.iter().find(|p| p.id == active_id) {
+            let (bg, strip) = Self::read_background(data_dir, &p.id);
             bg_cache.insert(p.id.clone(), bg);
-
-            let strip_p = data_dir.join(format!("background_strip_{}.png", p.id));
-            let strip = std::fs::read(&strip_p)
-                .ok()
-                .and_then(|b| Pixmap::decode_png(&b).ok());
             strip_cache.insert(p.id.clone(), strip);
         }
 
@@ -1068,8 +1069,36 @@ impl Prefs {
             active_persona_id: active_id,
             personas,
             permissions,
+            setup_done,
             bg_cache,
             strip_cache,
+        }
+    }
+
+    fn read_background(data_dir: &std::path::Path, id: &str) -> (Option<String>, Option<Pixmap>) {
+        let bg = std::fs::read_to_string(data_dir.join(format!("background_{id}.txt")))
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let strip = std::fs::read(data_dir.join(format!("background_strip_{id}.png")))
+            .ok()
+            .and_then(|b| Pixmap::decode_png(&b).ok());
+        (bg, strip)
+    }
+
+    /// Reads a persona's saved background from disk the first time it is needed.
+    fn ensure_background(&mut self, id: &str) {
+        if !self.bg_cache.contains_key(id) || !self.strip_cache.contains_key(id) {
+            let (bg, strip) = Self::read_background(&self.data_dir, id);
+            self.bg_cache.entry(id.to_string()).or_insert(bg);
+            self.strip_cache.entry(id.to_string()).or_insert(strip);
+        }
+    }
+
+    fn finish_setup(&mut self) {
+        if !self.setup_done {
+            self.setup_done = true;
+            self.save();
         }
     }
 
@@ -1170,6 +1199,7 @@ impl Prefs {
             brand: Some(self.brand()),
             bookmarks: Some(self.active_bookmarks().to_vec()),
             permissions: Some(self.permissions.clone()),
+            setup_done: Some(self.setup_done),
         };
         if let Ok(json) = serde_json::to_string_pretty(&data) {
             let tmp = self.path.with_extension("json.tmp");
@@ -1193,6 +1223,7 @@ impl Prefs {
     fn set_active_persona(&mut self, id: &str) -> bool {
         if self.personas.iter().any(|p| p.id == id) {
             self.active_persona_id = id.to_string();
+            self.ensure_background(id);
             self.save();
             true
         } else {
@@ -1272,6 +1303,8 @@ impl Prefs {
             self.personas.remove(pos);
             if self.active_persona_id == id {
                 self.active_persona_id = self.personas[0].id.clone();
+                let first = self.active_persona_id.clone();
+                self.ensure_background(&first);
             }
             let bg_p = self.bg_path(id);
             let strip_p = self.strip_path(id);
@@ -1457,6 +1490,7 @@ struct NewTabState<'a> {
     allow_notifications: bool,
     allow_microphone: bool,
     allow_geolocation: bool,
+    setup_done: bool,
 }
 
 struct Devtools {
@@ -1924,6 +1958,7 @@ impl Browser {
             allow_notifications: prefs.permissions.notifications,
             allow_microphone: prefs.permissions.microphone,
             allow_geolocation: prefs.permissions.geolocation,
+            setup_done: prefs.setup_done,
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -2009,15 +2044,17 @@ impl Browser {
     }
 
     fn navigate_active(&mut self, raw_input: &str) {
-        self.close_suggest();
         let Some(resolved) = input::resolve_with_info(&unmask(raw_input)) else {
             return;
         };
+        // Start the load before anything else (closing the dropdown, history, repainting) so the
+        // network request leaves as early as possible.
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.is_newtab = false;
             let _ = tab.view.load_url(&resolved.url);
             let _ = tab.view.focus();
         }
+        self.close_suggest();
         self.history.record(&resolved.query, &resolved.url, resolved.engine, resolved.is_search);
         self.sync_ui();
     }
@@ -3079,6 +3116,10 @@ impl Browser {
             }
             NewTabCmd::SetBrand { brand } => self.set_brand(brand),
             NewTabCmd::SetBackground { .. } => {}
+            NewTabCmd::FinishSetup => {
+                self.prefs.finish_setup();
+                self.sync_all_newtabs();
+            }
         }
     }
 
@@ -3553,6 +3594,8 @@ fn load_app_icon() -> Option<WinIcon> {
 }
 
 fn main() -> wry::Result<()> {
+    // Read the UI fonts on another thread while the window and the first WebView are created.
+    std::thread::spawn(gfx::warm_fonts);
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     update::cleanup();
@@ -3752,6 +3795,52 @@ mod tests {
     }
 
     #[test]
+    fn setup_screen_state_persists_and_skips_existing_users() {
+        let tmp = |tag: &str| {
+            std::env::temp_dir().join(format!(
+                "persona_setup_test_{tag}_{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ))
+        };
+        // A fresh profile shows the setup screen until it is finished, and remembers that.
+        let dir = tmp("new");
+        let mut prefs = Prefs::open(&dir);
+        assert!(!prefs.setup_done);
+        assert!(!Prefs::open(&dir).setup_done);
+        prefs.finish_setup();
+        assert!(Prefs::open(&dir).setup_done);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Prefs written before the setup screen existed already have personas: not shown again.
+        let dir = tmp("old");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = Prefs::open(&dir);
+        p.save();
+        let json = std::fs::read_to_string(dir.join("prefs.json")).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("setup_done");
+        std::fs::write(dir.join("prefs.json"), v.to_string()).unwrap();
+        assert!(Prefs::open(&dir).setup_done);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn other_personas_backgrounds_load_when_selected() {
+        let dir = std::env::temp_dir().join(format!(
+            "persona_bg_test_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("background_uzaki.txt"), "data:image/png;base64,AAAA").unwrap();
+        let mut prefs = Prefs::open(&dir);
+        // Only the active persona's background is read at startup.
+        assert!(prefs.background_for("uzaki").is_none());
+        assert!(prefs.set_active_persona("uzaki"));
+        assert_eq!(prefs.background(), Some("data:image/png;base64,AAAA"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn prefs_bookmark_and_brand_persistence() {
         let dir = std::env::temp_dir().join(format!(
             "cederic_prefs_test_{}",
@@ -3831,12 +3920,13 @@ mod tests {
         assert_eq!(prefs.background(), Some("https://example.com/cederic.jpg"));
 
         // Reload prefs from disk: both backgrounds must be preserved
-        let reloaded = Prefs::open(&dir);
+        let mut reloaded = Prefs::open(&dir);
+        // Only the active persona's background is read at startup; the other loads on demand.
+        reloaded.ensure_background("uzaki");
         assert_eq!(reloaded.background_for(Brand::Cederic), Some("https://example.com/cederic.jpg"));
         assert_eq!(reloaded.background_for(Brand::Uzaki), Some("https://example.com/uzaki.png"));
 
         // Clear Uzaki background: Cederic must remain untouched
-        let mut reloaded = reloaded;
         reloaded.set_background(Brand::Uzaki, None, None);
         assert_eq!(reloaded.background_for(Brand::Uzaki), None);
         assert_eq!(reloaded.background_for(Brand::Cederic), Some("https://example.com/cederic.jpg"));

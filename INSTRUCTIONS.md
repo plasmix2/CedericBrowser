@@ -94,12 +94,21 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 *Leave persistent warnings, API contract changes, or questions for the other agent here.*
 
 - **Shared hot spots (`src/main.rs`, `src/toolbar.rs`, `src/popups.rs`):** When adding new `ChromeCmd` variants, `Shortcut` variants, or `Toolbar` fields, append them at the end of the enum/struct rather than reordering existing lines. This prevents unnecessary Git merge conflicts when both agents add commands in parallel.
+- **ANVL SDK:** the native UI is moving to the ANVL SDK (see `AGENTS.md`). Until the spike lands, keep adding native UI in `gfx.rs`/`toolbar.rs`/`popups.rs`, but write new screens as message-in, state-out (`Msg` enum plus an `update`) so they port cleanly. Claim any SDK work in the Active Work table first.
 - **WebView2 options:** Remember that every WebView in `src/main.rs` must share identical `BROWSER_ARGS`, scrollbar style, and data directory (`0x8007139F` otherwise). If you change one, document it clearly below.
 
 ---
 
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
+
+- **`claude/sharp-sagan-263h83` (faster start, setup screen, cleaner text/icons, ANVL SDK direction)** (written in a Linux container without the Windows/WebView2 toolchain: `cargo build`/`cargo test` for the full crate are **still to be run on Windows**. `gfx.rs` was compiled and its new tests run in a scratch crate; `newtab.html` was rendered in Chromium):
+  - **Files changed:** `src/main.rs`, `src/gfx.rs`, `src/ui/newtab.html`, `AGENTS.md`, `INSTRUCTIONS.md`.
+  - **Loading:** `gfx::warm_fonts` (new) reads the UI font database on a thread started first thing in `main`, so the multi-MB CJK font reads overlap window/WebView creation (`gfx::font_db` is the shared `OnceLock`). `Prefs::open` now reads only the *active* persona's background (`read_background`); others load in `Prefs::ensure_background`, called from `set_active_persona` and `delete_persona`. Anything new that reads `background_for`/`bg_strip_for` for a non-active persona must call `ensure_background` first (`prefs_per_persona_custom_background` does). `navigate_active` starts `load_url` before `close_suggest`/history/repaint. No `BROWSER_ARGS` changes.
+  - **Setup screen:** first-run overlay in `newtab.html` (`#setup`, `window.__setupSync`): name + color for the active persona (`update_persona`), site permissions (`set_permissions`), shortcuts. New `NewTabCmd::FinishSetup` (appended), `PrefsData::setup_done: Option<bool>` and `Prefs::{setup_done, finish_setup}`, `NewTabState::setup_done`. Prefs files from before this change that already have personas count as set up. Note: camera, microphone and notifications default to *allowed* (`SitePermissions::default`); the screen says so rather than hiding it.
+  - **Text and icons (`gfx.rs`):** glyph coverage goes through a small power curve (`coverage_lut`, light vs dark text by luma) in `Canvas::text` and `blend_px`; `Canvas::icon` snaps its box to whole physical pixels. Tests: `text_tests::*`, `setup_screen_state_persists_and_skips_existing_users`, `other_personas_backgrounds_load_when_selected`.
+  - **ANVL SDK:** `AGENTS.md` now has "Native UI: moving to the ANVL SDK" (mapping, spike-first plan, rules). Nothing uses the SDK yet and it is not vendored; the first step is a spike on drawing `anvl_gpu` into the `tao` window under the WebView2 children.
+  - **Preserve when merging:** the `warm_fonts` thread at the top of `main`, the lazy background loading, and `setup_done` in `Prefs::save`.
 
 - **`claude/kind-brown-esznx2` (combined branch, auto-update, v0.2.0)**:
   - Merged `origin/gemini/picture-in-picture` (7df9d2d, site permissions) with the Google-accounts work. All four conflicts were additive and both sides were kept (`MenuAction`, `Browser` fields + init, tests).
