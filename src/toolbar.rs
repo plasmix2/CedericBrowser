@@ -1177,7 +1177,7 @@ impl Toolbar {
             if on {
                 self.button_bg(&mut c, r, h, 9.0, &th);
             }
-            c.icon(icon, r.x + 9.0, r.y + 9.0, 16.0, th.fg.with_alpha(disabled(on)));
+            c.icon(icon, r.x + 7.0, r.y + 7.0, 20.0, th.fg.with_alpha(disabled(on)));
         }
         // Star (bookmark current page) button.
         let can_star = !self.model.url.is_empty();
@@ -1188,15 +1188,15 @@ impl Toolbar {
         }
         c.icon(
             if self.model.bookmarked { Icon::StarFilled } else { Icon::Star },
-            g.star.x + 9.0,
-            g.star.y + 9.0,
-            16.0,
+            g.star.x + 7.0,
+            g.star.y + 7.0,
+            20.0,
             if self.model.bookmarked { th.accent } else { th.fg.with_alpha(disabled(can_star)) },
         );
         self.button_bg(&mut c, g.reload, Hit::Reload, 9.0, &th);
         let m = self.load_morph;
-        c.icon(Icon::Reload, g.reload.x + 9.0, g.reload.y + 9.0, 16.0, th.fg.with_alpha(1.0 - m));
-        c.icon(Icon::Stop, g.reload.x + 9.0, g.reload.y + 9.0, 16.0, th.fg.with_alpha(m));
+        c.icon(Icon::Reload, g.reload.x + 7.0, g.reload.y + 7.0, 20.0, th.fg.with_alpha(1.0 - m));
+        c.icon(Icon::Stop, g.reload.x + 7.0, g.reload.y + 7.0, 20.0, th.fg.with_alpha(m));
         for (r, h, icon, active) in [
             (g.pip, Hit::Pip, Icon::Pip, self.model.pip),
             (g.theme, Hit::Theme, Icon::Palette, self.model.brand == Brand::Uzaki),
@@ -1207,7 +1207,7 @@ impl Toolbar {
             } else {
                 self.button_bg(&mut c, r, h, 9.0, &th);
             }
-            c.icon(icon, r.x + 9.0, r.y + 9.0, 16.0, if active { th.accent } else { th.fg });
+            c.icon(icon, r.x + 7.0, r.y + 7.0, 20.0, if active { th.accent } else { th.fg });
         }
 
         self.draw_omni(&mut c, g.omni, &th);

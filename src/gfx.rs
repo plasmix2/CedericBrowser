@@ -277,7 +277,7 @@ impl Canvas<'_> {
         let k = size / grid;
         let (strokes, fills, width) = cached_icon(icon);
         let paint = c.paint();
-        let st = Stroke { width: width * k, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
+        let st = Stroke { width: width * k * if grid > 20.0 { 1.2 } else { 1.0 }, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
         let t = Transform::from_row(k, 0.0, 0.0, k, x, y).post_scale(self.s, self.s);
         for p in fills {
             self.pm.fill_path(p, &paint, FillRule::Winding, t, None);

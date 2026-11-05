@@ -209,6 +209,12 @@ impl Popups {
     pub fn window_event(&mut self, kind: Kind, event: &WindowEvent) -> Option<Pick> {
         let p = self.get(kind);
         match event {
+            // A popup is resized in place when its content changes; repaint at the new size so no
+            // stale or blank pixels show around it.
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                p.window.request_redraw();
+                None
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let y = position.to_logical::<f32>(p.window.scale_factor()).y;
                 let hover = p.v.rows.iter().position(|r| r.enabled && y >= r.y && y < r.y + r.h);
