@@ -131,6 +131,14 @@ const SHORTCUT_SCRIPT: &str = r#"
       window.ipc.postMessage(msg);
     }
   };
+  // While a Persona dialog is open the page must not keep the keyboard: forward keys to the dialog.
+  window.addEventListener('keydown', (e) => {
+    if (!window.__personaModal) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (e.isComposing) return;
+    post('modal_key:' + JSON.stringify({ k: e.key, c: e.ctrlKey || e.metaKey, s: e.shiftKey }));
+  }, true);
   const preconnected = new Set();
   const preconnect = (raw) => {
     if (!raw || preconnected.size >= 48) return;
@@ -596,6 +604,8 @@ enum UserEvent {
     Shortcut(Shortcut),
     NewTab(TabId, NewTabCmd),
     PageMenu(TabId, ContextRequest),
+    /// A key pressed in a page while a Persona dialog is open (the page had the keyboard focus).
+    ModalKey(TabId, FormKey),
     Thumb(TabId, Pixmap),
     PipState(TabId, bool),
     UpgradeHttps(TabId, String),
@@ -1466,6 +1476,49 @@ impl Prefs {
     }
 }
 
+/// A key for a dialog's text field, from the window or forwarded by a page.
+#[derive(Debug, Clone, PartialEq)]
+enum FormKey {
+    Text(String),
+    Backspace { word: bool },
+    Delete { word: bool },
+    Left { shift: bool, word: bool },
+    Right { shift: bool, word: bool },
+    Home { shift: bool },
+    End { shift: bool },
+    Enter,
+    Escape,
+}
+
+impl FormKey {
+    /// Parses `{"k": key, "c": ctrl, "s": shift}` from a page. Pages are untrusted: only these keys
+    /// and single printable characters are accepted, and only while a dialog is open.
+    fn from_page(json: &str) -> Option<Self> {
+        #[derive(Deserialize)]
+        struct K {
+            k: String,
+            #[serde(default)]
+            c: bool,
+            #[serde(default)]
+            s: bool,
+        }
+        let k: K = serde_json::from_str(json).ok()?;
+        let (word, shift) = (k.c, k.s);
+        Some(match k.k.as_str() {
+            "Backspace" => Self::Backspace { word },
+            "Delete" => Self::Delete { word },
+            "ArrowLeft" => Self::Left { shift, word },
+            "ArrowRight" => Self::Right { shift, word },
+            "Home" => Self::Home { shift },
+            "End" => Self::End { shift },
+            "Enter" => Self::Enter,
+            "Escape" => Self::Escape,
+            t if !k.c && t.chars().count() == 1 && !t.chars().any(char::is_control) => Self::Text(t.to_owned()),
+            _ => return None,
+        })
+    }
+}
+
 /// Which dialog the modal popup is showing.
 enum ModalKind {
     Settings,
@@ -1865,6 +1918,8 @@ impl Browser {
                     let _ = p_ipc.send_event(UserEvent::FullscreenState(id, true));
                 } else if body == "fs_off" {
                     let _ = p_ipc.send_event(UserEvent::FullscreenState(id, false));
+                } else if let Some(k) = body.strip_prefix("modal_key:").and_then(FormKey::from_page) {
+                    let _ = p_ipc.send_event(UserEvent::ModalKey(id, k));
                 } else if let Some(s) = Shortcut::parse(body) {
                     let _ = p_ipc.send_event(UserEvent::Shortcut(s));
                 } else if let Ok(cmd) = serde_json::from_str::<NewTabCmd>(body) {
@@ -2250,6 +2305,8 @@ impl Browser {
     /// Converts a point in the main window's client area to logical screen coordinates.
     fn to_screen(&self, x: f64, y: f64) -> LogicalPosition<f64> {
         let scale = self.window.scale_factor();
+        // Every popup is placed through here: keep its idea of the scale in step with the window.
+        self.popups.set_scale(scale);
         let origin = self.window.inner_position().map(|p| p.to_logical::<f64>(scale)).unwrap_or_default();
         LogicalPosition::new(origin.x + x, origin.y + y)
     }
@@ -2592,6 +2649,7 @@ impl Browser {
         // repaint the whole window each time.
         if !self.popups.is_open(PopupKind::Scrim) {
             self.show_scrim(true);
+            self.set_page_modal(true);
         }
         let size = self.logical_size();
         let pos = self.to_screen(((size.width - w as f64) / 2.0).max(0.0), ((size.height - h as f64) / 2.0 - 20.0).max(0.0));
@@ -2694,38 +2752,61 @@ impl Browser {
         if e.state != ElementState::Pressed {
             return true;
         }
-        if e.logical_key == Key::Escape {
+        let (word, shift) = (self.mods.control_key(), self.mods.shift_key());
+        let key = match &e.logical_key {
+            Key::Escape => FormKey::Escape,
+            Key::Enter => FormKey::Enter,
+            Key::Backspace => FormKey::Backspace { word },
+            Key::Delete => FormKey::Delete { word },
+            Key::ArrowLeft => FormKey::Left { shift, word },
+            Key::ArrowRight => FormKey::Right { shift, word },
+            Key::Home => FormKey::Home { shift },
+            Key::End => FormKey::End { shift },
+            _ if !word && !self.mods.alt_key() => match e.text {
+                Some(t) if !t.chars().all(char::is_control) => FormKey::Text(t.chars().filter(|c| !c.is_control()).collect()),
+                _ => return true,
+            },
+            _ => return true,
+        };
+        self.form_key(key);
+        true
+    }
+
+    /// Applies a key to the open dialog: Escape closes any dialog, the rest edit the persona name.
+    fn form_key(&mut self, key: FormKey) {
+        if key == FormKey::Escape {
             self.hide_modal();
-            return true;
+            return;
         }
         if !matches!(self.modal_kind, Some(ModalKind::Persona)) {
-            return true;
+            return;
         }
-        let ctrl = self.mods.control_key();
-        let Some(f) = self.persona_form.as_mut() else { return true };
-        match &e.logical_key {
-            Key::Enter => {
-                self.save_persona_form();
-                return true;
+        if key == FormKey::Enter {
+            self.save_persona_form();
+            return;
+        }
+        let Some(f) = self.persona_form.as_mut() else { return };
+        match key {
+            FormKey::Backspace { word } => f.ed.backspace(&mut f.name, word),
+            FormKey::Delete { word } => f.ed.delete_forward(&mut f.name, word),
+            FormKey::Left { shift, word } => f.ed.left(&f.name, shift, word),
+            FormKey::Right { shift, word } => f.ed.right(&f.name, shift, word),
+            FormKey::Home { shift } => f.ed.home(shift),
+            FormKey::End { shift } => f.ed.end(&f.name, shift),
+            FormKey::Text(t) => {
+                f.ed.insert(&mut f.name, &t, 24, &anvil_ui::InputKind::Text);
             }
-            Key::Backspace => f.ed.backspace(&mut f.name, ctrl),
-            Key::Delete => f.ed.delete_forward(&mut f.name, ctrl),
-            Key::ArrowLeft => f.ed.left(&f.name, self.mods.shift_key(), ctrl),
-            Key::ArrowRight => f.ed.right(&f.name, self.mods.shift_key(), ctrl),
-            Key::Home => f.ed.home(self.mods.shift_key()),
-            Key::End => f.ed.end(&f.name, self.mods.shift_key()),
-            _ if !ctrl && !self.mods.alt_key() => {
-                if let Some(t) = e.text {
-                    let clean: String = t.chars().filter(|c| !c.is_control()).collect();
-                    if !clean.is_empty() {
-                        f.ed.insert(&mut f.name, &clean, 24, &anvil_ui::InputKind::Text);
-                    }
-                }
-            }
-            _ => {}
+            FormKey::Enter | FormKey::Escape => {}
         }
         self.show_persona_form();
-        true
+    }
+
+    /// Tells the active page whether a dialog is open, so it forwards keys instead of using them.
+    fn set_page_modal(&self, on: bool) {
+        let js = if on { "window.__personaModal = true;" } else { "window.__personaModal = false;" };
+        for t in &self.tabs {
+            let _ = t.view.evaluate_script(js);
+        }
     }
 
     fn save_persona_form(&mut self) {
@@ -2758,20 +2839,54 @@ impl Browser {
     /// is only dimmed.
     fn show_scrim(&mut self, request_fresh: bool) {
         let size = self.logical_size();
-        let top = self.top_bar_height();
-        let img = self.tabs.get(self.active).and_then(|t| t.thumb.as_ref()).map(|t| anvil::blur_pixmap(t, 6));
+        let img = self.scrim_picture();
         if request_fresh && let Some(t) = self.tabs.get(self.active) {
             let _ = self.thumbs_tx.send(thumbs::Request::Capture(t.id));
         }
-        let pos = self.to_screen(0.0, top);
-        let h = (size.height - top).max(1.0) as f32;
-        self.popups.show(PopupKind::Scrim, Content::Scrim { img, h }, pos, size.width as f32);
+        // The whole window: tab strip, toolbar and page all sit under the blur.
+        let pos = self.to_screen(0.0, 0.0);
+        self.popups.show(PopupKind::Scrim, Content::Scrim { img: Some(img), h: size.height.max(1.0) as f32 }, pos, size.width as f32);
+    }
+
+    /// A blurred picture of the whole window as it looks now: the chrome as last drawn and the page
+    /// from its latest snapshot, assembled at a quarter of the window's pixel size (the blur hides
+    /// the low resolution) with the window's exact proportions, so it lines up when stretched back.
+    fn scrim_picture(&self) -> Pixmap {
+        use tiny_skia::{FilterQuality, PixmapPaint, Transform};
+        let px = self.window.inner_size();
+        let (qw, qh) = ((px.width / 4).max(1), (px.height / 4).max(1));
+        let Some(mut pic) = Pixmap::new(qw, qh) else { return Pixmap::new(1, 1).expect("1x1") };
+        let bg = self.newtab_color();
+        pic.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
+        let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
+        // The page, cover-fitted into the content area.
+        let scale = self.window.scale_factor() as f32;
+        let content = self.content_bounds();
+        let (cx, cy, cw, ch) = match (content.position, content.size) {
+            (wry::dpi::Position::Logical(p), wry::dpi::Size::Logical(s)) => (p.x as f32, p.y as f32, s.width as f32, s.height as f32),
+            _ => (0.0, self.top_bar_height() as f32, px.width as f32 / scale, px.height as f32 / scale),
+        };
+        if let Some(thumb) = self.tabs.get(self.active).and_then(|t| t.thumb.as_ref()) {
+            let q = scale / 4.0; // logical px -> picture px
+            let k = (cw * q / thumb.width() as f32).max(ch * q / thumb.height() as f32);
+            let tw = thumb.width() as f32 * k;
+            let (ox, oy) = (cx * q + (cw * q - tw) / 2.0, cy * q);
+            pic.draw_pixmap(0, 0, thumb.as_ref(), &paint, Transform::from_row(k, 0.0, 0.0, k, ox, oy), None);
+        }
+        // The chrome, as last presented.
+        if self.frame.width() > 1 {
+            pic.draw_pixmap(0, 0, self.frame.as_ref(), &paint, Transform::from_scale(0.25, 0.25), None);
+        }
+        anvil::blur_pixmap(&pic, 5)
     }
 
     fn hide_modal(&mut self) {
         if matches!(self.modal_kind, Some(ModalKind::Persona)) {
             // Cancelled or closed: undo the live color preview.
             self.restore_chrome_theme();
+        }
+        if self.modal_kind.is_some() {
+            self.set_page_modal(false);
         }
         self.modal_kind = None;
         self.persona_form = None;
@@ -3592,6 +3707,7 @@ impl Browser {
                 Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history);
                 self.ensure_chrome_focus();
             }
+            NewTabCmd::AutoKey { .. } if self.modal_kind.is_some() => {}
             NewTabCmd::AutoKey { key } => {
                 if i != self.active {
                     self.switch_to(i);
@@ -3683,6 +3799,12 @@ impl Browser {
             UserEvent::Shortcut(s) => self.handle_shortcut(s),
             UserEvent::NewTab(id, cmd) => self.handle_newtab(id, cmd),
             UserEvent::PageMenu(id, r) => self.page_menu(id, r),
+            UserEvent::ModalKey(id, key) => {
+                // Only the visible page, and only while a dialog is open.
+                if self.active_tab().is_some_and(|t| t.id == id) && self.modal_kind.is_some() && self.popups.is_open(PopupKind::Modal) {
+                    self.form_key(key);
+                }
+            }
             UserEvent::IconLoaded(url, img) => {
                 self.popups.image_loaded(url.clone(), img.clone());
                 self.toolbar.icon_loaded(url, img);
@@ -3987,11 +4109,7 @@ impl Browser {
             }
             WindowEvent::ReceivedImeText(text) => {
                 if matches!(self.modal_kind, Some(ModalKind::Persona)) && self.popups.is_open(PopupKind::Modal) {
-                    if let Some(f) = self.persona_form.as_mut() {
-                        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
-                        f.ed.insert(&mut f.name, &clean, 24, &anvil_ui::InputKind::Text);
-                    }
-                    self.show_persona_form();
+                    self.form_key(FormKey::Text(text.chars().filter(|c| !c.is_control()).collect()));
                 } else {
                     self.toolbar.ime(&text);
                 }
@@ -4408,6 +4526,19 @@ mod tests {
         again.finish_setup();
         assert!(Prefs::open(&dir).setup_done);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_keys_for_dialogs_are_limited() {
+        assert_eq!(FormKey::from_page(r#"{"k":"a","c":false,"s":false}"#), Some(FormKey::Text("a".into())));
+        assert_eq!(FormKey::from_page(r#"{"k":"Backspace","c":true}"#), Some(FormKey::Backspace { word: true }));
+        assert_eq!(FormKey::from_page(r#"{"k":"Escape"}"#), Some(FormKey::Escape));
+        // Ctrl+letter, long strings, control characters and unknown keys are refused.
+        assert_eq!(FormKey::from_page(r#"{"k":"v","c":true}"#), None);
+        assert_eq!(FormKey::from_page(r#"{"k":"abc"}"#), None);
+        assert_eq!(FormKey::from_page(r#"{"k":"\u0007"}"#), None);
+        assert_eq!(FormKey::from_page(r#"{"k":"F5"}"#), None);
+        assert_eq!(FormKey::from_page("not json"), None);
     }
 
     #[test]

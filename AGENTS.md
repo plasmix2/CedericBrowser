@@ -70,6 +70,8 @@ Note that building replaces `target/release/Persona.exe`, so any running Persona
 
 ## Native UI: the ANVL SDK
 
+**Versions:** this line is **Persona 2.0** (ANVL). Persona 1.x continues separately with the older UI; see `INSTRUCTIONS.md` for how the two lines relate and why 2.0 releases are drafts.
+
 The native UI (tab strip, toolbar, address bar, menus, suggestions, tooltips, hover cards) is drawn by the
 **ANVL SDK 0.3.0** (`anvl_gpu` renderer on wgpu, `anvil_ui`), vendored in `vendor/anvil` (only those two
 crates plus its docs). `tiny-skia` is no longer used to draw text, icons or shapes; it only holds pixel buffers

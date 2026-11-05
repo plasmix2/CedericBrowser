@@ -13,7 +13,7 @@ use std::{
 };
 
 use tao::{
-    dpi::{LogicalPosition, LogicalSize, PhysicalPosition},
+    dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::EventLoopWindowTarget,
     platform::windows::{WindowBuilderExtWindows, WindowExtWindows},
@@ -243,7 +243,9 @@ pub struct Popup {
     frame: Option<Frame>,
     open: bool,
     /// Where to move the window once it has been repainted at its new size.
-    pending_pos: Option<LogicalPosition<f64>>,
+    pending_pos: Option<PhysicalPosition<i32>>,
+    /// The window size this popup asked for, in physical pixels (re-applied after moving it).
+    phys_size: (u32, u32),
     /// Where the card is on screen (logical), for placing a submenu beside a row.
     card_pos: (f64, f64),
     /// Last pointer position inside the card (logical px), to find the row under a press.
@@ -285,6 +287,9 @@ pub struct Popups {
     /// mouse move and key press, and the GPU frames would starve input.
     next_anim: Instant,
     animating: bool,
+    /// The browser window's scale factor. Popups are sized and drawn with it rather than their own:
+    /// a popup waiting off-screen can sit on another monitor with another scale.
+    scale: std::cell::Cell<f64>,
     last_frame: Instant,
 }
 
@@ -307,6 +312,7 @@ impl Popups {
             t0: Instant::now(),
             next_anim: Instant::now(),
             animating: false,
+            scale: std::cell::Cell::new(owner.scale_factor()),
             theme,
             last_frame: Instant::now(),
         }
@@ -340,6 +346,11 @@ impl Popups {
         }
     }
 
+    /// The browser window's scale factor (call it whenever it may have changed).
+    pub fn set_scale(&self, scale: f64) {
+        self.scale.set(scale);
+    }
+
     /// A photo for a menu avatar arrived.
     pub fn image_loaded(&mut self, url: String, img: Option<Pixmap>) {
         if let Some(img) = img {
@@ -365,7 +376,7 @@ impl Popups {
 
     /// Window width that fits a tooltip showing `text`, measured with the real font.
     pub fn tip_width(&mut self, text: &str) -> f32 {
-        let s = self.tip.window.scale_factor() as f32;
+        let s = self.scale.get() as f32;
         let w = match &mut self.engine {
             Some(e) => e.text_width(text, TIP_FONT, Weight::Regular, s),
             None => text.chars().count() as f32 * TIP_FONT * 0.55,
@@ -389,6 +400,7 @@ impl Popups {
     /// Returns the height it needs, already applied.
     pub fn show(&mut self, kind: Kind, content: Content, pos: LogicalPosition<f64>, w: f32) -> f32 {
         let (rows, h) = layout(&content);
+        let sc = self.scale.get();
         let p = self.get(kind);
         let was_open = p.open;
         let fresh = !p.open || p.v.size != (w, h);
@@ -415,12 +427,15 @@ impl Popups {
         p.card_pos = (pos.x, pos.y);
         // `pos` and `w`/`h` are the card's; the window adds room for the shadow around it.
         let m = margins(kind);
-        let pos = LogicalPosition::new(pos.x - m.l as f64, pos.y - m.t as f64);
-        if fresh {
+        // Physical pixels at the browser window's scale, so the popup matches it on any monitor.
+        let pos = PhysicalPosition::new(((pos.x - m.l as f64) * sc).round() as i32, ((pos.y - m.t as f64) * sc).round() as i32);
+        let size = ((((w + m.l + m.r) as f64) * sc).round().max(1.0) as u32, (((h + m.t + m.b) as f64) * sc).round().max(1.0) as u32);
+        if fresh || p.phys_size != size {
             // Resizing exposes unpainted pixels. Keep the window off-screen while it is resized and
             // painted, and only then move it into place (`redraw` applies `pending_pos`).
             p.window.set_outer_position(PARKED);
-            p.window.set_inner_size(LogicalSize::new((w + m.l + m.r) as f64, (h + m.t + m.b) as f64));
+            p.window.set_inner_size(PhysicalSize::new(size.0, size.1));
+            p.phys_size = size;
             p.pending_pos = Some(pos);
         } else {
             p.window.set_outer_position(pos);
@@ -455,6 +470,7 @@ impl Popups {
 
     /// Mouse input on a popup window. Returns a pick when a row was clicked.
     pub fn window_event(&mut self, kind: Kind, event: &WindowEvent) -> Option<Pick> {
+        let sc = self.scale.get();
         let p = self.get(kind);
         match event {
             // A popup is resized in place when its content changes; repaint at the new size so no
@@ -465,7 +481,7 @@ impl Popups {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let m = margins(kind);
-                let pt = position.to_logical::<f32>(p.window.scale_factor());
+                let pt = position.to_logical::<f32>(sc);
                 let (x, y) = (pt.x - m.l, pt.y - m.t);
                 p.cursor = (x, y);
                 // The shadow margin is part of the window but not of the card.
@@ -602,7 +618,7 @@ impl Popups {
             let Some(pm) = Pixmap::new(w.get(), h.get()) else { return };
             p.pm = pm;
         }
-        let s = p.window.scale_factor() as f32;
+        let s = self.scale.get() as f32;
         let (cw, ch) = (((p.v.size.0 * s).round() as u32).max(1), ((p.v.size.1 * s).round() as u32).max(1));
         if p.card.width() != cw || p.card.height() != ch {
             let Some(pm) = Pixmap::new(cw, ch) else { return };
@@ -625,6 +641,10 @@ impl Popups {
         let _ = buf.present();
         if let Some(pos) = p.pending_pos.take() {
             p.window.set_outer_position(pos);
+            // Moving it onto a monitor with another scale lets Windows resize it; put its size back.
+            if (p.window.inner_size().width, p.window.inner_size().height) != p.phys_size {
+                p.window.set_inner_size(PhysicalSize::new(p.phys_size.0, p.phys_size.1));
+            }
         }
     }
 }
@@ -670,6 +690,7 @@ impl Popup {
             frame: None,
             open: false,
             pending_pos: None,
+            phys_size: (1, 1),
             card_pos: (0.0, 0.0),
             cursor: (-1.0, -1.0),
             v: View {
@@ -912,8 +933,8 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
             Content::Scrim { img, .. } => {
                 c.rect(0.0, 0.0, w, h, Rgba(20, 22, 28, 255));
                 if img.is_some() {
-                    // Cropped to fill, not stretched: the snapshot rarely has the window's shape.
-                    c.image_cover("popup:scrim", 0.0, 0.0, w, h, 0.0);
+                    // The picture is assembled with the window's exact proportions: stretch it back.
+                    c.image("popup:scrim", 0.0, 0.0, w, h, 1.0);
                 }
                 // Dim what is behind the dialog; fades in with the popup.
                 c.rect(0.0, 0.0, w, h, Rgba(0, 0, 0, 255).with_alpha(if dark { 0.42 * a } else { 0.30 * a }));

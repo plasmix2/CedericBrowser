@@ -1,4 +1,5 @@
-# Builds Persona for Windows and publishes it as a GitHub release when a version tag is pushed:
+# Builds Persona for Windows and publishes it as a GitHub release when a version tag is pushed
+# (v2.x tags, the ANVL line, become drafts: see the `draft` setting below):
 #
 #   git tag v0.2.0 && git push origin v0.2.0        -> release "Persona V0.2.0"
 #   git tag v0.2.0-pre && git push origin v0.2.0-pre -> the same, as a pre-release
@@ -61,4 +62,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           files: Persona-${{ env.TAG }}.exe
           prerelease: ${{ contains(env.TAG, '-') }}
+          # Persona 2.0 (the ANVL line) is published as a draft: installed 1.x copies auto-update to
+          # any newer non-draft release, and 2.0 must not reach them until it is meant to.
+          draft: ${{ startsWith(env.TAG, 'v2.') }}
           generate_release_notes: true
