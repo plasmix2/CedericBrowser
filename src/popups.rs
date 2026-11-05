@@ -425,6 +425,8 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
     let t = 1.0 - (1.0 - p.enter).powi(3);
     let dy = -3.0 * (1.0 - t);
     let a = t;
+    // Paint the whole buffer: the window can briefly be larger than `p.size` while it resizes.
+    pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
     let mut c = Canvas { pm, s };
     c.rect(0.0, 0.0, w, h, bg);
     match &p.content {
@@ -462,7 +464,7 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
                     c.rrect(PAD, y, w - 2.0 * PAD, r.h, [9.0; 4], hover_bg.with_alpha(*f * a));
                 }
                 let icon = if items.get(i).is_some_and(|it| it.url) { Icon::Globe } else { Icon::Search };
-                c.icon(icon, PAD + 12.0, y + (r.h - 16.0) / 2.0, 16.0, if sel { th.accent } else { th.dim }.with_alpha(a));
+                c.icon(icon, PAD + 11.0, y + (r.h - 18.0) / 2.0, 18.0, if sel { th.accent } else { th.fg.with_alpha(0.8) }.with_alpha(a));
                 let hint_w = r.hint.as_ref().map_or(0.0, |b| text_width(b, s));
                 if let Some(b) = &mut r.label {
                     c.text(fonts, b, PAD + 40.0, y + (r.h - 13.5 * 1.35) / 2.0, th.fg.with_alpha(a), w - PAD - 20.0 - hint_w, 16.0);
