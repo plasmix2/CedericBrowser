@@ -1798,7 +1798,12 @@ impl Browser {
             Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
         }
         let title = if tab.title.is_empty() { &active_name } else { &tab.title };
-        let full_title = format!("{title} - {active_name}");
+        // Pre-release builds name themselves (PERSONA_BUILD=<git hash> at compile time), so the
+        // running exe can be told apart from the taskbar or Alt+Tab.
+        let full_title = match option_env!("PERSONA_BUILD") {
+            Some(build) => format!("{title} - {active_name} [{build}]"),
+            None => format!("{title} - {active_name}"),
+        };
         if self.last_title != full_title {
             self.window.set_title(&full_title);
             self.last_title = full_title;
