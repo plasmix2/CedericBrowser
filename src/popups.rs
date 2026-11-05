@@ -279,6 +279,7 @@ impl Popups {
     pub fn show(&mut self, kind: Kind, content: Content, pos: LogicalPosition<f64>, w: f32) -> f32 {
         let (rows, h) = layout(&content);
         let p = self.get(kind);
+        let was_open = p.open;
         let fresh = !p.open || p.v.size != (w, h);
         // Moving between hover cards or refreshing suggestions only swaps the content, without replaying the entrance.
         if !p.open {
@@ -287,7 +288,11 @@ impl Popups {
         }
         p.v.selected = 0;
         p.v.pressed = None;
-        p.v.hover_fade = vec![0.0; rows.len()];
+        // Refreshing the content of an open popup (a toggled switch, new suggestions) keeps the hover
+        // fades going instead of snapping every row back to unhovered.
+        if !was_open || p.v.hover_fade.len() != rows.len() {
+            p.v.hover_fade = vec![0.0; rows.len()];
+        }
         p.v.rows = rows;
         p.v.shot_ready = false;
         p.v.content = content;

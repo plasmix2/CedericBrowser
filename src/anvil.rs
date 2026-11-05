@@ -301,13 +301,22 @@ impl Painter<'_> {
     /// Draws `icon` with its grid scaled into a `size`-wide box at (x, y). The box is snapped to
     /// whole physical pixels so straight strokes stay crisp.
     pub fn icon(&mut self, icon: Icon, x: f32, y: f32, size: f32, c: Rgba) {
+        self.icon_rot(icon, x, y, size, c, 0.0);
+    }
+
+    /// Like `icon`, turned by `angle` radians around the middle of its box.
+    pub fn icon_rot(&mut self, icon: Icon, x: f32, y: f32, size: f32, c: Rgba, angle: f32) {
         let s = self.s;
         let (x, y) = ((x * s).round() / s, (y * s).round() / s);
         let size = ((size * s).round() / s).max(1.0 / s);
         let def = icon_def(icon);
         let k = size / def.grid;
         let fill_c = self.solid(c);
-        let map = |p: [f32; 2]| [x + p[0] * k, y + p[1] * k];
+        let (sn, cs) = angle.sin_cos();
+        let map = |p: [f32; 2]| {
+            let (dx, dy) = (p[0] - def.grid / 2.0, p[1] - def.grid / 2.0);
+            [x + (def.grid / 2.0 + dx * cs - dy * sn) * k, y + (def.grid / 2.0 + dx * sn + dy * cs) * k]
+        };
         for poly in def.fills.iter() {
             self.fill_polygon(&poly.iter().map(|&p| map(p)).collect::<Vec<_>>(), fill_c);
         }

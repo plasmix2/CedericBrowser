@@ -149,6 +149,10 @@ pub struct Toolbar {
     progress_alpha: f32,
     was_loading: bool,
     load_morph: f32,
+    /// 0..1 fade of the address bar's focus ring.
+    focus_f: f32,
+    /// 1 -> 0 after a page is bookmarked: drives the star's little pop.
+    star_pop: f32,
     spin: f32,
     icons: HashMap<String, Option<Pixmap>>,
     icon_requests: Vec<String>,
@@ -257,6 +261,8 @@ impl Toolbar {
             progress_alpha: 0.0,
             was_loading: false,
             load_morph: 0.0,
+            focus_f: 0.0,
+            star_pop: 0.0,
             spin: 0.0,
             icons: HashMap::new(),
             icon_requests: Vec::new(),
@@ -358,6 +364,9 @@ impl Toolbar {
             self.progress_alpha = 1.0;
         }
         self.was_loading = model.loading;
+        if model.bookmarked && !self.model.bookmarked && model.url == self.model.url {
+            self.star_pop = 1.0;
+        }
         self.model = model;
         self.layout();
     }
@@ -1001,6 +1010,13 @@ impl Toolbar {
                 let (x, y) = self.history_anchor();
                 Some(ChromeCmd::HistoryMenu { x: x as f64, y: y as f64 })
             }
+            // Ctrl+1..8 jump to that tab, Ctrl+9 to the last one.
+            (_, Some(d)) if ctrl && !alt && d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
+                let n = (d.as_bytes()[0] - b'1') as usize;
+                let ids = self.live_ids();
+                let pick = if n == 8 { ids.last() } else { ids.get(n) };
+                pick.map(|&id| ChromeCmd::Switch { id })
+            }
             (Key::Tab, _) if ctrl => Some(if shift { ChromeCmd::PrevTab } else { ChromeCmd::NextTab }),
             (Key::ArrowLeft, _) if alt => Some(ChromeCmd::Back),
             (Key::ArrowRight, _) if alt => Some(ChromeCmd::Forward),
@@ -1147,6 +1163,11 @@ impl Toolbar {
             busy = true;
         }
         busy |= approach01(&mut self.load_morph, if self.model.loading { 1.0 } else { 0.0 }, kf);
+        busy |= approach01(&mut self.focus_f, if self.editing { 1.0 } else { 0.0 }, kf);
+        if self.star_pop > 0.0 {
+            self.star_pop = (self.star_pop - dt / 0.45).max(0.0);
+            busy = true;
+        }
         if self.model.loading {
             // Eases toward 90% over a few seconds, then waits for the load to finish.
             self.progress += (0.9 - self.progress) * (1.0 - (-dt / 2.5).exp());
@@ -1235,7 +1256,10 @@ impl Toolbar {
 
         // New tab button.
         self.button_bg(c, g.new_tab, Hit::NewTab, 8.0, &th);
-        c.icon(Icon::Plus, g.new_tab.x + 7.0, g.new_tab.y + 7.0, 16.0, th.dim.mix(th.fg, self.fade(Hit::NewTab)));
+        // The plus turns a quarter as the pointer arrives.
+        let k = self.press_scale(Hit::NewTab);
+        let sz = 16.0 * k;
+        c.icon_rot(Icon::Plus, g.new_tab.x + 7.0 + (16.0 - sz) / 2.0, g.new_tab.y + 7.0 + (16.0 - sz) / 2.0, sz, th.dim.mix(th.fg, self.fade(Hit::NewTab)), self.fade(Hit::NewTab) * std::f32::consts::FRAC_PI_2);
 
         // Window controls.
         for (r, h, icon) in [
@@ -1265,7 +1289,8 @@ impl Toolbar {
             if on {
                 self.button_bg(c, r, h, 9.0, &th);
             }
-            c.icon(icon, r.x + 7.0, r.y + 7.0, 20.0, th.fg.with_alpha(disabled(on)));
+            let sz = 20.0 * self.press_scale(h);
+            c.icon(icon, r.x + 7.0 + (20.0 - sz) / 2.0, r.y + 7.0 + (20.0 - sz) / 2.0, sz, th.fg.with_alpha(disabled(on)));
         }
         // Star (bookmark current page) button.
         let can_star = !self.model.url.is_empty();
@@ -1274,17 +1299,23 @@ impl Toolbar {
         } else if can_star {
             self.button_bg(c, g.star, Hit::Star, 9.0, &th);
         }
+        // A little pop when a page gets bookmarked.
+        let pop = 1.0 + 0.3 * (self.star_pop * std::f32::consts::PI).sin();
+        let ssz = 20.0 * pop * self.press_scale(Hit::Star);
         c.icon(
             if self.model.bookmarked { Icon::StarFilled } else { Icon::Star },
-            g.star.x + 7.0,
-            g.star.y + 7.0,
-            20.0,
+            g.star.x + 7.0 + (20.0 - ssz) / 2.0,
+            g.star.y + 7.0 + (20.0 - ssz) / 2.0,
+            ssz,
             if self.model.bookmarked { th.accent } else { th.fg.with_alpha(disabled(can_star)) },
         );
         self.button_bg(c, g.reload, Hit::Reload, 9.0, &th);
         let m = self.load_morph;
-        c.icon(Icon::Reload, g.reload.x + 7.0, g.reload.y + 7.0, 20.0, th.fg.with_alpha(1.0 - m));
-        c.icon(Icon::Stop, g.reload.x + 7.0, g.reload.y + 7.0, 20.0, th.fg.with_alpha(m));
+        // Reload spins away into Stop and back.
+        let rs = 20.0 * self.press_scale(Hit::Reload);
+        let (rx, ry) = (g.reload.x + 7.0 + (20.0 - rs) / 2.0, g.reload.y + 7.0 + (20.0 - rs) / 2.0);
+        c.icon_rot(Icon::Reload, rx, ry, rs, th.fg.with_alpha(1.0 - m), m * std::f32::consts::PI);
+        c.icon_rot(Icon::Stop, rx, ry, rs, th.fg.with_alpha(m), (m - 1.0) * std::f32::consts::PI);
         self.button_bg(c, g.theme, Hit::Theme, 9.0, &th);
         self.draw_avatar(c, g.theme, &th);
         for (r, h, icon, active) in [
@@ -1296,7 +1327,8 @@ impl Toolbar {
             } else {
                 self.button_bg(c, r, h, 9.0, &th);
             }
-            c.icon(icon, r.x + 7.0, r.y + 7.0, 20.0, if active { th.accent } else { th.fg });
+            let sz = 20.0 * self.press_scale(h);
+            c.icon(icon, r.x + 7.0 + (20.0 - sz) / 2.0, r.y + 7.0 + (20.0 - sz) / 2.0, sz, if active { th.accent } else { th.fg });
         }
 
         self.draw_omni(c, g.omni, &th);
@@ -1307,6 +1339,11 @@ impl Toolbar {
             let w = self.width * self.progress;
             c.rect(0.0, HEIGHT - 2.0, w, 2.0, th.accent.mix(th.accent2, 0.35).with_alpha(self.progress_alpha));
         }
+    }
+
+    /// Buttons dip a little while pressed.
+    fn press_scale(&self, h: Hit) -> f32 {
+        if self.pressed == Some(h) && self.hover == h { 0.86 } else { 1.0 }
     }
 
     fn fade(&self, h: Hit) -> f32 {
@@ -1456,9 +1493,12 @@ impl Toolbar {
 
     fn draw_omni(&mut self, c: &mut Painter, o: R, th: &Theme) {
         let f = if self.editing { 0.0 } else { self.fade(Hit::Omni) };
-        if self.editing {
-            c.rrect(o.x - 3.0, o.y - 3.0, o.w + 6.0, o.h + 6.0, 20.0, th.accent.with_alpha(0.22));
-            c.rrect(o.x - 1.0, o.y - 1.0, o.w + 2.0, o.h + 2.0, 18.0, th.accent);
+        // The focus ring fades and grows in rather than appearing at once.
+        let ff = self.focus_f;
+        if ff > 0.01 {
+            let grow = 3.0 * ff;
+            c.rrect(o.x - grow, o.y - grow, o.w + grow * 2.0, o.h + grow * 2.0, 17.0 + grow, th.accent.with_alpha(0.22 * ff));
+            c.rrect(o.x - 1.0, o.y - 1.0, o.w + 2.0, o.h + 2.0, 18.0, th.accent.with_alpha(ff));
         }
         c.rrect(o.x, o.y, o.w, o.h, 17.0, th.field.mix(th.field_hover, f));
 
