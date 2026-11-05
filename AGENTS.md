@@ -50,7 +50,7 @@ cargo run --release -- example.com       # opens a URL or search
 cargo test                               # unit tests
 ```
 
-Note that building replaces `target/release/cederic.exe`, so any running Cederic must be closed first.
+Note that building replaces `target/release/Persona.exe`, so any running Persona must be closed first.
 
 | File | What it does |
 |---|---|

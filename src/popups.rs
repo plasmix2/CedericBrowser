@@ -22,7 +22,7 @@ use tao::{
 };
 use tiny_skia::Pixmap;
 
-use crate::gfx::{Brand, Canvas, Fonts, Icon, Rgba, Theme, attrs, text_width};
+use crate::gfx::{Brand, Canvas, Fonts, Icon, PersonaColor, Rgba, Theme, attrs, text_width};
 
 /// Where hidden popups wait. Physical pixels: a logical position this far out would be scaled past
 /// what Windows accepts at high DPI, and the window would land at the screen's top-left instead.
@@ -129,8 +129,13 @@ impl Popups {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_theme(&mut self, dark: bool, brand: Brand) {
-        self.theme = Theme::for_brand(dark, brand);
+        self.set_persona_theme(dark, PersonaColor::from(brand));
+    }
+
+    pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor) {
+        self.theme = Theme::for_persona(dark, color);
         let c = self.theme.card;
         for p in [&self.menu, &self.suggest, &self.preview] {
             p.window.set_background_color(Some((c.0, c.1, c.2, 255)));

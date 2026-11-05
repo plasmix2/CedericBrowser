@@ -1,8 +1,13 @@
 [package]
-name = "cederic"
+name = "persona"
 version = "0.1.0"
 edition = "2024"
 description = "A lean, memory-safe browser shell written in Rust"
+default-run = "Persona"
+
+[[bin]]
+name = "Persona"
+path = "src/main.rs"
 
 [dependencies]
 arboard = { version = "3.7.0", default-features = false }

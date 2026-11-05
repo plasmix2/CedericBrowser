@@ -1,6 +1,6 @@
-# Cederic
+# Persona
 
-A lean Windows browser written in Rust. The browser itself forbids `unsafe` code and ships as a single ~1 MB executable; web pages are rendered by the system's WebView2 engine.
+A lean Windows browser written in Rust. The browser itself forbids `unsafe` code and ships as a single ~4 MB executable (`Persona.exe`); web pages are rendered by the system's WebView2 engine.
 
 > **AI agents:** read [AGENTS.md](AGENTS.md) before changing anything.
 

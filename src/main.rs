@@ -13,6 +13,7 @@ mod thumbs;
 mod toolbar;
 
 use std::{
+    collections::HashMap,
     num::NonZeroU32,
     path::PathBuf,
     rc::Rc,
@@ -20,7 +21,7 @@ use std::{
     time::Instant,
 };
 
-use gfx::Brand;
+use gfx::{Brand, PersonaColor};
 use history::{HistoryEntry, HistoryStore};
 use popups::{Card, Content, Kind as PopupKind, MenuEntry, Pick, Popups, SuggestEntry};
 use tiny_skia::Pixmap;
@@ -380,11 +381,11 @@ const BRAND_SCRIPT: &str = r#"
     }
   };
   window.__cedericSetBrand = (b) => {
-    const uzaki = b === 'uzaki';
-    brandName = uzaki ? 'Uzaki' : 'Cederic';
-    const letter = uzaki ? 'U' : 'C';
-    const grad = uzaki ? 'linear-gradient(90deg, #6a5acd, #94a3f8)' : 'linear-gradient(90deg, #ff6a3d, #ffb03d)';
-    const badgeGrad = uzaki ? 'linear-gradient(135deg, #6a5acd, #94a3f8)' : 'linear-gradient(135deg, #ff6a3d, #ffb03d)';
+    brandName = window.__cedericBrandName || (b === 'uzaki' ? 'Uzaki' : 'Persona');
+    const letter = (brandName.trim().charAt(0) || 'P').toUpperCase();
+    const color = window.__cedericBrandColor || (b === 'uzaki' ? '#7366e6' : '#ff6a3d');
+    const grad = `linear-gradient(90deg, ${color}, #ffffff)`;
+    const badgeGrad = `linear-gradient(135deg, ${color}, ${color})`;
     style.textContent = `
       img[src*="brave-logo" i], img[alt*="Brave logo" i], img[alt*="Cederic logo" i], img[alt*="Uzaki logo" i],
       picture:has(img[alt*="logo" i]) source,
@@ -519,6 +520,21 @@ enum NewTabCmd {
     OpenBookmark { url: String },
     DeleteBookmark { url: String },
     SetBrand { brand: Brand },
+    SelectPersona { id: String },
+    CreatePersona {
+        name: String,
+        color: String,
+        #[serde(default)]
+        pfp: Option<String>,
+    },
+    UpdatePersona {
+        id: String,
+        name: String,
+        color: String,
+        #[serde(default)]
+        pfp: Option<String>,
+    },
+    DeletePersona { id: String },
     SetBackground {
         #[serde(default)]
         data: String,
@@ -625,7 +641,11 @@ enum MenuAction {
     ClearHistory,
     ToggleBookmark,
     DeleteBookmark(String),
+    #[allow(dead_code)]
     SetBrand(Brand),
+    SelectPersona(String),
+    OpenNewPersona,
+    OpenManagePersonas,
     ChooseBackground,
     SetBackgroundUrl(String),
     ClearBackground,
@@ -633,28 +653,75 @@ enum MenuAction {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct Bookmark {
-    title: String,
-    url: String,
+pub struct Bookmark {
+    pub title: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaProfile {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    #[serde(default)]
+    pub pfp: Option<String>,
+    #[serde(default)]
+    pub bookmarks: Vec<Bookmark>,
+}
+
+impl PersonaProfile {
+    pub fn new_cederic() -> Self {
+        Self {
+            id: "cederic".into(),
+            name: "Cederic".into(),
+            color: "orange".into(),
+            pfp: None,
+            bookmarks: Vec::new(),
+        }
+    }
+
+    pub fn new_uzaki() -> Self {
+        Self {
+            id: "uzaki".into(),
+            name: "Uzaki".into(),
+            color: "slate".into(),
+            pfp: None,
+            bookmarks: Vec::new(),
+        }
+    }
+
+    pub fn parsed_color(&self) -> PersonaColor {
+        PersonaColor::from_str_name(&self.color)
+    }
+
+    pub fn badge_letter(&self) -> String {
+        self.name
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "P".into())
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct PrefsData {
     #[serde(default)]
-    brand: Brand,
+    active_persona: Option<String>,
     #[serde(default)]
-    bookmarks: Vec<Bookmark>,
+    personas: Vec<PersonaProfile>,
+    #[serde(default)]
+    brand: Option<Brand>,
+    #[serde(default)]
+    bookmarks: Option<Vec<Bookmark>>,
 }
 
 struct Prefs {
     path: PathBuf,
     data_dir: PathBuf,
-    brand: Brand,
-    bookmarks: Vec<Bookmark>,
-    bg_cederic: Option<String>,
-    strip_cederic: Option<Pixmap>,
-    bg_uzaki: Option<String>,
-    strip_uzaki: Option<Pixmap>,
+    active_persona_id: String,
+    personas: Vec<PersonaProfile>,
+    bg_cache: HashMap<String, Option<String>>,
+    strip_cache: HashMap<String, Option<Pixmap>>,
 }
 
 impl Prefs {
@@ -672,82 +739,166 @@ impl Prefs {
             let _ = std::fs::rename(&legacy_strip_path, &cederic_strip_path);
         }
 
-        let uzaki_bg_path = data_dir.join("background_uzaki.txt");
-        let uzaki_strip_path = data_dir.join("background_strip_uzaki.png");
-
         let data: PrefsData = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
-        let bg_cederic = std::fs::read_to_string(&cederic_bg_path)
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty());
-        let strip_cederic = std::fs::read(&cederic_strip_path)
-            .ok()
-            .and_then(|b| Pixmap::decode_png(&b).ok());
+        let mut personas = data.personas;
+        if personas.is_empty() {
+            let mut cederic = PersonaProfile::new_cederic();
+            if let Some(bms) = data.bookmarks {
+                cederic.bookmarks = bms;
+            }
+            let uzaki = PersonaProfile::new_uzaki();
+            personas = vec![cederic, uzaki];
+        }
 
-        let bg_uzaki = std::fs::read_to_string(&uzaki_bg_path)
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty());
-        let strip_uzaki = std::fs::read(&uzaki_strip_path)
-            .ok()
-            .and_then(|b| Pixmap::decode_png(&b).ok());
+        personas.truncate(5);
+
+        let active_id = if let Some(active) = data.active_persona
+            && personas.iter().any(|p| p.id == active)
+        {
+            active
+        } else if let Some(brand) = data.brand {
+            let legacy_id = match brand {
+                Brand::Cederic => "cederic",
+                Brand::Uzaki => "uzaki",
+            };
+            if personas.iter().any(|p| p.id == legacy_id) {
+                legacy_id.to_string()
+            } else {
+                personas[0].id.clone()
+            }
+        } else {
+            personas[0].id.clone()
+        };
+
+        let mut bg_cache = HashMap::new();
+        let mut strip_cache = HashMap::new();
+
+        for p in &personas {
+            let bg_p = data_dir.join(format!("background_{}.txt", p.id));
+            let bg = std::fs::read_to_string(&bg_p)
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
+            bg_cache.insert(p.id.clone(), bg);
+
+            let strip_p = data_dir.join(format!("background_strip_{}.png", p.id));
+            let strip = std::fs::read(&strip_p)
+                .ok()
+                .and_then(|b| Pixmap::decode_png(&b).ok());
+            strip_cache.insert(p.id.clone(), strip);
+        }
 
         Self {
             path,
             data_dir: data_dir.to_path_buf(),
-            brand: data.brand,
-            bookmarks: data.bookmarks,
-            bg_cederic,
-            strip_cederic,
-            bg_uzaki,
-            strip_uzaki,
+            active_persona_id: active_id,
+            personas,
+            bg_cache,
+            strip_cache,
+        }
+    }
+
+    fn active_persona(&self) -> &PersonaProfile {
+        self.personas
+            .iter()
+            .find(|p| p.id == self.active_persona_id)
+            .unwrap_or(&self.personas[0])
+    }
+
+    fn active_persona_mut(&mut self) -> &mut PersonaProfile {
+        let active = self.active_persona_id.clone();
+        if let Some(pos) = self.personas.iter().position(|p| p.id == active) {
+            &mut self.personas[pos]
+        } else {
+            &mut self.personas[0]
+        }
+    }
+
+    fn active_id(&self) -> &str {
+        &self.active_persona_id
+    }
+
+    fn active_name(&self) -> &str {
+        &self.active_persona().name
+    }
+
+    fn active_color(&self) -> PersonaColor {
+        self.active_persona().parsed_color()
+    }
+
+    fn active_badge_letter(&self) -> String {
+        self.active_persona().badge_letter()
+    }
+
+    fn active_bookmarks(&self) -> &[Bookmark] {
+        &self.active_persona().bookmarks
+    }
+
+    #[cfg(test)]
+    fn bookmarks(&self) -> &[Bookmark] {
+        self.active_bookmarks()
+    }
+
+    fn brand(&self) -> Brand {
+        match self.active_color() {
+            PersonaColor::Slate => Brand::Uzaki,
+            _ => Brand::Cederic,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_brand(&mut self, brand: Brand) {
+        let target_id = match brand {
+            Brand::Cederic => "cederic",
+            Brand::Uzaki => "uzaki",
+        };
+        if self.personas.iter().any(|p| p.id == target_id) {
+            self.set_active_persona(target_id);
+        } else {
+            let color = PersonaColor::from(brand);
+            let active_id = self.active_persona_id.clone();
+            let cur_name = self.active_name().to_string();
+            self.update_persona(&active_id, &cur_name, color.name(), None);
         }
     }
 
     fn background(&self) -> Option<&str> {
-        self.background_for(self.brand)
+        self.background_for(&self.active_persona_id)
     }
 
-    fn background_for(&self, brand: Brand) -> Option<&str> {
-        match brand {
-            Brand::Cederic => self.bg_cederic.as_deref(),
-            Brand::Uzaki => self.bg_uzaki.as_deref(),
-        }
+    fn background_for(&self, id_or_brand: impl AsRef<str>) -> Option<&str> {
+        let key = id_or_brand.as_ref().to_ascii_lowercase();
+        self.bg_cache.get(&key).and_then(|opt| opt.as_deref())
     }
 
     fn bg_strip(&self) -> Option<Pixmap> {
-        self.bg_strip_for(self.brand)
+        self.bg_strip_for(&self.active_persona_id)
     }
 
-    fn bg_strip_for(&self, brand: Brand) -> Option<Pixmap> {
-        match brand {
-            Brand::Cederic => self.strip_cederic.clone(),
-            Brand::Uzaki => self.strip_uzaki.clone(),
-        }
+    fn bg_strip_for(&self, id_or_brand: impl AsRef<str>) -> Option<Pixmap> {
+        let key = id_or_brand.as_ref().to_ascii_lowercase();
+        self.strip_cache.get(&key).and_then(|opt| opt.clone())
     }
 
-    fn bg_path(&self, brand: Brand) -> PathBuf {
-        let suffix = match brand {
-            Brand::Cederic => "cederic",
-            Brand::Uzaki => "uzaki",
-        };
-        self.data_dir.join(format!("background_{suffix}.txt"))
+    fn bg_path(&self, id: &str) -> PathBuf {
+        self.data_dir.join(format!("background_{id}.txt"))
     }
 
-    fn strip_path(&self, brand: Brand) -> PathBuf {
-        let suffix = match brand {
-            Brand::Cederic => "cederic",
-            Brand::Uzaki => "uzaki",
-        };
-        self.data_dir.join(format!("background_strip_{suffix}.png"))
+    fn strip_path(&self, id: &str) -> PathBuf {
+        self.data_dir.join(format!("background_strip_{id}.png"))
     }
 
     fn save(&self) {
-        let data = PrefsData { brand: self.brand, bookmarks: self.bookmarks.clone() };
+        let data = PrefsData {
+            active_persona: Some(self.active_persona_id.clone()),
+            personas: self.personas.clone(),
+            brand: Some(self.brand()),
+            bookmarks: Some(self.active_bookmarks().to_vec()),
+        };
         if let Ok(json) = serde_json::to_string_pretty(&data) {
             let tmp = self.path.with_extension("json.tmp");
             if let Some(p) = self.path.parent() {
@@ -759,9 +910,106 @@ impl Prefs {
         }
     }
 
-    fn set_background(&mut self, brand: Brand, data: Option<String>, strip_png: Option<&str>) {
-        let bg_path = self.bg_path(brand);
-        let strip_path = self.strip_path(brand);
+    fn set_active_persona(&mut self, id: &str) -> bool {
+        if self.personas.iter().any(|p| p.id == id) {
+            self.active_persona_id = id.to_string();
+            self.save();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn create_persona(
+        &mut self,
+        name: &str,
+        color: &str,
+        pfp: Option<String>,
+    ) -> Result<String, &'static str> {
+        if self.personas.len() >= 5 {
+            return Err("Maximum 5 personas allowed");
+        }
+        let clean_name = name.trim();
+        let final_name = if clean_name.is_empty() {
+            format!("Persona {}", self.personas.len() + 1)
+        } else {
+            clean_name.to_string()
+        };
+        let valid_color = PersonaColor::from_str_name(color).name().to_string();
+        let id = format!(
+            "p_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        let persona = PersonaProfile {
+            id: id.clone(),
+            name: final_name,
+            color: valid_color,
+            pfp: pfp.filter(|s| s.starts_with("data:image/") || s.starts_with("http")),
+            bookmarks: Vec::new(),
+        };
+        self.personas.push(persona);
+        self.active_persona_id = id.clone();
+        self.save();
+        Ok(id)
+    }
+
+    fn update_persona(
+        &mut self,
+        id: &str,
+        name: &str,
+        color: &str,
+        pfp: Option<Option<String>>,
+    ) -> bool {
+        if let Some(p) = self.personas.iter_mut().find(|p| p.id == id) {
+            let clean_name = name.trim();
+            if !clean_name.is_empty() {
+                p.name = clean_name.to_string();
+            }
+            p.color = PersonaColor::from_str_name(color).name().to_string();
+            if let Some(new_pfp) = pfp {
+                p.pfp = new_pfp.filter(|s| s.starts_with("data:image/") || s.starts_with("http"));
+            }
+            self.save();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn delete_persona(&mut self, id: &str) -> Result<(), &'static str> {
+        if self.personas.len() <= 1 {
+            return Err("Cannot delete the last persona");
+        }
+        if let Some(pos) = self.personas.iter().position(|p| p.id == id) {
+            self.personas.remove(pos);
+            if self.active_persona_id == id {
+                self.active_persona_id = self.personas[0].id.clone();
+            }
+            let bg_p = self.bg_path(id);
+            let strip_p = self.strip_path(id);
+            let _ = std::fs::remove_file(bg_p);
+            let _ = std::fs::remove_file(strip_p);
+            self.bg_cache.remove(id);
+            self.strip_cache.remove(id);
+            self.save();
+            Ok(())
+        } else {
+            Err("Persona not found")
+        }
+    }
+
+    fn set_background(
+        &mut self,
+        id_or_brand: impl AsRef<str>,
+        data: Option<String>,
+        strip_png: Option<&str>,
+    ) {
+        let id = id_or_brand.as_ref().to_ascii_lowercase();
+        let bg_path = self.bg_path(&id);
+        let strip_path = self.strip_path(&id);
         let clean = data
             .map(|s| s.trim().to_owned())
             .filter(|s| s.starts_with("data:image/") || s.starts_with("https://") || s.starts_with("http://"));
@@ -785,42 +1033,27 @@ impl Prefs {
                 let _ = std::fs::remove_file(&strip_path);
                 None
             };
-            match brand {
-                Brand::Cederic => {
-                    self.bg_cederic = Some(bg);
-                    self.strip_cederic = strip_pm;
-                }
-                Brand::Uzaki => {
-                    self.bg_uzaki = Some(bg);
-                    self.strip_uzaki = strip_pm;
-                }
-            }
+            self.bg_cache.insert(id.clone(), Some(bg));
+            self.strip_cache.insert(id, strip_pm);
         } else {
             let _ = std::fs::remove_file(&bg_path);
             let _ = std::fs::remove_file(&strip_path);
-            match brand {
-                Brand::Cederic => {
-                    self.bg_cederic = None;
-                    self.strip_cederic = None;
-                }
-                Brand::Uzaki => {
-                    self.bg_uzaki = None;
-                    self.strip_uzaki = None;
-                }
-            }
+            self.bg_cache.insert(id.clone(), None);
+            self.strip_cache.insert(id, None);
         }
     }
 
     fn is_bookmarked(&self, url: &str) -> bool {
-        !url.is_empty() && self.bookmarks.iter().any(|b| b.url == url)
+        !url.is_empty() && self.active_bookmarks().iter().any(|b| b.url == url)
     }
 
     fn toggle_bookmark(&mut self, title: &str, url: &str) -> bool {
         if url.is_empty() || url.starts_with("about:") || url.starts_with("data:") {
             return false;
         }
-        if let Some(pos) = self.bookmarks.iter().position(|b| b.url == url) {
-            self.bookmarks.remove(pos);
+        let bms = &mut self.active_persona_mut().bookmarks;
+        if let Some(pos) = bms.iter().position(|b| b.url == url) {
+            bms.remove(pos);
             self.save();
             false
         } else {
@@ -830,9 +1063,9 @@ impl Prefs {
             } else {
                 clean.chars().take(60).collect()
             };
-            self.bookmarks.insert(0, Bookmark { title: t, url: url.to_owned() });
-            if self.bookmarks.len() > 100 {
-                self.bookmarks.truncate(100);
+            bms.insert(0, Bookmark { title: t, url: url.to_owned() });
+            if bms.len() > 100 {
+                bms.truncate(100);
             }
             self.save();
             true
@@ -840,14 +1073,20 @@ impl Prefs {
     }
 
     fn remove_bookmark(&mut self, url: &str) -> bool {
-        let before = self.bookmarks.len();
-        self.bookmarks.retain(|b| b.url != url);
-        if self.bookmarks.len() != before {
+        let bms = &mut self.active_persona_mut().bookmarks;
+        let before = bms.len();
+        bms.retain(|b| b.url != url);
+        if bms.len() != before {
             self.save();
             true
         } else {
             false
         }
+    }
+
+    #[allow(dead_code)]
+    fn delete_bookmark(&mut self, url: &str) -> bool {
+        self.remove_bookmark(url)
     }
 }
 
@@ -902,12 +1141,31 @@ static LOGO_DATA_URI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
 });
 
 #[derive(Serialize)]
+struct PersonaDto<'a> {
+    id: &'a str,
+    name: &'a str,
+    color: &'a str,
+    color_hex: &'a str,
+    pfp: Option<&'a str>,
+    is_active: bool,
+    bookmark_count: usize,
+}
+
+#[derive(Serialize)]
 struct NewTabState<'a> {
     brand: Brand,
+    personas: Vec<PersonaDto<'a>>,
+    active_persona_id: &'a str,
+    persona_name: &'a str,
+    persona_color: &'a str,
+    persona_color_hex: &'a str,
+    persona_pfp: Option<&'a str>,
     bookmarks: &'a [Bookmark],
     history: &'a [HistoryEntry],
     background: Option<&'a str>,
     logo: &'a str,
+    can_create: bool,
+    can_delete: bool,
 }
 
 struct Devtools {
@@ -1002,11 +1260,11 @@ impl Browser {
     }
 
     fn newtab_color(&self) -> Rgba {
-        match (self.dark, self.prefs.brand) {
-            (true, Brand::Uzaki) => (24, 29, 44, 255),
-            (false, Brand::Uzaki) => (237, 240, 247, 255),
-            (true, Brand::Cederic) => (29, 30, 34, 255),
-            (false, Brand::Cederic) => (244, 244, 246, 255),
+        let (strip, toolbar, _) = self.prefs.active_color().surface_tints(self.dark);
+        if self.dark {
+            (strip.0, strip.1, strip.2, 255)
+        } else {
+            (toolbar.0, toolbar.1, toolbar.2, 255)
         }
     }
 
@@ -1016,7 +1274,9 @@ impl Browser {
         self.next_id += 1;
         let bounds = self.content_bounds();
         let bg = self.newtab_color();
-        let brand_key = if self.prefs.brand == Brand::Uzaki { "uzaki" } else { "cederic" };
+        let brand_key = if self.prefs.active_color() == PersonaColor::Slate { "uzaki" } else { "cederic" };
+        let persona_name = self.prefs.active_name().to_string();
+        let persona_color_hex = self.prefs.active_color().hex_code();
 
         let p_title = self.proxy.clone();
         let p_load = self.proxy.clone();
@@ -1030,7 +1290,7 @@ impl Browser {
             .with_user_agent(USER_AGENT)
             .with_initialization_script(STEALTH_SCRIPT)
             .with_initialization_script(format!(
-                "if (window === window.top && location.hostname === 'search.brave.com') window.__cedericBrand = {brand_key:?};"
+                "if (window === window.top && location.hostname === 'search.brave.com') {{ window.__cedericBrand = {brand_key:?}; window.__cedericBrandName = {persona_name:?}; window.__cedericBrandColor = {persona_color_hex:?}; }}"
             ))
             .with_initialization_script(SHORTCUT_SCRIPT)
             .with_initialization_script(BRAND_SCRIPT)
@@ -1264,12 +1524,35 @@ impl Browser {
     }
 
     fn push_newtab_state(view: &WebView, prefs: &Prefs, history: &HistoryStore) {
+        let active = prefs.active_persona();
+        let color = active.parsed_color();
+        let personas = prefs
+            .personas
+            .iter()
+            .map(|p| PersonaDto {
+                id: &p.id,
+                name: &p.name,
+                color: &p.color,
+                color_hex: p.parsed_color().hex_code(),
+                pfp: p.pfp.as_deref(),
+                is_active: p.id == prefs.active_persona_id,
+                bookmark_count: p.bookmarks.len(),
+            })
+            .collect();
         let state = NewTabState {
-            brand: prefs.brand,
-            bookmarks: &prefs.bookmarks,
+            brand: prefs.brand(),
+            personas,
+            active_persona_id: &prefs.active_persona_id,
+            persona_name: &active.name,
+            persona_color: color.name(),
+            persona_color_hex: color.hex_code(),
+            persona_pfp: active.pfp.as_deref(),
+            bookmarks: prefs.active_bookmarks(),
             history: history.entries(),
             background: prefs.background(),
             logo: LOGO_DATA_URI.as_str(),
+            can_create: prefs.personas.len() < 5,
+            can_delete: prefs.personas.len() > 1,
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -1278,7 +1561,10 @@ impl Browser {
 
     fn sync_ui(&mut self) {
         let Some(tab) = self.active_tab() else { return };
-        let brand = self.prefs.brand;
+        let brand = self.prefs.brand();
+        let color = self.prefs.active_color();
+        let badge_letter = self.prefs.active_badge_letter();
+        let active_name = self.prefs.active_name().to_string();
         let model = toolbar::Model {
             tabs: self
                 .tabs
@@ -1292,7 +1578,7 @@ impl Browser {
                 })
                 .collect(),
             active: tab.id,
-            url: display_url(&tab.url, brand),
+            url: display_url(&tab.url, &active_name),
             can_back: tab.view.can_go_back().unwrap_or(false),
             can_forward: tab.view.can_go_forward().unwrap_or(false),
             loading: tab.loading,
@@ -1301,6 +1587,8 @@ impl Browser {
             pip: self.tabs.iter().any(|t| t.pip),
             bookmarked: self.prefs.is_bookmarked(&tab.url),
             brand,
+            color,
+            badge_letter,
         };
         if tab.is_newtab {
             Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
@@ -1401,7 +1689,7 @@ impl Browser {
         {
             let _ = self.thumbs_tx.send(thumbs::Request::Capture(cur.id));
         }
-        let shown = display_url(&tab.url, self.prefs.brand);
+        let shown = display_url(&tab.url, self.prefs.active_name());
         let card = Card {
             title: if tab.title.is_empty() { "New Tab".into() } else { tab.title.clone() },
             host: host_of(&shown).unwrap_or_default().to_owned(),
@@ -1502,11 +1790,11 @@ impl Browser {
         );
         items.push(MenuItem::sep());
 
-        if self.prefs.bookmarks.is_empty() {
+        if self.prefs.active_bookmarks().is_empty() {
             items.push(MenuItem::new("No saved bookmarks yet", MenuAction::ToggleBookmark).enabled(false));
         } else {
-            for b in self.prefs.bookmarks.iter().take(MAX) {
-                let shown = display_url(&b.url, self.prefs.brand);
+            for b in self.prefs.active_bookmarks().iter().take(MAX) {
+                let shown = display_url(&b.url, self.prefs.active_name());
                 let host = host_of(&shown).unwrap_or_default().to_owned();
                 items.push(
                     MenuItem::new(b.title.clone(), MenuAction::OpenUrl(b.url.clone())).hint(host),
@@ -1523,32 +1811,39 @@ impl Browser {
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
-    /// Theme & persona dropdown under the palette button: switch between Cederic (Orange) and Uzaki (Slate Blue),
+    /// Theme & persona dropdown under the palette button: switch between personas, create new,
     /// or choose / clear a custom background image.
     fn theme_menu(&mut self, right: f64, y: f64) {
-        let cur = self.prefs.brand;
-        let c_check = if cur == Brand::Cederic { "✓  Cederic (Orange)" } else { "   Cederic (Orange)" };
-        let u_check = if cur == Brand::Uzaki { "✓  Uzaki (Slate Blue)" } else { "   Uzaki (Slate Blue)" };
+        let active_id = self.prefs.active_id().to_string();
+        let mut items = Vec::new();
+        for p in &self.prefs.personas {
+            let is_cur = p.id == active_id;
+            let mark = if is_cur { "✓  " } else { "   " };
+            let label = format!("{mark}{}", p.name);
+            let hint = p.parsed_color().label();
+            items.push(MenuItem::new(label, MenuAction::SelectPersona(p.id.clone())).hint(hint));
+        }
+        if self.prefs.personas.len() < 5 {
+            items.push(MenuItem::new("+ Create New Persona…", MenuAction::OpenNewPersona));
+        }
+        items.push(MenuItem::new("Manage Personas…", MenuAction::OpenManagePersonas));
+        items.push(MenuItem::sep());
+        let cur_name = self.prefs.active_name().to_string();
         let has_bg = self.prefs.background().is_some();
         let bg_label = if has_bg {
-            format!("Change {} background image…", cur.name())
+            format!("Change {cur_name} background image…")
         } else {
-            format!("Set {} background image…", cur.name())
+            format!("Set {cur_name} background image…")
         };
-        let rm_label = format!("Remove {} background image", cur.name());
-        let items = vec![
-            MenuItem::new(c_check, MenuAction::SetBrand(Brand::Cederic)).hint("Default"),
-            MenuItem::new(u_check, MenuAction::SetBrand(Brand::Uzaki)).hint("Slate Blue"),
-            MenuItem::sep(),
-            MenuItem::new(bg_label, MenuAction::ChooseBackground),
-            MenuItem::new(rm_label, MenuAction::ClearBackground).enabled(has_bg),
-        ];
-        self.show_menu(items, (right - 248.0).max(0.0), y);
+        let rm_label = format!("Remove {cur_name} background image");
+        items.push(MenuItem::new(bg_label, MenuAction::ChooseBackground));
+        items.push(MenuItem::new(rm_label, MenuAction::ClearBackground).enabled(has_bg));
+        self.show_menu(items, (right - 260.0).max(0.0), y);
     }
 
     fn apply_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
-        let brand = self.prefs.brand;
-        self.prefs.set_background(brand, data, strip_png);
+        let active_id = self.prefs.active_id().to_string();
+        self.prefs.set_background(&active_id, data, strip_png);
         self.toolbar.set_background(self.prefs.bg_strip());
         self.sync_all_newtabs();
         self.sync_ui();
@@ -1559,19 +1854,37 @@ impl Browser {
         self.with_active(|v| v.evaluate_script(js));
     }
 
-    fn set_brand(&mut self, brand: Brand) {
-        if self.prefs.brand == brand {
+    fn open_persona_editor(&mut self, id: Option<&str>) {
+        let script = match id {
+            Some(i) => format!("window.__personaOpenEditor && window.__personaOpenEditor({i:?});"),
+            None => "window.__personaOpenEditor && window.__personaOpenEditor(null);".to_string(),
+        };
+        let is_newtab = self.tabs.get(self.active).is_some_and(|t| t.is_newtab);
+        if is_newtab {
+            self.with_active(|v| v.evaluate_script(&script));
+        } else {
+            let _ = self.open_tab(None, None, true);
+            self.with_active(|v| v.evaluate_script(&script));
+        }
+    }
+
+    fn set_persona(&mut self, id: &str) {
+        if !self.prefs.set_active_persona(id) {
             return;
         }
-        self.prefs.brand = brand;
-        self.prefs.save();
-        self.toolbar.set_theme(self.dark, brand);
+        let persona = self.prefs.active_persona().clone();
+        let color = persona.parsed_color();
+        let letter = persona.badge_letter();
+
+        self.toolbar.set_persona_theme(self.dark, color, &letter);
         self.toolbar.set_background(self.prefs.bg_strip());
-        self.popups.set_theme(self.dark, brand);
+        self.popups.set_persona_theme(self.dark, color);
+
         let bg = self.newtab_color();
-        let brand_key = if brand == Brand::Uzaki { "uzaki" } else { "cederic" };
+        let brand_key = if color == PersonaColor::Slate { "uzaki" } else { "cederic" };
         let js = format!(
-            "window.__cedericBrand = {brand_key:?}; window.__cedericSetBrand && window.__cedericSetBrand({brand_key:?});"
+            "window.__cedericBrand = {:?}; window.__cedericBrandName = {:?}; window.__cedericBrandColor = {:?}; window.__cedericSetBrand && window.__cedericSetBrand({:?});",
+            brand_key, persona.name, color.hex_code(), brand_key
         );
         for tab in &mut self.tabs {
             if tab.newtab_bg {
@@ -1580,9 +1893,9 @@ impl Browser {
             if host_of(&tab.url) == Some(REAL_SEARCH_HOST) {
                 tab.title = tab
                     .title
-                    .replace("Brave", brand.name())
-                    .replace("Cederic", brand.name())
-                    .replace("Uzaki", brand.name());
+                    .replace("Brave", &persona.name)
+                    .replace("Cederic", &persona.name)
+                    .replace("Uzaki", &persona.name);
             }
             let _ = tab.view.evaluate_script(&js);
         }
@@ -1594,6 +1907,23 @@ impl Browser {
         }
         self.sync_all_newtabs();
         self.sync_ui();
+        self.redraw();
+    }
+
+    fn set_brand(&mut self, brand: Brand) {
+        let target_id = match brand {
+            Brand::Cederic => "cederic",
+            Brand::Uzaki => "uzaki",
+        };
+        if self.prefs.personas.iter().any(|p| p.id == target_id) {
+            self.set_persona(target_id);
+        } else {
+            let color = PersonaColor::from(brand);
+            let active_id = self.prefs.active_id().to_string();
+            let cur_name = self.prefs.active_name().to_string();
+            self.prefs.update_persona(&active_id, &cur_name, color.name(), None);
+            self.set_persona(&active_id);
+        }
     }
 
     fn page_menu(&mut self, id: TabId, r: ContextRequest) {
@@ -1708,6 +2038,12 @@ impl Browser {
                 }
             }
             MenuAction::SetBrand(brand) => self.set_brand(brand),
+            MenuAction::SelectPersona(id) => self.set_persona(&id),
+            MenuAction::OpenNewPersona => self.open_persona_editor(None),
+            MenuAction::OpenManagePersonas => {
+                let id = self.prefs.active_id().to_string();
+                self.open_persona_editor(Some(&id));
+            }
             MenuAction::ChooseBackground => self.choose_background(),
             MenuAction::SetBackgroundUrl(url) => {
                 self.apply_background(Some(url.clone()), None);
@@ -2085,6 +2421,28 @@ impl Browser {
                     self.sync_ui();
                 }
             }
+            NewTabCmd::SelectPersona { id } => self.set_persona(&id),
+            NewTabCmd::CreatePersona { name, color, pfp } => {
+                if let Ok(nid) = self.prefs.create_persona(&name, &color, pfp) {
+                    self.set_persona(&nid);
+                }
+            }
+            NewTabCmd::UpdatePersona { id, name, color, pfp } => {
+                if self.prefs.update_persona(&id, &name, &color, Some(pfp)) {
+                    if id == self.prefs.active_persona_id {
+                        self.set_persona(&id);
+                    } else {
+                        self.sync_all_newtabs();
+                        self.sync_ui();
+                    }
+                }
+            }
+            NewTabCmd::DeletePersona { id } => {
+                if self.prefs.delete_persona(&id).is_ok() {
+                    let active_id = self.prefs.active_id().to_string();
+                    self.set_persona(&active_id);
+                }
+            }
             NewTabCmd::SetBrand { brand } => self.set_brand(brand),
             NewTabCmd::SetBackground { .. } => {}
         }
@@ -2189,7 +2547,7 @@ impl Browser {
                     return;
                 }
                 if let Some(i) = self.index_of(id) {
-                    let brand_name = self.prefs.brand.name();
+                    let brand_name = self.prefs.active_name();
                     let t = &mut self.tabs[i];
                     t.title = if host_of(&t.url) == Some(REAL_SEARCH_HOST) {
                         title
@@ -2288,8 +2646,10 @@ impl Browser {
             WindowEvent::CloseRequested => self.quit = true,
             WindowEvent::ThemeChanged(theme) => {
                 self.dark = theme == Theme::Dark;
-                self.toolbar.set_theme(self.dark, self.prefs.brand);
-                self.popups.set_theme(self.dark, self.prefs.brand);
+                let color = self.prefs.active_color();
+                let letter = self.prefs.active_badge_letter();
+                self.toolbar.set_persona_theme(self.dark, color, &letter);
+                self.popups.set_persona_theme(self.dark, color);
                 let bg = self.newtab_color();
                 for tab in &self.tabs {
                     if tab.newtab_bg {
@@ -2408,12 +2768,8 @@ impl Browser {
             // The bare strip between page and DevTools is the splitter.
             let x0 = ((logical_w - dt - SPLITTER) * scale).floor().max(0.0) as u32;
             let gap = ((SPLITTER * scale).ceil() as u32 + 1).min(w.get().saturating_sub(x0));
-            let color = match (self.dark, self.prefs.brand) {
-                (true, Brand::Uzaki) => 0x131722,
-                (false, Brand::Uzaki) => 0xd9deec,
-                (true, Brand::Cederic) => 0x18191d,
-                (false, Brand::Cederic) => 0xdfe1e6,
-            };
+            let (strip, _, _) = self.prefs.active_color().surface_tints(self.dark);
+            let color = ((strip.0 as u32) << 16) | ((strip.1 as u32) << 8) | (strip.2 as u32);
             for row in bar_h as usize..h.get() as usize {
                 buf[row * width + x0 as usize..row * width + (x0 + gap) as usize].fill(color);
             }
@@ -2447,14 +2803,27 @@ fn parse_favicon(json: &str) -> Option<String> {
     (ok && url.len() < 64 * 1024).then_some(url)
 }
 
-/// The address-bar text for `url`; Brave Search is shown as Cederic's (or Uzaki's) own search host.
-fn display_url(url: &str, brand: Brand) -> String {
+fn search_host_for_persona(name: &str) -> String {
+    let slug: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if slug.is_empty() {
+        "search.persona.com".into()
+    } else {
+        format!("search.{slug}.com")
+    }
+}
+
+/// The address-bar text for `url`; Brave Search is shown as Persona's own search host.
+fn display_url(url: &str, brand: impl AsRef<str>) -> String {
     if url.starts_with("about:") || url.starts_with("data:") {
         return String::new();
     }
     match url.split_once("://") {
         Some((scheme, rest)) if host_of(url) == Some(REAL_SEARCH_HOST) => {
-            let shown_host = brand.search_host();
+            let shown_host = search_host_for_persona(brand.as_ref());
             format!("{scheme}://{shown_host}{}", &rest[REAL_SEARCH_HOST.len()..])
         }
         _ => url.to_owned(),
@@ -2463,9 +2832,18 @@ fn display_url(url: &str, brand: Brand) -> String {
 
 /// Maps the displayed search host back to the real one when the user edits and submits it.
 fn unmask(input: &str) -> String {
-    input
+    let mut res = input
         .replace(Brand::Cederic.search_host(), REAL_SEARCH_HOST)
         .replace(Brand::Uzaki.search_host(), REAL_SEARCH_HOST)
+        .replace("search.persona.com", REAL_SEARCH_HOST);
+    if let Some((scheme, rest)) = res.split_once("://")
+        && let Some((host, path_and_query)) = rest.split_once('/')
+        && host.starts_with("search.")
+        && host.ends_with(".com")
+    {
+        res = format!("{scheme}://{REAL_SEARCH_HOST}/{path_and_query}");
+    }
+    res
 }
 
 fn host_of(url: &str) -> Option<&str> {
@@ -2515,7 +2893,9 @@ fn main() -> wry::Result<()> {
 
     let dir = data_dir();
     let prefs = Prefs::open(&dir);
-    let brand = prefs.brand;
+    let brand = prefs.brand();
+    let color = prefs.active_color();
+    let letter = prefs.active_badge_letter();
 
     let window = Rc::new(
         WindowBuilder::new()
@@ -2539,11 +2919,13 @@ fn main() -> wry::Result<()> {
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
     let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
+    toolbar.set_persona_theme(dark, color, &letter);
     toolbar.set_background(prefs.bg_strip());
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
-    let popups = Popups::new(&event_loop, &window, dark, brand);
+    let mut popups = Popups::new(&event_loop, &window, dark, brand);
+    popups.set_persona_theme(dark, color);
 
     let p_thumb = proxy.clone();
     let thumbs_tx = thumbs::spawn(dir.clone(), move |tab, img| {
@@ -2678,22 +3060,33 @@ mod tests {
                 .as_nanos()
         ));
         let mut prefs = Prefs::open(&dir);
-        assert_eq!(prefs.brand, Brand::Cederic);
-        assert!(prefs.bookmarks.is_empty());
+        assert_eq!(prefs.brand(), Brand::Cederic);
+        assert!(prefs.bookmarks().is_empty());
 
         assert!(prefs.toggle_bookmark("Rust Lang", "https://www.rust-lang.org/"));
         assert!(prefs.is_bookmarked("https://www.rust-lang.org/"));
-        prefs.brand = Brand::Uzaki;
-        prefs.save();
+
+        // Switch to Uzaki: bookmarks are isolated per persona!
+        prefs.set_brand(Brand::Uzaki);
+        assert_eq!(prefs.brand(), Brand::Uzaki);
+        assert!(prefs.bookmarks().is_empty());
+        assert!(!prefs.is_bookmarked("https://www.rust-lang.org/"));
+
+        // Bookmark in Uzaki
+        assert!(prefs.toggle_bookmark("Uzaki Site", "https://example.com/uzaki"));
+        assert!(prefs.is_bookmarked("https://example.com/uzaki"));
+
+        // Switch back to Cederic: Cederic still has its bookmark, not Uzaki's
+        prefs.set_brand(Brand::Cederic);
+        assert_eq!(prefs.bookmarks().len(), 1);
+        assert_eq!(prefs.bookmarks()[0].title, "Rust Lang");
+        assert!(prefs.is_bookmarked("https://www.rust-lang.org/"));
+        assert!(!prefs.is_bookmarked("https://example.com/uzaki"));
 
         let reloaded = Prefs::open(&dir);
-        assert_eq!(reloaded.brand, Brand::Uzaki);
-        assert_eq!(reloaded.bookmarks.len(), 1);
-        assert_eq!(reloaded.bookmarks[0].title, "Rust Lang");
-
-        let mut reloaded = reloaded;
-        assert!(!reloaded.toggle_bookmark("Rust Lang", "https://www.rust-lang.org/"));
-        assert!(!reloaded.is_bookmarked("https://www.rust-lang.org/"));
+        assert_eq!(reloaded.brand(), Brand::Cederic);
+        assert_eq!(reloaded.bookmarks().len(), 1);
+        assert_eq!(reloaded.bookmarks()[0].title, "Rust Lang");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2717,7 +3110,7 @@ mod tests {
                 .as_nanos()
         ));
         let mut prefs = Prefs::open(&dir);
-        assert_eq!(prefs.brand, Brand::Cederic);
+        assert_eq!(prefs.brand(), Brand::Cederic);
         assert_eq!(prefs.background(), None);
 
         // Set Cederic background
@@ -2725,7 +3118,7 @@ mod tests {
         assert_eq!(prefs.background(), Some("https://example.com/cederic.jpg"));
 
         // Switch to Uzaki: should not have a background yet
-        prefs.brand = Brand::Uzaki;
+        prefs.set_brand(Brand::Uzaki);
         assert_eq!(prefs.background(), None);
 
         // Set Uzaki background
@@ -2733,7 +3126,7 @@ mod tests {
         assert_eq!(prefs.background(), Some("https://example.com/uzaki.png"));
 
         // Switch back to Cederic: should still have Cederic background
-        prefs.brand = Brand::Cederic;
+        prefs.set_brand(Brand::Cederic);
         assert_eq!(prefs.background(), Some("https://example.com/cederic.jpg"));
 
         // Reload prefs from disk: both backgrounds must be preserved
@@ -2746,6 +3139,73 @@ mod tests {
         reloaded.set_background(Brand::Uzaki, None, None);
         assert_eq!(reloaded.background_for(Brand::Uzaki), None);
         assert_eq!(reloaded.background_for(Brand::Cederic), Some("https://example.com/cederic.jpg"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefs_persona_creation_limits_and_deletion() {
+        let dir = std::env::temp_dir().join(format!(
+            "persona_mgmt_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut prefs = Prefs::open(&dir);
+        // Initially 2 base personas: Cederic and Uzaki
+        assert_eq!(prefs.personas.len(), 2);
+        assert_eq!(prefs.personas[0].name, "Cederic");
+        assert_eq!(prefs.personas[1].name, "Uzaki");
+
+        // Create 3rd, 4th, 5th persona
+        let p3 = prefs.create_persona("Work", "emerald", Some("data:image/png;base64,abc".into())).unwrap();
+        let p4 = prefs.create_persona("Gaming", "violet", None).unwrap();
+        let p5 = prefs.create_persona("Secret", "ruby", None).unwrap();
+        assert_eq!(prefs.personas.len(), 5);
+
+        // Max 5 personas enforced: creating a 6th must fail
+        let p6_err = prefs.create_persona("Overflow", "cyan", None);
+        assert!(p6_err.is_err());
+        assert_eq!(prefs.personas.len(), 5);
+
+        // Active persona should be p5
+        assert_eq!(prefs.active_id(), &p5);
+        assert_eq!(prefs.active_name(), "Secret");
+        assert_eq!(prefs.active_color(), PersonaColor::Ruby);
+
+        // Edit p3
+        assert!(prefs.update_persona(&p3, "Work & Code", "cyan", Some(None)));
+        let p3_prof = prefs.personas.iter().find(|p| p.id == p3).unwrap();
+        assert_eq!(p3_prof.name, "Work & Code");
+        assert_eq!(p3_prof.color, "cyan");
+        assert_eq!(p3_prof.pfp, None);
+
+        // User can delete base personas if they want!
+        assert!(prefs.delete_persona("cederic").is_ok());
+        assert_eq!(prefs.personas.len(), 4);
+        assert!(!prefs.personas.iter().any(|p| p.id == "cederic"));
+
+        assert!(prefs.delete_persona("uzaki").is_ok());
+        assert_eq!(prefs.personas.len(), 3);
+        assert!(!prefs.personas.iter().any(|p| p.id == "uzaki"));
+
+        // Delete down to 1 persona
+        assert!(prefs.delete_persona(&p4).is_ok());
+        assert!(prefs.delete_persona(&p5).is_ok());
+        assert_eq!(prefs.personas.len(), 1);
+
+        // Cannot delete the only remaining persona!
+        let last_id = prefs.personas[0].id.clone();
+        let del_err = prefs.delete_persona(&last_id);
+        assert!(del_err.is_err());
+        assert_eq!(prefs.personas.len(), 1);
+
+        // Persistence check
+        let reloaded = Prefs::open(&dir);
+        assert_eq!(reloaded.personas.len(), 1);
+        assert_eq!(reloaded.personas[0].name, "Work & Code");
+        assert_eq!(reloaded.personas[0].color, "cyan");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

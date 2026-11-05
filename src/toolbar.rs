@@ -17,7 +17,7 @@ use tiny_skia::Pixmap;
 
 use crate::{
     ChromeCmd, TabId,
-    gfx::{Brand, Canvas, Fonts, Icon, Rgba, Theme, attrs, text_width},
+    gfx::{Brand, Canvas, Fonts, Icon, PersonaColor, Rgba, Theme, attrs, text_width},
 };
 
 /// Height of the tab strip (also the window's title bar).
@@ -61,6 +61,8 @@ pub struct Model {
     pub pip: bool,
     pub bookmarked: bool,
     pub brand: Brand,
+    pub color: PersonaColor,
+    pub badge_letter: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -266,9 +268,19 @@ impl Toolbar {
 
     // ---------- outside updates ----------
 
+    #[allow(dead_code)]
     pub fn set_theme(&mut self, dark: bool, brand: Brand) {
-        self.theme = Theme::for_brand(dark, brand);
-        self.model.brand = brand;
+        self.set_persona_theme(dark, PersonaColor::from(brand), brand.badge_letter());
+    }
+
+    pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor, badge_letter: &str) {
+        self.theme = Theme::for_persona(dark, color);
+        self.model.brand = match color {
+            PersonaColor::Slate => Brand::Uzaki,
+            _ => Brand::Cederic,
+        };
+        self.model.color = color;
+        self.model.badge_letter = badge_letter.to_uppercase();
         self.pretty = None;
     }
 
@@ -1094,7 +1106,7 @@ impl Toolbar {
         c.icon(Icon::Stop, g.reload.x + 9.0, g.reload.y + 9.0, 16.0, th.fg.with_alpha(m));
         for (r, h, icon, active) in [
             (g.pip, Hit::Pip, Icon::Pip, self.model.pip),
-            (g.theme, Hit::Theme, Icon::Palette, self.model.brand == Brand::Uzaki),
+            (g.theme, Hit::Theme, Icon::Palette, self.model.color != PersonaColor::Orange || self.model.brand == Brand::Uzaki),
             (g.dev, Hit::Devtools, Icon::Code, self.model.devtools),
         ] {
             if active {
@@ -1200,7 +1212,12 @@ impl Toolbar {
             c.image(logo, icon_x, cy - 8.0, 16.0, 16.0, alpha);
         } else if favicon == BRAND_ICON {
             c.rrect(icon_x, cy - 8.0, 16.0, 16.0, [4.0; 4], th.accent.mix(th.accent2, 0.3).with_alpha(alpha));
-            let mut b = self.fonts.line(self.model.brand.badge_letter(), 11.0, Weight::BOLD, self.s);
+            let letter = if !self.model.badge_letter.is_empty() {
+                self.model.badge_letter.as_str()
+            } else {
+                self.model.brand.badge_letter()
+            };
+            let mut b = self.fonts.line(letter, 11.0, Weight::BOLD, self.s);
             let bw = text_width(&b, self.s);
             c.text(&mut self.fonts, &mut b, icon_x + (16.0 - bw) / 2.0, cy - 7.5, Rgba(255, 255, 255, 255).with_alpha(alpha), f32::MAX, 0.0);
         } else if let Some(Some(img)) = self.icons.get(&favicon) {
