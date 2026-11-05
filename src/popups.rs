@@ -38,6 +38,9 @@ const SHOT_H: f32 = 158.0;
 const CARD_TEXT_H: f32 = 62.0;
 const TIP_H: f32 = 28.0;
 const TIP_FONT: f32 = 12.5;
+const MODAL_HEAD: f32 = 74.0;
+const MODAL_ROW: f32 = 56.0;
+const MODAL_FOOT: f32 = 62.0;
 
 /// Space around a popup's card for its drop shadow (left, top, right, bottom), in logical pixels.
 /// The shadow falls downward, so the top margin is small: tooltips and the suggestion list sit
@@ -93,6 +96,8 @@ pub enum Kind {
     Preview,
     /// Toolbar button tooltips; its own window so it never fights the hover card.
     Tip,
+    /// A centred dialog with switches (site permissions). Stays until its Done button is clicked.
+    Modal,
 }
 
 pub struct MenuEntry {
@@ -108,6 +113,12 @@ pub struct SuggestEntry {
     pub url: bool,
 }
 
+pub struct ToggleEntry {
+    pub label: String,
+    pub desc: String,
+    pub on: bool,
+}
+
 pub struct Card {
     pub title: String,
     pub host: String,
@@ -121,6 +132,8 @@ pub enum Content {
     Preview(Card),
     /// One-line tooltip under a toolbar button.
     Tip(String),
+    /// A dialog: title, a line of explanation, one switch row per entry, then a Done button.
+    Modal { title: String, note: String, items: Vec<ToggleEntry> },
 }
 
 /// A row laid out for drawing and hit-testing.
@@ -169,6 +182,8 @@ pub struct Popup {
 pub enum Pick {
     Menu(usize),
     Suggest(usize),
+    /// A row of the modal: a switch (0..n) or, last, the Done button.
+    Modal(usize),
 }
 
 pub struct Popups {
@@ -179,6 +194,7 @@ pub struct Popups {
     pub suggest: Popup,
     pub preview: Popup,
     pub tip: Popup,
+    pub modal: Popup,
     last_frame: Instant,
 }
 
@@ -192,6 +208,7 @@ impl Popups {
             suggest: make(Kind::Suggest),
             preview: make(Kind::Preview),
             tip: make(Kind::Tip),
+            modal: make(Kind::Modal),
             theme,
             last_frame: Instant::now(),
         }
@@ -205,7 +222,7 @@ impl Popups {
     pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor) {
         self.theme = Theme::for_persona(dark, color);
         let c = self.theme.card;
-        for p in [&self.menu, &self.suggest, &self.preview, &self.tip] {
+        for p in [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal] {
             p.window.set_background_color(Some(window_bg(c)));
             if p.open {
                 p.window.request_redraw();
@@ -219,6 +236,7 @@ impl Popups {
             Kind::Suggest => &mut self.suggest,
             Kind::Preview => &mut self.preview,
             Kind::Tip => &mut self.tip,
+            Kind::Modal => &mut self.modal,
         }
     }
 
@@ -238,6 +256,7 @@ impl Popups {
             Kind::Suggest => self.suggest.open,
             Kind::Preview => self.preview.open,
             Kind::Tip => self.tip.open,
+            Kind::Modal => self.modal.open,
         }
     }
 
@@ -297,7 +316,7 @@ impl Popups {
     }
 
     pub fn owns(&self, id: WindowId) -> Option<Kind> {
-        [&self.menu, &self.suggest, &self.preview, &self.tip].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
+        [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
     }
 
     /// Mouse input on a popup window. Returns a pick when a row was clicked.
@@ -337,14 +356,14 @@ impl Popups {
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match (kind, state) {
                 // Suggestions act on press: the address bar may lose focus before release.
                 (Kind::Suggest, ElementState::Pressed) => p.v.hover.map(Pick::Suggest),
-                (Kind::Menu, ElementState::Pressed) => {
+                (Kind::Menu | Kind::Modal, ElementState::Pressed) => {
                     p.v.pressed = p.v.hover;
                     p.window.request_redraw();
                     None
                 }
-                (Kind::Menu, ElementState::Released) => {
+                (Kind::Menu | Kind::Modal, ElementState::Released) => {
                     let picked = p.v.pressed.take().filter(|i| Some(*i) == p.v.hover);
-                    picked.map(Pick::Menu)
+                    picked.map(if kind == Kind::Modal { Pick::Modal } else { Pick::Menu })
                 }
                 _ => None,
             },
@@ -359,7 +378,7 @@ impl Popups {
         let k = 1.0 - (-dt * 30.0).exp();
         let mut busy = false;
         let mut dirty = Vec::new();
-        for p in [&mut self.menu, &mut self.suggest, &mut self.preview, &mut self.tip] {
+        for p in [&mut self.menu, &mut self.suggest, &mut self.preview, &mut self.tip, &mut self.modal] {
             if !p.open {
                 continue;
             }
@@ -398,6 +417,7 @@ impl Popups {
             Kind::Suggest => &mut self.suggest,
             Kind::Preview => &mut self.preview,
             Kind::Tip => &mut self.tip,
+            Kind::Modal => &mut self.modal,
         };
         if !p.open {
             return;
@@ -528,6 +548,15 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
             rows.push(row(0.0, TIP_H, Some(text.clone()), None, false));
             return (rows, TIP_H);
         }
+        Content::Modal { items, .. } => {
+            y = MODAL_HEAD;
+            for it in items {
+                rows.push(row(y, MODAL_ROW, Some(it.label.clone()), Some(it.desc.clone()), true));
+                y += MODAL_ROW;
+            }
+            rows.push(row(y, MODAL_FOOT, Some("Done".to_owned()), None, true));
+            return (rows, y + MODAL_FOOT);
+        }
     }
     (rows, y + PAD)
 }
@@ -609,6 +638,42 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, th: &Theme, 
                         let hy = y + (r.h - c.line_height(11.5, Weight::Regular)) / 2.0;
                         c.text(hint, w - PAD - 12.0 - hint_w, hy, 11.5, Weight::Regular, th.dim.with_alpha(a), w);
                     }
+                }
+            }
+            Content::Modal { title, note, items } => {
+                c.text(title, 22.0, 20.0, 17.0, Weight::SemiBold, th.fg.with_alpha(a), w - 22.0);
+                c.text(note, 22.0, 46.0, 12.0, Weight::Regular, th.dim.with_alpha(a), w - 22.0);
+                for (i, r) in p.rows.iter().enumerate() {
+                    let y = r.y + dy;
+                    let f = p.hover_fade.get(i).copied().unwrap_or(0.0);
+                    if i == items.len() {
+                        // Done button, bottom right.
+                        let (bw, bh) = (88.0, 34.0);
+                        let (bx, by) = (w - 22.0 - bw, y + (r.h - bh) / 2.0);
+                        let col = if p.pressed == Some(i) { th.accent.mix(Rgba(0, 0, 0, 255), 0.15) } else { th.accent.mix(Rgba(255, 255, 255, 255), 0.12 * f) };
+                        c.rrect(bx, by, bw, bh, 10.0, col.with_alpha(a));
+                        let tw = c.text_width("Done", 13.0, Weight::SemiBold);
+                        let ty = by + (bh - c.line_height(13.0, Weight::SemiBold)) / 2.0;
+                        c.text("Done", bx + (bw - tw) / 2.0, ty, 13.0, Weight::SemiBold, Rgba(255, 255, 255, 255).with_alpha(a), w);
+                        continue;
+                    }
+                    if f > 0.0 {
+                        c.rrect(12.0, y, w - 24.0, r.h - 4.0, 10.0, hover_bg.with_alpha(f * a));
+                    }
+                    let (ly, dyy) = (y + 9.0, y + 29.0);
+                    if let Some(l) = &r.label {
+                        c.text(l, 22.0, ly, 13.5, Weight::Regular, th.fg.with_alpha(a), w - 90.0);
+                    }
+                    if let Some(d) = &r.hint {
+                        c.text(d, 22.0, dyy, 11.5, Weight::Regular, th.dim.with_alpha(a), w - 90.0);
+                    }
+                    // Switch.
+                    let on = items.get(i).is_some_and(|it| it.on);
+                    let (sw, sh) = (38.0, 22.0);
+                    let (sx, sy) = (w - 22.0 - sw, y + (r.h - 4.0 - sh) / 2.0);
+                    c.rrect(sx, sy, sw, sh, sh / 2.0, if on { th.accent } else { th.border.mix(th.dim, 0.35) }.with_alpha(a));
+                    let kx = if on { sx + sw - sh + 3.0 } else { sx + 3.0 };
+                    c.circle(kx + (sh - 6.0) / 2.0, sy + sh / 2.0, (sh - 6.0) / 2.0, Rgba(255, 255, 255, 255).with_alpha(a));
                 }
             }
             Content::Tip(_) => {

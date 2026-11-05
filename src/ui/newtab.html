@@ -694,7 +694,8 @@
 
   window.__personaOpenSettings = openSettingsModal;
 
-  document.getElementById('settings-btn').onclick = openSettingsModal;
+  // Site permissions are a native (ANVL) dialog now; the page only asks for it.
+  document.getElementById('settings-btn').onclick = () => { toggleDropdown(false); send({ nt: 'open_settings' }); };
   document.getElementById('settings-close-x').onclick = closeSettingsModal;
   document.getElementById('settings-done-btn').onclick = closeSettingsModal;
   document.getElementById('settings-modal-backdrop').onclick = (e) => {

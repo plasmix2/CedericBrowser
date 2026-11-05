@@ -706,6 +706,8 @@ enum NewTabCmd {
     AutoKey { key: String },
     /// The first-run setup screen was completed (or skipped).
     FinishSetup,
+    /// The Settings button: open the native site-permissions dialog.
+    OpenSettings,
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -2329,15 +2331,33 @@ impl Browser {
         self.sync_all_newtabs();
     }
 
+    /// The site-permissions dialog, drawn by the ANVL engine in its own popup window.
+    fn show_settings(&mut self) {
+        const W: f32 = 420.0;
+        let item = |label: &str, desc: &str, on: bool| popups::ToggleEntry { label: label.into(), desc: desc.into(), on };
+        let perms = &self.prefs.permissions;
+        let content = Content::Modal {
+            title: "Site permissions".into(),
+            note: "On: sites may use it without asking again. Off: the request is blocked.".into(),
+            items: vec![
+                item("Camera & video", "Websites may use your webcam", perms.camera),
+                item("Microphone & audio", "Websites may use your microphone", perms.microphone),
+                item("Notifications", "Sites may send desktop notifications", perms.notifications),
+                item("Location", "Websites may read your location", perms.geolocation),
+            ],
+        };
+        self.close_menu();
+        self.hide_preview();
+        self.hide_tip();
+        // Centred over the window, a little above the middle.
+        let size = self.logical_size();
+        let h = 74.0 + 4.0 * 56.0 + 62.0;
+        let pos = self.to_screen(((size.width - W as f64) / 2.0).max(0.0), ((size.height - h as f64) / 2.0 - 20.0).max(0.0));
+        self.popups.show(PopupKind::Modal, content, pos, W);
+    }
+
     fn open_settings(&mut self) {
-        let js = "window.__personaOpenSettings && window.__personaOpenSettings();";
-        let is_newtab = self.tabs.get(self.active).is_some_and(|t| t.is_newtab);
-        if is_newtab {
-            self.with_active(|v| v.evaluate_script(js));
-        } else {
-            let _ = self.open_tab(None, None, true);
-            self.with_active(|v| v.evaluate_script(js));
-        }
+        self.show_settings();
     }
 
     fn apply_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
@@ -2980,6 +3000,23 @@ impl Browser {
                     self.run_menu_action(action);
                 }
             }
+            Pick::Modal(index) => {
+                let p = &self.prefs.permissions;
+                let (mut cam, mut mic, mut notif, mut geo) = (p.camera, p.microphone, p.notifications, p.geolocation);
+                match index {
+                    0 => cam = !cam,
+                    1 => mic = !mic,
+                    2 => notif = !notif,
+                    3 => geo = !geo,
+                    _ => {
+                        self.popups.hide(PopupKind::Modal);
+                        self.refocus_page();
+                        return;
+                    }
+                }
+                self.set_permissions(cam, notif, mic, geo);
+                self.show_settings();
+            }
             Pick::Suggest(index) => {
                 if let Some(text) = self.suggestions.get(index).map(|s| s.text.clone()) {
                     self.toolbar.blur_address();
@@ -3117,6 +3154,7 @@ impl Browser {
             }
             NewTabCmd::SetBrand { brand } => self.set_brand(brand),
             NewTabCmd::SetBackground { .. } => {}
+            NewTabCmd::OpenSettings => self.show_settings(),
             NewTabCmd::FinishSetup => {
                 self.prefs.finish_setup();
                 self.sync_all_newtabs();
