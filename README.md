@@ -14,6 +14,22 @@ cargo run --release -- example.com
 cargo test
 ```
 
+## Releases & updates
+
+Pushing a version tag builds Persona on GitHub Actions and publishes it as a release
+(`.github/workflows/release.yml`). The tag must match `version` in `Cargo.toml`:
+
+```
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+Installed copies check this repository's releases about 15 seconds after starting. If there is a
+newer version, they download it, check its size and SHA-256 digest, and put it in place of the
+running exe. A green dot on the persona button means an update is ready, and the persona menu
+offers **Restart to update**. Builds run from a cargo `target` folder never update themselves.
+Set `PERSONA_NO_UPDATE=1` to turn updates off.
+
 ## Features
 
 - **Tabs in the title bar**: frameless window with custom window controls, animated tab open/close, drag to reorder, and hover cards showing a snapshot of the page.

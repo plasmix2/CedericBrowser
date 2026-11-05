@@ -73,6 +73,22 @@ fn decode(b: &[u8]) -> Option<Pixmap> {
         }
         return Pixmap::from_vec(rgba, IntSize::from_wh(img.width(), img.height())?);
     }
+    if b.starts_with(&[0xFF, 0xD8]) {
+        // JPEG: persona profile pictures are saved as JPEG by the New Tab page.
+        let mut dec = jpeg_decoder::Decoder::new(Cursor::new(b));
+        let px = dec.decode().ok()?;
+        let info = dec.info()?;
+        let (w, h) = (info.width as u32, info.height as u32);
+        if w == 0 || h == 0 || w > 4096 || h > 4096 {
+            return None;
+        }
+        let rgba: Vec<u8> = match info.pixel_format {
+            jpeg_decoder::PixelFormat::RGB24 => px.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect(),
+            jpeg_decoder::PixelFormat::L8 => px.iter().flat_map(|&l| [l, l, l, 255]).collect(),
+            _ => return None,
+        };
+        return Pixmap::from_vec(rgba, IntSize::from_wh(w, h)?);
+    }
     None
 }
 
@@ -106,5 +122,17 @@ mod tests {
     fn decodes_base64() {
         assert_eq!(super::base64_decode("aGVsbG8gd29ybGQ=").unwrap(), b"hello world");
         assert_eq!(super::base64_decode("YQ==").unwrap(), b"a");
+    }
+
+    /// Persona pictures are stored as JPEG data URLs; they must decode for the toolbar avatar.
+    #[test]
+    fn decodes_jpeg() {
+        let bytes = super::base64_decode("/9j/4AAQSkZJRgABAQAAAAAAAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh7/wAARCAAQABADASIAAhEBAxEB/8QAFgABAQEAAAAAAAAAAAAAAAAAAAQF/8QAFhAAAwAAAAAAAAAAAAAAAAAAABRh/8QAFAEBAAAAAAAAAAAAAAAAAAAABf/EABYRAAMAAAAAAAAAAAAAAAAAAAAWYv/aAAwDAQACEQMRAD8AnZoZpiM0M0YSJHm+j//Z").unwrap();
+        let img = super::decode(&bytes).expect("JPEG decodes");
+        assert_eq!((img.width(), img.height()), (16, 16));
+        let px = img.pixel(0, 0).unwrap();
+        assert_eq!(px.alpha(), 255);
+        // Top is the orange end of the gradient.
+        assert!(px.red() > px.blue());
     }
 }

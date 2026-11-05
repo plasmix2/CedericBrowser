@@ -11,6 +11,7 @@ mod popups;
 mod suggest;
 mod thumbs;
 mod toolbar;
+mod update;
 
 use std::{
     collections::HashMap,
@@ -18,7 +19,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::mpsc::Sender,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use gfx::{Brand, PersonaColor};
@@ -154,36 +155,6 @@ const SHORTCUT_SCRIPT: &str = r#"
     } catch (_) {}
   };
   window.__cedericPreconnect = preconnect;
-  // Toolbar tooltip, drawn here because the page covers the window area below the toolbar. A closed
-  // shadow root keeps page CSS out; it ignores the pointer and goes away on any page pointer move.
-  (() => {
-    let host = null, box = null;
-    const hide = () => { if (host) { host.remove(); host = box = null; } };
-    window.__cedericTip = (text, x, y, bg, fg, border) => {
-      if (text == null) return hide();
-      if (typeof text !== 'string' || text.length > 80) return;
-      const root = document.documentElement;
-      if (!root) return;
-      if (!host) {
-        host = document.createElement('div');
-        host.style.cssText = 'all:initial;position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none';
-        const sh = host.attachShadow({ mode: 'closed' });
-        box = document.createElement('div');
-        sh.appendChild(box);
-        root.appendChild(host);
-      }
-      const css = (v, d) => (typeof v === 'string' && /^rgb\(\d{1,3},\d{1,3},\d{1,3}\)$/.test(v)) ? v : d;
-      box.textContent = text;
-      box.style.cssText = 'position:fixed;white-space:nowrap;pointer-events:none;font:12.5px "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;padding:6px 10px;border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,.35);opacity:0;transition:opacity .12s;'
-        + 'background:' + css(bg, '#222') + ';color:' + css(fg, '#eee') + ';border:1px solid ' + css(border, '#444');
-      const w = box.offsetWidth;
-      box.style.left = Math.max(4, Math.min(x - w / 2, innerWidth - w - 4)) + 'px';
-      box.style.top = Math.max(0, Number(y) || 0) + 'px';
-      requestAnimationFrame(() => { if (box) box.style.opacity = '1'; });
-    };
-    window.addEventListener('pointermove', hide, true);
-    window.addEventListener('blur', hide);
-  })();
 
   const injectSpeculation = () => {
     if (location.protocol !== 'https:' && location.protocol !== 'http:') return;
@@ -638,6 +609,14 @@ enum UserEvent {
     /// Frame tick from the pacer while the UI animates.
     Frame,
     FullscreenState(TabId, bool),
+    /// Time to check which Google account is signed in (scheduled, never run from a page event).
+    ProbeAccount,
+    /// A newer version was downloaded and put in place; it runs after a restart.
+    UpdateReady(String),
+    /// The hidden account probe finished loading Google's account list.
+    AccountProbeLoaded,
+    /// What the probe read, for the profile it ran in.
+    GoogleAccount(Option<String>, Option<GoogleAccount>),
 }
 
 /// What the browser chrome (the native toolbar, menus) asks the browser to do.
@@ -677,6 +656,8 @@ enum ChromeCmd {
     BookmarksMenu { x: f64, y: f64 },
     ThemeMenu { x: f64, y: f64 },
     ToggleFullscreen,
+    /// Clears cookies and all site data in every tab: signs out of every account.
+    ClearSiteData,
     /// Tooltip centred under a toolbar button.
     Tip { text: String, x: f64, y: f64 },
     TipEnd,
@@ -708,6 +689,13 @@ enum NewTabCmd {
         pfp: Option<String>,
     },
     DeletePersona { id: String },
+    SetPermissions {
+        camera: bool,
+        notifications: bool,
+        microphone: bool,
+        #[serde(default)]
+        geolocation: bool,
+    },
     SetBackground {
         #[serde(default)]
         data: String,
@@ -824,12 +812,78 @@ enum MenuAction {
     SetBackgroundUrl(String),
     ClearBackground,
     ToggleFullscreen,
+    ClearSiteData,
+    OpenTab(String),
+    RestartToUpdate,
+    ToggleCamera,
+    ToggleNotifications,
+    ToggleMicrophone,
+    OpenSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Bookmark {
     pub title: String,
     pub url: String,
+}
+
+/// The Google account signed in to the active persona's profile, as Google's own account list
+/// reports it. Shown on the persona button and at the top of the persona menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GoogleAccount {
+    pub name: String,
+    pub email: String,
+    /// A `googleusercontent.com` photo URL, or empty.
+    pub photo: String,
+}
+
+/// Where Google lists the accounts signed in to this browser profile (what Chrome's own avatar
+/// button reads). It only answers a POST carrying the profile's cookies, so a hidden WebView
+/// opens a tiny page on the same origin (`GOOGLE_PROBE_PAGE`) and posts from there.
+const GOOGLE_ACCOUNTS_URL: &str = "https://accounts.google.com/ListAccounts?gpsia=1&source=ChromiumBrowser&json=standard";
+const GOOGLE_PROBE_PAGE: &str = "https://accounts.google.com/robots.txt";
+const GOOGLE_SIGN_IN_URL: &str = "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fmyaccount.google.com%2F";
+const GOOGLE_ACCOUNT_URL: &str = "https://myaccount.google.com/";
+const GOOGLE_SIGN_OUT_URL: &str = "https://accounts.google.com/Logout";
+
+/// Parses the `ListAccounts` response: `["gaia.l.a.r", [["gaia.l.a", 1, name, email, photo, ...], ...]]`.
+/// Untrusted page text: only well-formed, length-limited fields are kept, and only a
+/// googleusercontent.com photo URL.
+fn parse_google_accounts(text: &str) -> Option<GoogleAccount> {
+    let start = text.find('[')?;
+    let v: serde_json::Value = serde_json::from_str(&text[start..]).ok()?;
+    for a in v.get(1)?.as_array()? {
+        let field = |i: usize| a.get(i).and_then(|x| x.as_str()).unwrap_or("");
+        // [9] is 1 while the session is valid; [14] is 1 for an account that was signed out.
+        let valid = a.get(9).and_then(|x| x.as_i64()).unwrap_or(1) == 1;
+        let signed_out = a.get(14).and_then(|x| x.as_i64()).unwrap_or(0) == 1;
+        let email = field(3);
+        if field(0) != "gaia.l.a" || !valid || signed_out || !email.contains('@') || email.len() > 254 {
+            continue;
+        }
+        let name: String = field(2).chars().filter(|c| !c.is_control()).take(80).collect();
+        let photo = field(4);
+        let photo_ok = photo.len() < 2048
+            && url::Url::parse(photo).ok().is_some_and(|u| {
+                u.scheme() == "https" && u.host_str().is_some_and(|h| h == "googleusercontent.com" || h.ends_with(".googleusercontent.com"))
+            });
+        return Some(GoogleAccount {
+            name: if name.trim().is_empty() { email.to_owned() } else { name },
+            email: email.to_owned(),
+            photo: if photo_ok { sized_google_photo(photo) } else { String::new() },
+        });
+    }
+    None
+}
+
+/// Asks for a 96px square crop: googleusercontent photo URLs take a `=s<size>-c` suffix.
+fn sized_google_photo(url: &str) -> String {
+    let tail = url.rsplit('/').next().unwrap_or("");
+    let base = match tail.rfind('=') {
+        Some(i) => &url[..url.len() - (tail.len() - i)],
+        None => url,
+    };
+    format!("{base}=s96-c")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -868,12 +922,49 @@ impl PersonaProfile {
         PersonaColor::from_str_name(&self.color)
     }
 
+    /// The WebView2 profile holding this persona's cookies and sign-ins. The original persona keeps
+    /// the default profile, so sign-ins made before personas had their own profiles stay with it.
+    pub fn profile_name(&self) -> Option<String> {
+        if self.id == "cederic" {
+            return None;
+        }
+        let safe: String = self.id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(48).collect();
+        Some(format!("persona_{safe}"))
+    }
+
     pub fn badge_letter(&self) -> String {
         self.name
             .chars()
             .find(|c| c.is_alphanumeric())
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_else(|| "P".into())
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SitePermissions {
+    #[serde(default = "default_true")]
+    pub camera: bool,
+    #[serde(default = "default_true")]
+    pub notifications: bool,
+    #[serde(default = "default_true")]
+    pub microphone: bool,
+    #[serde(default)]
+    pub geolocation: bool,
+}
+
+impl Default for SitePermissions {
+    fn default() -> Self {
+        Self {
+            camera: true,
+            notifications: true,
+            microphone: true,
+            geolocation: false,
+        }
     }
 }
 
@@ -887,6 +978,8 @@ struct PrefsData {
     brand: Option<Brand>,
     #[serde(default)]
     bookmarks: Option<Vec<Bookmark>>,
+    #[serde(default)]
+    permissions: Option<SitePermissions>,
 }
 
 struct Prefs {
@@ -894,6 +987,7 @@ struct Prefs {
     data_dir: PathBuf,
     active_persona_id: String,
     personas: Vec<PersonaProfile>,
+    permissions: SitePermissions,
     bg_cache: HashMap<String, Option<String>>,
     strip_cache: HashMap<String, Option<Pixmap>>,
 }
@@ -966,11 +1060,14 @@ impl Prefs {
             strip_cache.insert(p.id.clone(), strip);
         }
 
+        let permissions = data.permissions.unwrap_or_default();
+
         Self {
             path,
             data_dir: data_dir.to_path_buf(),
             active_persona_id: active_id,
             personas,
+            permissions,
             bg_cache,
             strip_cache,
         }
@@ -1072,6 +1169,7 @@ impl Prefs {
             personas: self.personas.clone(),
             brand: Some(self.brand()),
             bookmarks: Some(self.active_bookmarks().to_vec()),
+            permissions: Some(self.permissions.clone()),
         };
         if let Ok(json) = serde_json::to_string_pretty(&data) {
             let tmp = self.path.with_extension("json.tmp");
@@ -1082,6 +1180,14 @@ impl Prefs {
                 let _ = std::fs::rename(&tmp, &self.path);
             }
         }
+    }
+
+    pub fn set_permissions(&mut self, camera: bool, notifications: bool, microphone: bool, geolocation: bool) {
+        self.permissions.camera = camera;
+        self.permissions.notifications = notifications;
+        self.permissions.microphone = microphone;
+        self.permissions.geolocation = geolocation;
+        self.save();
     }
 
     fn set_active_persona(&mut self, id: &str) -> bool {
@@ -1110,13 +1216,18 @@ impl Prefs {
             clean_name.to_string()
         };
         let valid_color = PersonaColor::from_str_name(color).name().to_string();
-        let id = format!(
-            "p_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        // Two personas created within the same millisecond would otherwise share an id, and
+        // deleting or editing one would hit the other.
+        let mut id = format!("p_{stamp}");
+        let mut n = 1;
+        while self.personas.iter().any(|p| p.id == id) {
+            n += 1;
+            id = format!("p_{stamp}_{n}");
+        }
         let persona = PersonaProfile {
             id: id.clone(),
             name: final_name,
@@ -1342,6 +1453,10 @@ struct NewTabState<'a> {
     logo: &'a str,
     can_create: bool,
     can_delete: bool,
+    allow_camera: bool,
+    allow_notifications: bool,
+    allow_microphone: bool,
+    allow_geolocation: bool,
 }
 
 struct Devtools {
@@ -1397,6 +1512,22 @@ struct Browser {
     fullscreen: bool,
     html_fullscreen: bool,
     last_title: String,
+    /// The Google account signed in to the active persona's profile, once the probe has read it.
+    google: Option<GoogleAccount>,
+    /// Hidden WebView reading Google's account list (see `probe_google_account`), while it runs.
+    account_probe: Option<(Option<String>, WebView, Instant)>,
+    /// A probe was asked for while one was running: run another when it ends.
+    probe_again: bool,
+    /// A probe is already scheduled to run shortly.
+    probe_scheduled: bool,
+    /// A downloaded update waiting for a restart: its version.
+    update_ready: Option<String>,
+    /// The exe this process started from (an update replaces the file at this path).
+    exe_path: Option<PathBuf>,
+    allow_camera: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    allow_notifications: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    allow_microphone: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    allow_geolocation: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Browser {
@@ -1459,6 +1590,10 @@ impl Browser {
         let p_new = self.proxy.clone();
         let p_ipc = self.proxy.clone();
         let p_nav = self.proxy.clone();
+        let cam = self.allow_camera.clone();
+        let notif = self.allow_notifications.clone();
+        let mic = self.allow_microphone.clone();
+        let geo = self.allow_geolocation.clone();
 
         let mut builder = WebViewBuilder::new_with_web_context(&mut self.context)
             .with_bounds(bounds)
@@ -1476,11 +1611,35 @@ impl Browser {
             .with_hotkeys_zoom(true)
             .with_general_autofill_enabled(false)
             .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
-            .with_permission_handler(|kind| match kind {
-                PermissionKind::Microphone
-                | PermissionKind::Camera
-                | PermissionKind::Geolocation
-                | PermissionKind::Notifications => PermissionResponse::Deny,
+            .with_permission_handler(move |kind| match kind {
+                PermissionKind::Camera | PermissionKind::DisplayCapture => {
+                    if cam.load(std::sync::atomic::Ordering::Relaxed) {
+                        PermissionResponse::Allow
+                    } else {
+                        PermissionResponse::Deny
+                    }
+                }
+                PermissionKind::Notifications => {
+                    if notif.load(std::sync::atomic::Ordering::Relaxed) {
+                        PermissionResponse::Allow
+                    } else {
+                        PermissionResponse::Deny
+                    }
+                }
+                PermissionKind::Microphone => {
+                    if mic.load(std::sync::atomic::Ordering::Relaxed) {
+                        PermissionResponse::Allow
+                    } else {
+                        PermissionResponse::Deny
+                    }
+                }
+                PermissionKind::Geolocation => {
+                    if geo.load(std::sync::atomic::Ordering::Relaxed) {
+                        PermissionResponse::Allow
+                    } else {
+                        PermissionResponse::Deny
+                    }
+                }
                 _ => PermissionResponse::Allow,
             })
             .with_navigation_handler(move |nav_url| {
@@ -1518,6 +1677,10 @@ impl Browser {
                     let _ = p_ipc.send_event(UserEvent::PageMenu(id, r));
                 }
             });
+        // Each persona has its own profile: separate cookies, so separate Google sign-ins.
+        if let Some(profile) = self.prefs.active_persona().profile_name() {
+            builder = builder.with_profile_name(profile);
+        }
         builder = match url {
             Some(u) => builder.with_url(u),
             // Paint the new-tab page's own color from the first frame, so it never flashes white.
@@ -1757,6 +1920,10 @@ impl Browser {
             logo: LOGO_DATA_URI.as_str(),
             can_create: prefs.personas.len() < 5,
             can_delete: prefs.personas.len() > 1,
+            allow_camera: prefs.permissions.camera,
+            allow_notifications: prefs.permissions.notifications,
+            allow_microphone: prefs.permissions.microphone,
+            allow_geolocation: prefs.permissions.geolocation,
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -1793,12 +1960,22 @@ impl Browser {
             brand,
             color,
             badge_letter,
+            update_ready: self.update_ready.is_some(),
+            pfp: match &self.google {
+                Some(g) if !g.photo.is_empty() => g.photo.clone(),
+                _ => self.prefs.active_persona().pfp.clone().unwrap_or_default(),
+            },
         };
         if tab.is_newtab {
             Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
         }
         let title = if tab.title.is_empty() { &active_name } else { &tab.title };
-        let full_title = format!("{title} - {active_name}");
+        // Pre-release builds name themselves (PERSONA_BUILD=<git hash> at compile time), so the
+        // running exe can be told apart from the taskbar or Alt+Tab.
+        let full_title = match option_env!("PERSONA_BUILD") {
+            Some(build) => format!("{title} - {active_name} [{build}]"),
+            None => format!("{title} - {active_name}"),
+        };
         if self.last_title != full_title {
             self.window.set_title(&full_title);
             self.last_title = full_title;
@@ -1879,6 +2056,7 @@ impl Browser {
             })
             .collect();
         self.hide_preview();
+        self.hide_tip();
         let pos = self.to_screen(x, y);
         self.popups.show(PopupKind::Menu, Content::Menu(entries), pos, W as f32);
     }
@@ -1909,23 +2087,19 @@ impl Browser {
         self.popups.show(PopupKind::Preview, Content::Preview(card), pos, w as f32);
     }
 
-    /// Tooltip under a toolbar button. Drawn by the page itself (see `__cedericTip` in
-    /// `SHORTCUT_SCRIPT`) instead of an extra OS window: the page already fills the area below the
-    /// toolbar, so there is nothing to resize, park or repaint. `cx` and `y` are window coordinates.
+    /// Tooltip centred under a toolbar button, in its own native popup window.
     fn show_tip(&mut self, text: String, cx: f64, y: f64) {
         if self.popups.is_open(PopupKind::Menu) {
             return;
         }
-        let top = self.top_bar_height();
-        let th = gfx::Theme::for_brand(self.dark, self.prefs.brand());
-        let css = |c: gfx::Rgba| format!("rgb({},{},{})", c.0, c.1, c.2);
-        let args = serde_json::json!([text, cx, (y - top).max(6.0), css(th.card), css(th.fg), css(th.border)]);
-        let js = format!("window.__cedericTip&&window.__cedericTip(...{args})");
-        self.with_active(|v| v.evaluate_script(&js));
+        let w = self.popups.tip_width(&text) as f64;
+        let x = (cx - w / 2.0).clamp(4.0, (self.logical_size().width - w - 4.0).max(4.0));
+        let pos = self.to_screen(x, y);
+        self.popups.show(PopupKind::Tip, Content::Tip(text), pos, w as f32);
     }
 
     fn hide_tip(&mut self) {
-        self.with_active(|v| v.evaluate_script("window.__cedericTip&&window.__cedericTip(null)"));
+        self.popups.hide(PopupKind::Tip);
     }
 
     fn hide_preview(&mut self) {
@@ -1977,6 +2151,8 @@ impl Browser {
                     .map(|e| MenuItem::new(e.query.clone(), MenuAction::OpenUrl(e.url.clone())).hint("Anonymous")),
             );
         }
+        items.push(MenuItem::sep());
+        items.push(MenuItem::new("Clear cookies and site data", MenuAction::ClearSiteData).hint("Signs you out"));
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
@@ -2048,6 +2224,22 @@ impl Browser {
     fn theme_menu(&mut self, right: f64, y: f64) {
         let active_id = self.prefs.active_id().to_string();
         let mut items = Vec::new();
+        if let Some(v) = &self.update_ready {
+            items.push(MenuItem::new(format!("Restart to update to Persona {v}"), MenuAction::RestartToUpdate).hint("Update"));
+            items.push(MenuItem::sep());
+        }
+        match &self.google {
+            Some(g) => {
+                items.push(MenuItem::new(g.name.clone(), MenuAction::OpenTab(GOOGLE_ACCOUNT_URL.into())).hint("Google").enabled(false));
+                if g.email != g.name {
+                    items.push(MenuItem::new(g.email.clone(), MenuAction::OpenTab(GOOGLE_ACCOUNT_URL.into())).enabled(false));
+                }
+                items.push(MenuItem::new("Manage your Google Account", MenuAction::OpenTab(GOOGLE_ACCOUNT_URL.into())));
+                items.push(MenuItem::new("Sign out of Google", MenuAction::OpenTab(GOOGLE_SIGN_OUT_URL.into())));
+            }
+            None => items.push(MenuItem::new("Sign in to Google", MenuAction::OpenTab(GOOGLE_SIGN_IN_URL.into())).hint("Persona")),
+        }
+        items.push(MenuItem::sep());
         for p in &self.prefs.personas {
             let is_cur = p.id == active_id;
             let mark = if is_cur { "✓  " } else { "   " };
@@ -2070,7 +2262,44 @@ impl Browser {
         let rm_label = format!("Remove {cur_name} background image");
         items.push(MenuItem::new(bg_label, MenuAction::ChooseBackground));
         items.push(MenuItem::new(rm_label, MenuAction::ClearBackground).enabled(has_bg));
+        items.push(MenuItem::sep());
+        let cam_allowed = self.allow_camera.load(std::sync::atomic::Ordering::Relaxed);
+        let notif_allowed = self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed);
+        let mic_allowed = self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed);
+        items.push(MenuItem::new(
+            if cam_allowed { "✓ Camera Access" } else { "   Camera Access" },
+            MenuAction::ToggleCamera,
+        ).hint(if cam_allowed { "Allowed" } else { "Blocked" }));
+        items.push(MenuItem::new(
+            if notif_allowed { "✓ Notifications" } else { "   Notifications" },
+            MenuAction::ToggleNotifications,
+        ).hint(if notif_allowed { "Allowed" } else { "Blocked" }));
+        items.push(MenuItem::new(
+            if mic_allowed { "✓ Microphone Access" } else { "   Microphone Access" },
+            MenuAction::ToggleMicrophone,
+        ).hint(if mic_allowed { "Allowed" } else { "Blocked" }));
+        items.push(MenuItem::new("Permissions & Settings…", MenuAction::OpenSettings));
         self.show_menu(items, (right - 260.0).max(0.0), y);
+    }
+
+    fn set_permissions(&mut self, camera: bool, notifications: bool, microphone: bool, geolocation: bool) {
+        self.allow_camera.store(camera, std::sync::atomic::Ordering::Relaxed);
+        self.allow_notifications.store(notifications, std::sync::atomic::Ordering::Relaxed);
+        self.allow_microphone.store(microphone, std::sync::atomic::Ordering::Relaxed);
+        self.allow_geolocation.store(geolocation, std::sync::atomic::Ordering::Relaxed);
+        self.prefs.set_permissions(camera, notifications, microphone, geolocation);
+        self.sync_all_newtabs();
+    }
+
+    fn open_settings(&mut self) {
+        let js = "window.__personaOpenSettings && window.__personaOpenSettings();";
+        let is_newtab = self.tabs.get(self.active).is_some_and(|t| t.is_newtab);
+        if is_newtab {
+            self.with_active(|v| v.evaluate_script(js));
+        } else {
+            let _ = self.open_tab(None, None, true);
+            self.with_active(|v| v.evaluate_script(js));
+        }
     }
 
     fn apply_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
@@ -2100,7 +2329,119 @@ impl Browser {
         }
     }
 
+    /// Reads which Google account is signed in to the active persona's profile. Loads Google's
+    /// account list in a hidden, throwaway WebView of that profile and reads the page text back
+    /// with a script callback, so the page itself gets no channel to the browser.
+    fn probe_google_account(&mut self) {
+        // A probe that never finished (offline, blocked) must not block every later one.
+        if self.account_probe.as_ref().is_some_and(|(_, _, t)| t.elapsed() < Duration::from_secs(20)) {
+            self.probe_again = true;
+            return;
+        }
+        self.account_probe = None;
+        let profile = self.prefs.active_persona().profile_name();
+        let proxy = self.proxy.clone();
+        let mut builder = WebViewBuilder::new_with_web_context(&mut self.context)
+            .with_bounds(rect(-10.0, -10.0, 1.0, 1.0))
+            .with_visible(false)
+            .with_user_agent(USER_AGENT)
+            // Same arguments and scroll bar style as every other WebView (see BROWSER_ARGS).
+            .with_additional_browser_args(BROWSER_ARGS)
+            .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
+            .with_navigation_handler(|u| u == GOOGLE_PROBE_PAGE)
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            .with_on_page_load_handler(move |ev, url| {
+                if matches!(ev, PageLoadEvent::Finished) && url == GOOGLE_PROBE_PAGE {
+                    let _ = proxy.send_event(UserEvent::AccountProbeLoaded);
+                }
+            })
+            .with_url(GOOGLE_PROBE_PAGE);
+        if let Some(name) = &profile {
+            builder = builder.with_profile_name(name.clone());
+        }
+        if let Ok(view) = builder.build_as_child(&self.window) {
+            self.account_probe = Some((profile, view, Instant::now()));
+        }
+    }
+
+    /// Checks the Google account a moment from now. Never builds the probe WebView from inside a
+    /// page event: creating a WebView runs a nested message loop, and during sign-in Windows may be
+    /// showing its own modal dialog (Windows Hello for passkeys), which must not be re-entered.
+    fn schedule_account_probe(&mut self, delay: Duration) {
+        if std::mem::replace(&mut self.probe_scheduled, true) {
+            return;
+        }
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let _ = proxy.send_event(UserEvent::ProbeAccount);
+        });
+    }
+
+    fn account_probe_loaded(&mut self) {
+        let Some((profile, view, _)) = &self.account_probe else { return };
+        let proxy = self.proxy.clone();
+        let profile = profile.clone();
+        // Synchronous so the script returns the text itself (an async result would not come back).
+        let read_js = format!(
+            "(() => {{ try {{ const x = new XMLHttpRequest(); x.open('POST', {GOOGLE_ACCOUNTS_URL:?}, false); x.send(' '); return x.status === 200 ? x.responseText : ''; }} catch (_) {{ return ''; }} }})()"
+        );
+        let read = view.evaluate_script_with_callback(&read_js, move |json| {
+            // The callback gets the script's result as JSON: here, a JSON string.
+            let text: String = serde_json::from_str(&json).unwrap_or_default();
+            let _ = proxy.send_event(UserEvent::GoogleAccount(profile.clone(), parse_google_accounts(&text)));
+        });
+        if read.is_err() {
+            self.account_probe = None;
+        }
+    }
+
+    fn set_google_account(&mut self, profile: Option<String>, account: Option<GoogleAccount>) {
+        self.account_probe = None;
+        // Ignore a result for a persona that is no longer active.
+        if profile == self.prefs.active_persona().profile_name() {
+            self.google = account;
+            self.sync_ui();
+        }
+        if std::mem::take(&mut self.probe_again) {
+            self.schedule_account_probe(Duration::from_millis(500));
+        }
+    }
+
+    /// Reopens every tab in the active persona's profile, keeping their order, pages and the
+    /// active tab, the way switching profile in other browsers opens that profile's window.
+    fn reopen_tabs_in_profile(&mut self) {
+        if self.devtools.open {
+            self.toggle_devtools();
+        }
+        let urls: Vec<Option<String>> =
+            self.tabs.iter().map(|t| if t.is_newtab || t.url.is_empty() { None } else { Some(t.url.clone()) }).collect();
+        let active = self.active;
+        let old = std::mem::take(&mut self.tabs);
+        self.spare = None;
+        for url in urls {
+            match self.build_tab(url.as_deref()) {
+                Ok(tab) => self.tabs.push(tab),
+                Err(_) => continue,
+            }
+        }
+        if self.tabs.is_empty()
+            && let Ok(tab) = self.build_tab(None)
+        {
+            self.tabs.push(tab);
+        }
+        self.active = active.min(self.tabs.len().saturating_sub(1));
+        // Show the new active tab before the old ones go, so the window never flashes bare.
+        self.show_active();
+        for t in &old {
+            let _ = self.thumbs_tx.send(thumbs::Request::Forget(t.id));
+        }
+        drop(old);
+        let _ = self.proxy.send_event(UserEvent::Prewarm);
+    }
+
     fn set_persona(&mut self, id: &str) {
+        let old_profile = self.prefs.active_persona().profile_name();
         if !self.prefs.set_active_persona(id) {
             return;
         }
@@ -2136,6 +2477,11 @@ impl Browser {
                 let _ = spare.view.set_background_color(bg);
             }
             let _ = spare.view.evaluate_script(&js);
+        }
+        if self.prefs.active_persona().profile_name() != old_profile {
+            self.google = None;
+            self.reopen_tabs_in_profile();
+            self.schedule_account_probe(Duration::from_millis(800));
         }
         self.sync_all_newtabs();
         self.sync_ui();
@@ -2262,6 +2608,18 @@ impl Browser {
             }
             MenuAction::OpenUrl(url) => self.navigate_active(&url),
             MenuAction::ClearHistory => self.handle_chrome(ChromeCmd::ClearHistory),
+            MenuAction::ClearSiteData => self.handle_chrome(ChromeCmd::ClearSiteData),
+            MenuAction::RestartToUpdate => {
+                // The exe at the path we started from is now the new version.
+                if let Some(exe) = &self.exe_path
+                    && std::process::Command::new(exe).spawn().is_ok()
+                {
+                    self.quit = true;
+                }
+            }
+            MenuAction::OpenTab(url) => {
+                let _ = self.open_tab(Some(url), None, true);
+            }
             MenuAction::ToggleBookmark => self.toggle_bookmark(),
             MenuAction::DeleteBookmark(url) => {
                 if self.prefs.remove_bookmark(&url) {
@@ -2286,6 +2644,19 @@ impl Browser {
             }
             MenuAction::ClearBackground => self.apply_background(None, None),
             MenuAction::ToggleFullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
+            MenuAction::ToggleCamera => {
+                let cur = self.allow_camera.load(std::sync::atomic::Ordering::Relaxed);
+                self.set_permissions(!cur, self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed), self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed), self.allow_geolocation.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            MenuAction::ToggleNotifications => {
+                let cur = self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed);
+                self.set_permissions(self.allow_camera.load(std::sync::atomic::Ordering::Relaxed), !cur, self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed), self.allow_geolocation.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            MenuAction::ToggleMicrophone => {
+                let cur = self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed);
+                self.set_permissions(self.allow_camera.load(std::sync::atomic::Ordering::Relaxed), self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed), !cur, self.allow_geolocation.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            MenuAction::OpenSettings => self.open_settings(),
         }
     }
 
@@ -2542,7 +2913,12 @@ impl Browser {
             ChromeCmd::Drag => {
                 let _ = self.window.drag_window();
             }
+            // Only the search history: cookies stay, so saved Google (and other) sign-ins survive.
             ChromeCmd::ClearHistory => {
+                self.history.clear();
+                self.sync_ui();
+            }
+            ChromeCmd::ClearSiteData => {
                 self.history.clear();
                 for t in &self.tabs {
                     let _ = t.view.clear_all_browsing_data();
@@ -2698,6 +3074,9 @@ impl Browser {
                     self.set_persona(&active_id);
                 }
             }
+            NewTabCmd::SetPermissions { camera, notifications, microphone, geolocation } => {
+                self.set_permissions(camera, notifications, microphone, geolocation);
+            }
             NewTabCmd::SetBrand { brand } => self.set_brand(brand),
             NewTabCmd::SetBackground { .. } => {}
         }
@@ -2826,7 +3205,25 @@ impl Browser {
                     self.sync_ui();
                 }
             }
+            UserEvent::UpdateReady(version) => {
+                self.update_ready = Some(version);
+                self.sync_ui();
+            }
+            UserEvent::ProbeAccount => {
+                self.probe_scheduled = false;
+                self.probe_google_account();
+            }
+            UserEvent::AccountProbeLoaded => self.account_probe_loaded(),
+            UserEvent::GoogleAccount(profile, account) => self.set_google_account(profile, account),
             UserEvent::Load(id, ev, url) => {
+                // Signing in or out of Google finishes on a Google page. Wait until the sign-in and
+                // challenge steps (passwords, passkeys, 2-step) are over before checking.
+                if matches!(ev, PageLoadEvent::Finished)
+                    && host_of(&url).is_some_and(|h| h == "google.com" || h.ends_with(".google.com"))
+                    && !["/signin", "/challenge", "/v3/", "/ServiceLogin", "/InteractiveLogin"].iter().any(|p| url.contains(p))
+                {
+                    self.schedule_account_probe(Duration::from_millis(1500));
+                }
                 let Some(i) = self.index_of(id) else { return };
                 let started = matches!(ev, PageLoadEvent::Started);
                 if started && let Some((query, engine)) = input::extract_search(&url) {
@@ -3158,8 +3555,25 @@ fn load_app_icon() -> Option<WinIcon> {
 fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    update::cleanup();
+    {
+        let proxy = proxy.clone();
+        update::spawn(move |v| {
+            let _ = proxy.send_event(UserEvent::UpdateReady(v.to_string()));
+        });
+    }
 
     let dir = data_dir();
+    // Release builds abort on panic with no message; keep the reason and location on disk so a
+    // crash can be traced. Appends to %LOCALAPPDATA%\Persona\crash.log (no page data in it).
+    let crash_log = dir.join("crash.log");
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&crash_log) {
+            let _ = writeln!(f, "[{secs}] {} {info}", env!("CARGO_PKG_VERSION"));
+        }
+    }));
     let prefs = Prefs::open(&dir);
     let brand = prefs.brand();
     let color = prefs.active_color();
@@ -3218,6 +3632,11 @@ fn main() -> wry::Result<()> {
     // Warm up DNS + TLS to the suggestion server so the first keystroke is fast.
     let _ = suggest_tx.send(suggest::Request { seq: 0, query: String::new() });
 
+    let allow_camera = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(prefs.permissions.camera));
+    let allow_notifications = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(prefs.permissions.notifications));
+    let allow_microphone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(prefs.permissions.microphone));
+    let allow_geolocation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(prefs.permissions.geolocation));
+
     let mut browser = Browser {
         window,
         toolbar,
@@ -3256,6 +3675,16 @@ fn main() -> wry::Result<()> {
         fullscreen: false,
         html_fullscreen: false,
         last_title: String::new(),
+        google: None,
+        account_probe: None,
+        probe_again: false,
+        probe_scheduled: false,
+        update_ready: None,
+        exe_path: std::env::current_exe().ok(),
+        allow_camera,
+        allow_notifications,
+        allow_microphone,
+        allow_geolocation,
     };
     let start = std::env::args().nth(1).and_then(|a| {
         let resolved = input::resolve_with_info(&unmask(&a))?;
@@ -3264,6 +3693,7 @@ fn main() -> wry::Result<()> {
     });
     browser.open_tab(start, None, true)?;
     browser.layout();
+    browser.schedule_account_probe(Duration::from_millis(1500));
 
     event_loop.run(move |event, _, control_flow| {
         match event {
@@ -3295,10 +3725,8 @@ fn main() -> wry::Result<()> {
             _ => ControlFlow::Wait,
         };
         if browser.quit {
+            // Search history is per session; cookies are kept so accounts stay signed in.
             browser.history.clear();
-            for t in &browser.tabs {
-                let _ = t.view.clear_all_browsing_data();
-            }
             *control_flow = ControlFlow::Exit;
         }
     });
@@ -3479,6 +3907,70 @@ mod tests {
         assert_eq!(reloaded.personas.len(), 1);
         assert_eq!(reloaded.personas[0].name, "Work & Code");
         assert_eq!(reloaded.personas[0].color, "cyan");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_google_account_list() {
+        let text = r#"["gaia.l.a.r",[["gaia.l.a",1,"Merik Venne","merik@example.com","https://lh3.googleusercontent.com/a/ACg8ocK=s48-c",1,1,0,null,1,"1234",null,null,null,0,1]]]"#;
+        let a = parse_google_accounts(text).expect("one account");
+        assert_eq!(a.name, "Merik Venne");
+        assert_eq!(a.email, "merik@example.com");
+        assert_eq!(a.photo, "https://lh3.googleusercontent.com/a/ACg8ocK=s96-c");
+        // Signed out ([14] = 1) or invalid ([9] = 0) sessions do not count.
+        let out = r#"["gaia.l.a.r",[["gaia.l.a",1,"X","x@example.com","",1,1,0,null,1,"1",null,null,null,1,1]]]"#;
+        assert_eq!(parse_google_accounts(out), None);
+        let invalid = r#"["gaia.l.a.r",[["gaia.l.a",1,"X","x@example.com","",1,1,0,null,0,"1"]]]"#;
+        assert_eq!(parse_google_accounts(invalid), None);
+        // No accounts, junk, and photos from other hosts.
+        assert_eq!(parse_google_accounts(r#"["gaia.l.a.r",[]]"#), None);
+        assert_eq!(parse_google_accounts("<html>"), None);
+        let evil = r#"["gaia.l.a.r",[["gaia.l.a",1,"E","e@example.com","https://evil.example/p.png",1,1,0,null,1,"1"]]]"#;
+        assert_eq!(parse_google_accounts(evil).unwrap().photo, "");
+        let photo_plain = sized_google_photo("https://lh3.googleusercontent.com/a/abc");
+        assert_eq!(photo_plain, "https://lh3.googleusercontent.com/a/abc=s96-c");
+    }
+
+    #[test]
+    fn persona_profiles_are_separate() {
+        let base = PersonaProfile::new_cederic();
+        assert_eq!(base.profile_name(), None);
+        let mut other = PersonaProfile::new_uzaki();
+        assert_eq!(other.profile_name().as_deref(), Some("persona_uzaki"));
+        other.id = "p_17/../x y".into();
+        assert_eq!(other.profile_name().as_deref(), Some("persona_p_17xy"));
+    }
+
+    #[test]
+    fn prefs_permissions_persistence() {
+        let dir = std::env::temp_dir().join(format!(
+            "persona_perms_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut prefs = Prefs::open(&dir);
+        // Defaults: camera=true, notifications=true, microphone=true, geolocation=false
+        assert!(prefs.permissions.camera);
+        assert!(prefs.permissions.notifications);
+        assert!(prefs.permissions.microphone);
+        assert!(!prefs.permissions.geolocation);
+
+        // Update permissions
+        prefs.set_permissions(false, false, false, true);
+        assert!(!prefs.permissions.camera);
+        assert!(!prefs.permissions.notifications);
+        assert!(!prefs.permissions.microphone);
+        assert!(prefs.permissions.geolocation);
+
+        // Verify disk persistence
+        let reloaded = Prefs::open(&dir);
+        assert!(!reloaded.permissions.camera);
+        assert!(!reloaded.permissions.notifications);
+        assert!(!reloaded.permissions.microphone);
+        assert!(reloaded.permissions.geolocation);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

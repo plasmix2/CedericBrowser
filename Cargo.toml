@@ -1,6 +1,6 @@
 [package]
 name = "persona"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A lean, memory-safe browser shell written in Rust"
 default-run = "Persona"
@@ -13,8 +13,10 @@ path = "src/main.rs"
 arboard = { version = "3.7.0", default-features = false }
 cosmic-text = "0.19.0"
 ico = "0.6.0"
+jpeg-decoder = { version = "0.3", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.10"
 softbuffer = "0.4.8"
 tao = "0.37.2"
 tiny-skia = "0.12.0"
