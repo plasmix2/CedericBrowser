@@ -763,10 +763,13 @@ mod tests {
         assert!(px(9) > 20 && px(9) < 235, "the edge is smoothed");
     }
 
-    /// Draws a frame and checks the pixels. Skipped on machines with no GPU adapter.
+    /// Draws frames on the GPU and checks the pixels. One test with one engine on purpose: tests run
+    /// in parallel, and two GPU devices created at the same time crashed Windows' software renderer
+    /// (WARP) on CI. Skipped on machines with no GPU adapter.
     #[test]
-    fn frame_draws_shapes_and_text() {
+    fn gpu_frames() {
         let Some(mut e) = Engine::new() else { return };
+        // Shapes and text.
         let f = e.frame(100, 40, 1.0, Rgba(0, 0, 0, 255), |p| {
             p.rect(0.0, 0.0, 10.0, 10.0, Rgba(255, 0, 0, 255));
             p.text("Hi", 20.0, 5.0, 13.0, Weight::Regular, Rgba(255, 255, 255, 255), 1.0e9);
@@ -775,13 +778,8 @@ mod tests {
         assert_eq!(px(5, 5), [255, 0, 0, 255]);
         assert_eq!(px(90, 35), [0, 0, 0, 255]);
         assert!(f.rgba.chunks_exact(4).skip(20).any(|p| p[0] > 100 && p[1] > 100), "text drew nothing");
-    }
-
-    /// The vendored shader has Persona's own orb branch: a WGSL mistake there makes every frame
-    /// blank (the pipeline fails to build), so check it draws, on dark and on light.
-    #[test]
-    fn orb_shader_draws_on_dark_and_light() {
-        let Some(mut e) = Engine::new() else { return };
+        // The vendored shader has Persona's own orb branch: a WGSL mistake there makes every frame
+        // blank (the pipeline fails to build), so check it draws, on dark and on light.
         for base in [Rgba(30, 30, 34, 255), Rgba(255, 255, 255, 255)] {
             let f = e.frame(120, 80, 1.0, base, |p| {
                 p.orb(0.0, 0.0, 120.0, 80.0, 0.0, 1.0, 1.0, Rgba(30, 200, 230, 255), base);
