@@ -160,6 +160,8 @@ pub struct Toolbar {
     hover_tab: Option<(TabId, Instant, bool)>,
     card_shown: bool,
     card_leave: Option<Instant>,
+    /// Button under the pointer, when it started hovering, and whether its tooltip is up.
+    tip: Option<(Hit, Instant, bool)>,
     last_frame: Instant,
     /// Requests for the browser, drained after each event.
     pub cmds: Vec<ChromeCmd>,
@@ -186,6 +188,8 @@ fn approach01(v: &mut f32, target: f32, k: f32) -> bool {
         true
     }
 }
+
+const TIP_DELAY: Duration = Duration::from_millis(450);
 
 fn hit_key(h: Hit) -> usize {
     match h {
@@ -257,6 +261,7 @@ impl Toolbar {
             hover_tab: None,
             card_shown: false,
             card_leave: None,
+            tip: None,
             last_frame: now,
             cmds: Vec::new(),
         }
@@ -595,6 +600,7 @@ impl Toolbar {
     }
 
     pub fn mouse_left(&mut self) {
+        self.end_tip();
         if !self.captures_mouse() {
             self.hover = Hit::None;
             self.mouse = (-1.0, -1.0);
@@ -622,6 +628,7 @@ impl Toolbar {
         let hit = self.hit(x, y);
         self.cmds.push(ChromeCmd::Dismiss);
         self.end_hover_card();
+        self.end_tip();
         if self.editing && hit != Hit::Omni {
             self.blur_address();
         }
@@ -774,6 +781,80 @@ impl Toolbar {
                 self.card_shown = false;
                 self.cmds.push(ChromeCmd::TabHoverEnd);
             }
+        }
+    }
+
+    // ---------- button tooltips ----------
+
+    /// Tooltip text for a toolbar or window button, with its shortcut.
+    fn tip_text(&self, h: Hit) -> Option<&'static str> {
+        Some(match h {
+            Hit::Back => "Back (Alt+Left)",
+            Hit::Forward => "Forward (Alt+Right)",
+            Hit::Reload if self.model.loading => "Stop loading",
+            Hit::Reload => "Reload (Ctrl+R)",
+            Hit::Star if self.model.url.is_empty() => return None,
+            Hit::Star if self.model.bookmarked => "Remove bookmark (Ctrl+D)",
+            Hit::Star => "Bookmark this page (Ctrl+D)",
+            Hit::Bookmarks => "Bookmarks (Ctrl+B)",
+            Hit::Pip => "Picture in picture (Alt+P)",
+            Hit::History => "Search history (Ctrl+H)",
+            Hit::Theme => "Theme and persona",
+            Hit::Devtools => "Developer tools (F12)",
+            Hit::NewTab => "New tab (Ctrl+T)",
+            Hit::Min => "Minimize",
+            Hit::Max if self.model.maximized => "Restore down",
+            Hit::Max => "Maximize",
+            Hit::Close => "Close window",
+            _ => return None,
+        })
+    }
+
+    fn tip_rect(&self, h: Hit) -> Option<R> {
+        let g = self.geo();
+        Some(match h {
+            Hit::Back => g.back,
+            Hit::Forward => g.fwd,
+            Hit::Reload => g.reload,
+            Hit::Star => g.star,
+            Hit::Bookmarks => g.bookmarks,
+            Hit::Pip => g.pip,
+            Hit::History => g.hist,
+            Hit::Theme => g.theme,
+            Hit::Devtools => g.dev,
+            Hit::NewTab => g.new_tab,
+            Hit::Min => g.min,
+            Hit::Max => g.max,
+            Hit::Close => g.close,
+            _ => return None,
+        })
+    }
+
+    fn end_tip(&mut self) {
+        if self.tip.take().is_some_and(|(_, _, shown)| shown) {
+            self.cmds.push(ChromeCmd::TipEnd);
+        }
+    }
+
+    fn update_tip(&mut self, now: Instant) {
+        let busy = self.drag.is_some() || self.selecting || self.pressed.is_some();
+        let over = if busy || self.tip_text(self.hover).is_none() { None } else { Some(self.hover) };
+        match (over, self.tip) {
+            (None, _) => self.end_tip(),
+            (Some(h), Some((cur, _, _))) if h == cur => {}
+            (Some(h), prev) => {
+                // Moving between neighbouring buttons while a tip is up swaps it at once.
+                let was_shown = prev.is_some_and(|(_, _, shown)| shown);
+                self.tip = Some((h, if was_shown { now - TIP_DELAY } else { now }, false));
+            }
+        }
+        if let Some((h, since, false)) = self.tip
+            && now >= since + TIP_DELAY
+            && let (Some(text), Some(r)) = (self.tip_text(h), self.tip_rect(h))
+        {
+            // The tab hover card and a tooltip never show together.
+            self.cmds.push(ChromeCmd::Tip { text: text.to_owned(), x: (r.x + r.w / 2.0) as f64, y: (r.y + r.h + 6.0) as f64 });
+            self.tip = Some((h, since, true));
         }
     }
 
@@ -978,6 +1059,7 @@ impl Toolbar {
         let dt = now.saturating_duration_since(self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         self.update_hover_card(now);
+        self.update_tip(now);
         // Rates tuned so motion settles in ~0.2s and hover fades in ~0.12s.
         let k = 1.0 - (-dt * 26.0).exp();
         let kf = 1.0 - (-dt * 30.0).exp();
@@ -1040,6 +1122,9 @@ impl Toolbar {
         }
         if let Some(t) = self.card_leave {
             wake(t);
+        }
+        if let Some((_, since, false)) = self.tip {
+            wake(since + TIP_DELAY);
         }
         if self.editing {
             // Caret blink.

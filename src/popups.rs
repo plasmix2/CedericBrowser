@@ -34,6 +34,8 @@ const PAD: f32 = 5.0;
 pub const CARD_W: f32 = 280.0;
 const SHOT_H: f32 = 158.0;
 const CARD_TEXT_H: f32 = 62.0;
+/// Height of a toolbar tooltip.
+pub const TIP_H: f32 = 28.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -66,6 +68,8 @@ pub enum Content {
     Menu(Vec<MenuEntry>),
     Suggest { items: Vec<SuggestEntry>, query: String },
     Preview(Card),
+    /// One-line tooltip under a toolbar button.
+    Tip(String),
 }
 
 /// A row laid out for drawing and hit-testing.
@@ -397,6 +401,11 @@ fn layout(fonts: &mut Fonts, content: &Content, s: f32) -> (Vec<Row>, f32) {
             rows.push(Row { y: img_h, h: CARD_TEXT_H, label: Some(title), hint: Some(host), enabled: false });
             return (rows, img_h + CARD_TEXT_H);
         }
+        Content::Tip(text) => {
+            let label = fonts.line(text, 12.5, Weight::NORMAL, s);
+            rows.push(Row { y: 0.0, h: TIP_H, label: Some(label), hint: None, enabled: false });
+            return (rows, TIP_H);
+        }
     }
     (rows, y + PAD)
 }
@@ -458,6 +467,16 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
                     c.text(fonts, b, w - PAD - 12.0 - hint_w, y + (r.h - 11.5 * 1.35) / 2.0, th.dim.with_alpha(a), w, 0.0);
                 }
             }
+        }
+        Content::Tip(_) => {
+            if let Some(r) = p.rows.first_mut() {
+                let y = r.y + dy;
+                if let Some(b) = &mut r.label {
+                    c.text(fonts, b, 10.0, y + 5.5, th.fg.with_alpha(a), w - 10.0, 18.0);
+                }
+            }
+            c.hairline_h(0.0, 0.0, w, th.border);
+            c.hairline_h(0.0, h - 1.0, w, th.border);
         }
         Content::Preview(card) => {
             if let Some(img) = &card.img {

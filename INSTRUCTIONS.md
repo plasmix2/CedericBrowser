@@ -101,6 +101,10 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`claude/kind-brown-esznx2`** — Native tooltips on toolbar and window buttons (not built or run: written in a Linux container without the Windows/WebView2 toolchain, so `cargo build`/`cargo test` are still to be run on Windows):
+  - **Files changed:** `src/toolbar.rs`, `src/popups.rs`, `src/main.rs`, `INSTRUCTIONS.md`.
+  - **Key changes:** `ChromeCmd::Tip { text, x, y }` / `TipEnd` (appended), `popups::Content::Tip(String)` + `TIP_H`, `Toolbar::{tip_text, tip_rect, update_tip, end_tip}` with a 450ms `TIP_DELAY`, `Browser::show_tip`. Tooltips reuse the `Kind::Preview` popup window, so no new popup window was added. `Toolbar::tick` wakes for the tooltip timer and stays idle otherwise.
+
 - **`agy/anonymous-history`** — Anonymous session search history & automatic clearing:
   - **Files changed:** `src/main.rs`, `src/history.rs`, `src/crypto.rs`, `INSTRUCTIONS.md`.
   - **Key changes:**

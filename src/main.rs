@@ -467,6 +467,9 @@ enum ChromeCmd {
     ToggleBookmark,
     BookmarksMenu { x: f64, y: f64 },
     ThemeMenu { x: f64, y: f64 },
+    /// Tooltip centred under a toolbar button.
+    Tip { text: String, x: f64, y: f64 },
+    TipEnd,
 }
 
 /// Messages from the built-in New Tab page (accepted only while `tab.is_newtab` is true).
@@ -1221,6 +1224,18 @@ impl Browser {
         self.popups.show(PopupKind::Preview, Content::Preview(card), pos, w as f32);
     }
 
+    /// One-line tooltip for a toolbar button; shares the hover card's popup window.
+    fn show_tip(&mut self, text: String, cx: f64, y: f64) {
+        if self.popups.is_open(PopupKind::Menu) {
+            return;
+        }
+        // Rough text width: the popup has no text measurement before it is laid out.
+        let w = (text.chars().count() as f64 * 6.6 + 22.0).max(60.0);
+        let x = (cx - w / 2.0).clamp(4.0, (self.logical_size().width - w - 4.0).max(4.0));
+        let pos = self.to_screen(x, y);
+        self.popups.show(PopupKind::Preview, Content::Tip(text), pos, w as f32);
+    }
+
     fn hide_preview(&mut self) {
         self.popups.hide(PopupKind::Preview);
     }
@@ -1701,6 +1716,8 @@ impl Browser {
             ChromeCmd::HistoryMenu { x, y } => self.history_menu(x, y),
             ChromeCmd::TabHover { id, x, y } => self.show_preview(id, x, y),
             ChromeCmd::TabHoverEnd => self.hide_preview(),
+            ChromeCmd::Tip { text, x, y } => self.show_tip(text, x, y),
+            ChromeCmd::TipEnd => self.hide_preview(),
             ChromeCmd::Dismiss => self.close_menu(),
             ChromeCmd::Query { text, x, y, w } => self.query(text, x, y, w),
             ChromeCmd::SuggestSelect { index } => {
