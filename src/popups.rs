@@ -203,6 +203,8 @@ pub struct Popup {
     pending_pos: Option<LogicalPosition<f64>>,
     /// Where the card is on screen (logical), for placing a submenu beside a row.
     card_pos: (f64, f64),
+    /// Last pointer position inside the card (logical px), to find the row under a press.
+    cursor: (f32, f32),
     v: View,
 }
 
@@ -235,13 +237,13 @@ pub struct Popups {
 }
 
 impl Popups {
-    pub fn new<T>(target: &EventLoopWindowTarget<T>, owner: &Window, dark: bool, brand: Brand) -> Self {
+    pub fn new<T>(target: &EventLoopWindowTarget<T>, owner: &Window, dark: bool, brand: Brand, engine: Option<Engine>) -> Self {
         let theme = Theme::for_brand(dark, brand);
         let make = |kind| Popup::new(target, owner, kind, theme.card);
         // The scrim is created first so the modal's window ends up above it.
         let scrim = make(Kind::Scrim);
         Self {
-            engine: Engine::new(),
+            engine,
             scrim,
             menu: make(Kind::Menu),
             suggest: make(Kind::Suggest),
@@ -407,6 +409,7 @@ impl Popups {
                 let m = margins(kind);
                 let pt = position.to_logical::<f32>(p.window.scale_factor());
                 let (x, y) = (pt.x - m.l, pt.y - m.t);
+                p.cursor = (x, y);
                 // The shadow margin is part of the window but not of the card.
                 let inside = x >= 0.0 && x < p.v.size.0;
                 let hover = p.v.rows.iter().position(|r| inside && r.enabled && y >= r.y && y < r.y + r.h);
@@ -430,7 +433,15 @@ impl Popups {
                 p.window.request_redraw();
                 None
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match (kind, state) {
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                // A popup that appeared under a still pointer never got a move event: find the
+                // pressed row from the last known position rather than ignoring the click.
+                if *state == ElementState::Pressed && p.v.hover.is_none() {
+                    let (x, y) = p.cursor;
+                    let inside = x >= 0.0 && x < p.v.size.0;
+                    p.v.hover = p.v.rows.iter().position(|r| inside && r.enabled && y >= r.y && y < r.y + r.h);
+                }
+                match (kind, state) {
                 // Suggestions act on press: the address bar may lose focus before release.
                 (Kind::Suggest, ElementState::Pressed) => p.v.hover.map(Pick::Suggest),
                 (Kind::Menu | Kind::Modal | Kind::Sub, ElementState::Pressed) => {
@@ -447,7 +458,8 @@ impl Popups {
                     })
                 }
                 _ => None,
-            },
+                }
+            }
             _ => None,
         }
     }
@@ -581,6 +593,7 @@ impl Popup {
             open: false,
             pending_pos: None,
             card_pos: (0.0, 0.0),
+            cursor: (-1.0, -1.0),
             v: View {
                 content: Content::Empty,
                 rows: Vec::new(),
@@ -983,7 +996,7 @@ mod tests {
         };
         let mut el = EventLoopBuilder::new().with_any_thread(true).build();
         let main = WindowBuilder::new().with_decorations(false).with_inner_size(LogicalSize::new(900.0, 500.0)).with_position(LogicalPosition::new(0.0, 0.0)).build(&el).unwrap();
-        let mut popups = Popups::new(&el, &main, true, Brand::Cederic);
+        let mut popups = Popups::new(&el, &main, true, Brand::Cederic, Engine::new());
         let entry = |label: &str, hint: Option<&str>| MenuEntry { label: label.into(), hint: hint.map(Into::into), disabled: false, sep: false, ..Default::default() };
         popups.show(Kind::Menu, Content::Menu(vec![entry("Bookmark this page", Some("Ctrl+D")), entry("No saved bookmarks yet", None)]), LogicalPosition::new(150.0, 100.0), 248.0);
         popups.show(Kind::Suggest, Content::Suggest { query: "dsda".into(), items: (0..4).map(|i| SuggestEntry { text: format!("suggestion {i}"), url: false }).collect() }, LogicalPosition::new(150.0, 260.0), 500.0);

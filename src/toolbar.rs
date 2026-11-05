@@ -145,6 +145,10 @@ pub struct Toolbar {
     hover: Hit,
     pressed: Option<Hit>,
     hover_fade: [f32; 16],
+    /// The pointer moved in a way that changes what is drawn (see `take_dirty`).
+    dirty: bool,
+    /// Setup is running: the chrome is blurred and only the window buttons and title bar work.
+    locked: bool,
     /// 0..1 phase of the hover gradient's slow turn.
     shimmer: f32,
     drag: Option<Drag>,
@@ -237,11 +241,10 @@ fn hit_key(h: Hit) -> usize {
 impl Toolbar {
     #[cfg(test)]
     pub fn new(dark: bool, scale: f32, width: f32) -> Self {
-        Self::new_with_brand(dark, Brand::Cederic, scale, width)
+        Self::new_with_brand(dark, Brand::Cederic, scale, width, Engine::new())
     }
 
-    pub fn new_with_brand(dark: bool, brand: Brand, scale: f32, width: f32) -> Self {
-        let engine = Engine::new();
+    pub fn new_with_brand(dark: bool, brand: Brand, scale: f32, width: f32, engine: Option<Engine>) -> Self {
         if engine.is_none() {
             eprintln!("persona: no GPU adapter for the ANVL engine; the toolbar will be blank");
         }
@@ -261,6 +264,8 @@ impl Toolbar {
             hover: Hit::None,
             pressed: None,
             hover_fade: [0.0; 16],
+            dirty: false,
+            locked: false,
             shimmer: 0.0,
             drag: None,
             last_click: (now, 0.0, 0.0, 0),
@@ -423,6 +428,9 @@ impl Toolbar {
     }
 
     pub fn focus_address(&mut self) {
+        if self.locked {
+            return;
+        }
         self.editing = true;
         let url = self.model.url.clone();
         self.set_text(&url, true);
@@ -438,6 +446,9 @@ impl Toolbar {
     /// Feeds a keystroke forwarded from a New Tab (or while the address bar is active) straight
     /// into the address bar editor so typing works immediately even before Win32 focus transfers.
     pub fn auto_key(&mut self, key: &str) {
+        if self.locked {
+            return;
+        }
         if !self.editing {
             self.focus_address();
         }
@@ -590,8 +601,22 @@ impl Toolbar {
         self.drag.is_some() || self.selecting || self.pressed.is_some()
     }
 
+    /// True once after a pointer move that needs a repaint. Plain moves over nothing do not, which
+    /// keeps the event loop free for clicks.
+    pub fn set_locked(&mut self, on: bool) {
+        self.locked = on;
+    }
+
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
     pub fn mouse_move(&mut self, x: f32, y: f32) -> CursorIcon {
         self.mouse = (x, y);
+        let hover_before = self.hover;
+        if self.selecting || self.drag.is_some() {
+            self.dirty = true;
+        }
         if self.selecting {
             let i = self.index_at(self.editor_x(x));
             self.ed.move_to(i, true);
@@ -617,6 +642,9 @@ impl Toolbar {
             return CursorIcon::Default;
         }
         self.hover = self.hit(x, y);
+        if self.hover != hover_before {
+            self.dirty = true;
+        }
         if y >= TITLE_H && self.frozen_w.is_some() {
             // Closing tabs with the mouse froze their widths; release once the pointer leaves the strip.
             self.frozen_w = None;
@@ -709,6 +737,9 @@ impl Toolbar {
     pub fn mouse_down(&mut self, button: MouseButton, x: f32, y: f32) {
         self.mouse = (x, y);
         let hit = self.hit(x, y);
+        if self.locked && !matches!(hit, Hit::Min | Hit::Max | Hit::Close | Hit::DragArea) {
+            return;
+        }
         self.cmds.push(ChromeCmd::Dismiss);
         self.end_hover_card();
         self.end_tip();
@@ -996,7 +1027,7 @@ impl Toolbar {
 
     /// Handles a key press while the browser window (not a page) has keyboard focus.
     pub fn key(&mut self, e: &KeyEvent, mods: ModifiersState) {
-        if e.state != ElementState::Pressed {
+        if e.state != ElementState::Pressed || self.locked {
             return;
         }
         let (ctrl, shift, alt) = (mods.control_key(), mods.shift_key(), mods.alt_key());
@@ -1006,6 +1037,7 @@ impl Toolbar {
         };
         // Browser shortcuts, whether or not the address bar is being edited.
         let shortcut = match (&e.logical_key, ch.as_deref()) {
+            (_, Some("t")) if ctrl && shift => Some(ChromeCmd::ReopenTab),
             (_, Some("t")) if ctrl => Some(ChromeCmd::NewTab),
             (_, Some("w")) if ctrl => Some(ChromeCmd::CloseTab { id: self.model.active }),
             (_, Some("r")) if ctrl => Some(ChromeCmd::Reload),
@@ -1370,6 +1402,11 @@ impl Toolbar {
         if self.progress_alpha > 0.0 {
             let w = self.width * self.progress;
             c.rect(0.0, HEIGHT - 2.0, w, 2.0, th.accent.mix(th.accent2, 0.35).with_alpha(self.progress_alpha));
+        }
+        if self.locked {
+            // Everything but the window buttons is blurred while setup runs.
+            c.veil(0.0, 0.0, self.width - 3.0 * WIN_BTN_W, HEIGHT, th.toolbar.with_alpha(0.35));
+            c.veil(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar.with_alpha(0.35));
         }
     }
 

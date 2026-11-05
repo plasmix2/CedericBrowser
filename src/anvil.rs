@@ -33,8 +33,8 @@ impl Weight {
     }
 }
 
-/// The GPU, the text system and the pictures uploaded to it for one drawing surface.
-pub struct Engine {
+/// The GPU, the text system and the pictures uploaded to it.
+struct Inner {
     ui: Ui,
     renderer: Renderer,
     /// Uploaded pictures by caller key (favicon URL, `"logo"`, ...).
@@ -42,7 +42,7 @@ pub struct Engine {
     clock: f32,
 }
 
-impl Engine {
+impl Inner {
     /// `None` when the machine has no usable GPU adapter (DX12 also covers WARP, so on Windows
     /// this only fails when the graphics stack is broken).
     pub fn new() -> Option<Self> {
@@ -107,6 +107,38 @@ impl Engine {
         // The chrome animates itself (see `Toolbar::tick`), so ANVL gets no clock or input here.
         self.clock += 1.0 / 60.0;
         self.ui.begin(Input::default(), Vec2::new(w as f32, h as f32), scale, self.clock, 1.0 / 60.0);
+    }
+}
+
+/// A handle on the one GPU engine the whole chrome shares (toolbar and every popup). Cloning it
+/// shares the same device, text cache and uploaded pictures instead of starting another GPU.
+#[derive(Clone)]
+pub struct Engine(std::rc::Rc<std::cell::RefCell<Inner>>);
+
+impl Engine {
+    pub fn new() -> Option<Self> {
+        Inner::new().map(|i| Self(std::rc::Rc::new(std::cell::RefCell::new(i))))
+    }
+
+    pub fn ensure_texture(&mut self, key: &str, pm: &Pixmap) {
+        self.0.borrow_mut().ensure_texture(key, pm);
+    }
+
+    pub fn forget_texture(&mut self, key: &str) {
+        self.0.borrow_mut().forget_texture(key);
+    }
+
+    pub fn text_width(&mut self, text: &str, size: f32, weight: Weight, scale: f32) -> f32 {
+        self.0.borrow_mut().text_width(text, size, weight, scale)
+    }
+
+    pub fn frame(&mut self, w: u32, h: u32, scale: f32, clear: Rgba, build: impl FnOnce(&mut Painter)) -> Frame {
+        self.0.borrow_mut().frame(w, h, scale, clear, build)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn shadow_pixmap(&mut self, w: u32, h: u32, scale: f32, card: (f32, f32, f32, f32), radius: f32, strength: f32) -> Option<Pixmap> {
+        self.0.borrow_mut().shadow_pixmap(w, h, scale, card, radius, strength)
     }
 }
 
@@ -210,6 +242,15 @@ impl Painter<'_> {
         let a = phase * std::f32::consts::TAU;
         self.rrect_gradient(x, y, w, h, radius, blue.with_alpha(0.30 * f * k), violet.with_alpha(0.16 * f * k), a, Some((violet.with_alpha(0.50 * f), 1.0)));
         self.rrect_gradient(x, y, w, h, radius, pink.with_alpha(0.24 * f * k), pink.with_alpha(0.0), a + std::f32::consts::PI * 0.75, None);
+    }
+
+    /// Blurs everything drawn so far inside the box and dims it with `tint` (a locked chrome).
+    pub fn veil(&mut self, x: f32, y: f32, w: f32, h: f32, tint: Rgba) {
+        let r = self.r(x, y, w, h);
+        self.ui.set_layer(1);
+        self.ui.backdrop_blur(r, 0.0);
+        self.ui.rect(r, RectStyle::fill(color(tint)));
+        self.ui.set_layer(0);
     }
 
     /// A soft drop shadow for a rounded rectangle: `blur` px of falloff, shifted down by `dy`.

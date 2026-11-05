@@ -104,6 +104,10 @@ pub struct Renderer {
     blur_targets: Option<BlurTargets>,
     /// Where the last [`Renderer::render`] spent its time.
     timings: RenderTimings,
+    /// Persona patch: the off-screen target and read-back buffer of `render_to_frame` are kept
+    /// between frames instead of being created and freed every time.
+    offscreen: Option<(u32, u32, wgpu::Texture)>,
+    readback: Option<(u64, wgpu::Buffer)>,
 }
 
 /// Where one [`Renderer::render`] spent its time, in seconds.
@@ -188,7 +192,8 @@ impl Renderer {
         icons: &IconAtlas,
     ) -> Result<Self, GpuError> {
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
+            // Persona patch: the chrome is a few small frames, so prefer the integrated GPU (less memory).
+            power_preference: wgpu::PowerPreference::LowPower,
             compatible_surface: surface.as_ref(),
             force_fallback_adapter: false,
             apply_limit_buckets: false,
@@ -523,6 +528,8 @@ impl Renderer {
             blur_scratch: Vec::new(),
             blur_targets: None,
             timings: RenderTimings::default(),
+            offscreen: None,
+            readback: None,
         })
     }
 
@@ -741,20 +748,27 @@ impl Renderer {
     pub fn render_to_frame(&mut self, draw: &DrawList, text: &mut TextSystem, clear: Color) -> Frame {
         let (w, h) = (self.config.width.max(1), self.config.height.max(1));
         let prepared = self.prepare(draw, text);
-        let target = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("anvil-offscreen"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        if self.offscreen.as_ref().is_none_or(|(ow, oh, _)| (*ow, *oh) != (w, h)) {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("anvil-offscreen"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            self.offscreen = Some((w, h, texture));
+        }
+        let target = match &self.offscreen {
+            Some((_, _, t)) => t.clone(),
+            None => return Frame { width: w, height: h, rgba: vec![0; (w * h * 4) as usize] },
+        };
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("anvil-offscreen-encoder"),
@@ -763,12 +777,20 @@ impl Renderer {
         // Rows of a texture copy are padded to 256 bytes.
         let row = w * 4;
         let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("anvil-readback"),
-            size: (padded * h) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let size = (padded * h) as u64;
+        if self.readback.as_ref().is_none_or(|(sz, _)| *sz != size) {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("anvil-readback"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            self.readback = Some((size, buffer));
+        }
+        let readback = match &self.readback {
+            Some((_, b)) => b.clone(),
+            None => return Frame { width: w, height: h, rgba: vec![0; (w * h * 4) as usize] },
+        };
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target,

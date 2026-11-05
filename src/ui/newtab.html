@@ -172,7 +172,9 @@
   kbd { font: inherit; padding: 1px 6px; border: 1px solid var(--border); border-radius: 5px; }
 
   /* First-run setup screen */
-  #setup { position: fixed; inset: 0; z-index: 80; display: none; place-items: center; padding: 20px; background: var(--bg); }
+  /* The page behind setup (search box, shortcuts, wallpaper) stays visible but heavily blurred. */
+  #setup { position: fixed; inset: 0; z-index: 80; display: none; place-items: center; padding: 20px;
+    background: color-mix(in srgb, var(--bg) 48%, transparent); backdrop-filter: blur(26px) saturate(1.15); -webkit-backdrop-filter: blur(26px) saturate(1.15); }
   #setup.open { display: grid; animation: fadeIn .25s var(--ease); }
   #setup::before { content: ""; position: absolute; inset: 0; pointer-events: none;
     background: radial-gradient(40% 35% at 30% 20%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 70%),

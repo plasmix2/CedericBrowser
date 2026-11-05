@@ -99,15 +99,14 @@ const STEALTH_SCRIPT: &str = r#"
 
 /// Every WebView sharing a data directory must use identical arguments.
 const BROWSER_ARGS: &str = "\
-    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,UserAgentClientHint \
-    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,BackForwardCache,ParallelDownloading,CanvasOopRasterization,UseEcoQoSForBackgroundProcess \
+    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate \
+    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,BackForwardCache,ParallelDownloading,UseEcoQoSForBackgroundProcess \
     --disable-blink-features=AutomationControlled \
     --autoplay-policy=no-user-gesture-required \
     --enable-quic \
     --ssl-version-min=tls1.2 \
     --disable-component-update \
     --enable-gpu-rasterization \
-    --enable-zero-copy \
     --enable-accelerated-video-decode \
     --enable-smooth-scrolling \
     --enable-fast-unload \
@@ -256,6 +255,7 @@ const SHORTCUT_SCRIPT: &str = r#"
 
   const map = (e) => {
     const c = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
+    if (c && e.shiftKey && k === 't') return 'reopen_tab';
     if (c && k === 't') return 'new_tab';
     if (c && k === 'w') return 'close_tab';
     if (c && k === 'l') return 'focus_address';
@@ -663,6 +663,8 @@ enum ChromeCmd {
     /// Tooltip centred under a toolbar button.
     Tip { text: String, x: f64, y: f64 },
     TipEnd,
+    /// Ctrl+Shift+T: reopen the tab closed last.
+    ReopenTab,
 }
 
 /// Messages from the built-in New Tab page (accepted only while `tab.is_newtab` is true).
@@ -734,6 +736,7 @@ enum Shortcut {
     Bookmarks,
     Fullscreen,
     Escape,
+    ReopenTab,
 }
 
 impl Shortcut {
@@ -755,6 +758,7 @@ impl Shortcut {
             "bookmarks" => Self::Bookmarks,
             "fullscreen" => Self::Fullscreen,
             "escape" => Self::Escape,
+            "reopen_tab" => Self::ReopenTab,
             _ => return None,
         })
     }
@@ -1010,7 +1014,14 @@ struct PrefsData {
     /// setup screen existed; those users already have personas and are treated as set up.
     #[serde(default)]
     setup_done: Option<bool>,
+    /// Which version of the setup screen was completed. Raising `SETUP_VERSION` makes everyone,
+    /// including profiles with saved data, go through setup once more.
+    #[serde(default)]
+    setup_version: Option<u32>,
 }
+
+/// Bump to show the setup screen again to every existing profile.
+const SETUP_VERSION: u32 = 2;
 
 struct Prefs {
     path: PathBuf,
@@ -1045,7 +1056,8 @@ impl Prefs {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
-        let mut setup_done = data.setup_done.unwrap_or(!data.personas.is_empty());
+        // Setup runs on the first launch of every profile, saved data or not.
+        let mut setup_done = data.setup_done.unwrap_or(false) && data.setup_version.unwrap_or(0) >= SETUP_VERSION;
         let mut personas = data.personas;
         if personas.is_empty() {
             // The unit tests exercise persona switching and isolation, which needs two personas.
@@ -1238,6 +1250,7 @@ impl Prefs {
             bookmarks: Some(self.active_bookmarks().to_vec()),
             permissions: Some(self.permissions.clone()),
             setup_done: Some(self.setup_done),
+            setup_version: self.setup_done.then_some(SETUP_VERSION),
         };
         if let Ok(json) = serde_json::to_string_pretty(&data) {
             let tmp = self.path.with_extension("json.tmp");
@@ -1591,6 +1604,8 @@ struct Browser {
     dark: bool,
     popups: Popups,
     menu_actions: Vec<Option<MenuAction>>,
+    /// URLs of recently closed tabs, newest last (Ctrl+Shift+T).
+    closed_tabs: Vec<String>,
     /// Submenus of the open menu's rows, and the actions of the open submenu's rows.
     menu_subs: Vec<Option<Vec<MenuItem>>>,
     sub_actions: Vec<Option<MenuAction>>,
@@ -1829,10 +1844,23 @@ impl Browser {
         Ok(())
     }
 
+    fn remember_closed(&mut self, idx: usize) {
+        if let Some(t) = self.tabs.get(idx)
+            && t.url.starts_with("http")
+            && self.closed_tabs.last() != Some(&t.url)
+        {
+            self.closed_tabs.push(t.url.clone());
+            if self.closed_tabs.len() > 15 {
+                self.closed_tabs.remove(0);
+            }
+        }
+    }
+
     fn close_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() {
             return;
         }
+        self.remember_closed(idx);
         if idx == self.active && self.html_fullscreen {
             self.set_fullscreen(false, true);
         }
@@ -1876,6 +1904,11 @@ impl Browser {
             self.show_active();
         }
         let active_id = self.tabs[self.active].id;
+        for i in 0..self.tabs.len() {
+            if !kept[i] {
+                self.remember_closed(i);
+            }
+        }
         for (i, t) in self.tabs.iter().enumerate() {
             if !kept[i] {
                 let _ = self.thumbs_tx.send(thumbs::Request::Forget(t.id));
@@ -3109,6 +3142,11 @@ impl Browser {
             ChromeCmd::BookmarksMenu { x, y } => self.bookmarks_menu(x, y),
             ChromeCmd::ThemeMenu { x, y } => self.theme_menu(x, y),
             ChromeCmd::ToggleFullscreen => self.toggle_fullscreen(),
+            ChromeCmd::ReopenTab => {
+                if let Some(url) = self.closed_tabs.pop() {
+                    let _ = self.open_tab(Some(url), None, true);
+                }
+            }
         }
     }
 
@@ -3166,6 +3204,7 @@ impl Browser {
         let n = self.tabs.len();
         match s {
             Shortcut::NewTab => self.handle_chrome(ChromeCmd::NewTab),
+            Shortcut::ReopenTab => self.handle_chrome(ChromeCmd::ReopenTab),
             Shortcut::CloseTab => self.close_tab(self.active),
             Shortcut::FocusAddress => self.focus_address(),
             Shortcut::History => {
@@ -3301,6 +3340,8 @@ impl Browser {
                     return;
                 }
                 self.prefs.finish_setup();
+                self.toolbar.set_locked(false);
+                self.window.request_redraw();
                 self.sync_all_newtabs();
             }
         }
@@ -3576,7 +3617,11 @@ impl Browser {
                     let icon = self.toolbar.mouse_move(p.x as f32, p.y as f32);
                     self.set_cursor(icon);
                     self.devtools.hover = false;
-                    self.window.request_redraw();
+                    // Only repaint when the move changed something; a GPU frame per mouse move
+                    // would keep the event loop too busy to see clicks promptly.
+                    if self.toolbar.take_dirty() {
+                        self.window.request_redraw();
+                    }
                 } else {
                     self.toolbar.mouse_left();
                     self.on_cursor(p.x, p.y);
@@ -3830,13 +3875,16 @@ fn main() -> wry::Result<()> {
 
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
-    let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
+    // One GPU engine for the toolbar and all popups: a second device would cost tens of MB.
+    let engine = anvil::Engine::new();
+    let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32, engine.clone());
     toolbar.set_persona_theme(dark, color, &letter);
     toolbar.set_background(prefs.bg_strip());
+    toolbar.set_locked(!prefs.setup_done);
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
-    let mut popups = Popups::new(&event_loop, &window, dark, brand);
+    let mut popups = Popups::new(&event_loop, &window, dark, brand, engine);
     popups.set_persona_theme(dark, color);
 
     let p_thumb = proxy.clone();
@@ -3893,6 +3941,7 @@ fn main() -> wry::Result<()> {
         dark,
         popups,
         menu_actions: Vec::new(),
+        closed_tabs: Vec::new(),
         menu_subs: Vec::new(),
         sub_actions: Vec::new(),
         thumbs_tx,
@@ -3984,7 +4033,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_screen_state_persists_and_skips_existing_users() {
+    fn setup_runs_once_per_version_even_with_saved_data() {
         let tmp = |tag: &str| {
             std::env::temp_dir().join(format!(
                 "persona_setup_test_{tag}_{}",
@@ -4000,15 +4049,19 @@ mod tests {
         assert!(Prefs::open(&dir).setup_done);
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Prefs written before the setup screen existed already have personas: not shown again.
+        // Profiles saved before this version of setup (even "done" ones) go through it once more.
         let dir = tmp("old");
         std::fs::create_dir_all(&dir).unwrap();
         let p = Prefs::open(&dir);
         p.save();
         let json = std::fs::read_to_string(dir.join("prefs.json")).unwrap();
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        v.as_object_mut().unwrap().remove("setup_done");
+        v["setup_done"] = serde_json::Value::Bool(true);
+        v.as_object_mut().unwrap().remove("setup_version");
         std::fs::write(dir.join("prefs.json"), v.to_string()).unwrap();
+        let mut again = Prefs::open(&dir);
+        assert!(!again.setup_done);
+        again.finish_setup();
         assert!(Prefs::open(&dir).setup_done);
         let _ = std::fs::remove_dir_all(&dir);
     }
