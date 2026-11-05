@@ -244,6 +244,24 @@ impl Painter<'_> {
         self.rrect_gradient(x, y, w, h, radius, pink.with_alpha(0.24 * f * k), pink.with_alpha(0.0), a + std::f32::consts::PI * 0.75, None);
     }
 
+    /// Switches the layer new shapes go to (0 = base, 1 = blurs and veils, 2 = on top of them).
+    pub fn layer(&mut self, n: usize) {
+        self.ui.set_layer(n);
+    }
+
+    /// Shows what is on layer 0 beneath the box blurred; `amount` (0..1) is how much of the blur
+    /// shows through, so a falling amount makes a progressive blur.
+    pub fn blur_region(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, amount: f32) {
+        if amount <= 0.01 || w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let r = self.r(x, y, w, h);
+        let prev = self.ui.draw.current;
+        self.ui.set_layer(1);
+        self.ui.draw.push_blur(anvil_ui::draw::RectInstance::new(r, RectStyle::fill([0.0, 0.0, 0.0, amount.clamp(0.0, 1.0)]).radius(radius * self.s)));
+        self.ui.set_layer(prev);
+    }
+
     /// Blurs everything drawn so far inside the box and dims it with `tint` (a locked chrome).
     pub fn veil(&mut self, x: f32, y: f32, w: f32, h: f32, tint: Rgba) {
         let r = self.r(x, y, w, h);

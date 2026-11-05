@@ -1839,8 +1839,13 @@ impl Browser {
             }
             self.sync_ui();
         }
-        // Build the next spare after this tab is on screen, so it never delays the switch.
-        let _ = self.proxy.send_event(UserEvent::Prewarm);
+        // Build the next spare after this tab is on screen, and after its opening animation: creating
+        // a WebView blocks the UI thread, which showed as a flicker right as the tab appeared.
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = proxy.send_event(UserEvent::Prewarm);
+        });
         Ok(())
     }
 

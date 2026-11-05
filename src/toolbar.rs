@@ -218,6 +218,10 @@ fn approach01(v: &mut f32, target: f32, k: f32) -> bool {
 
 const TIP_DELAY: Duration = Duration::from_millis(450);
 
+fn dragging_tab(lift_id: Option<TabId>, id: TabId, lift: f32) -> bool {
+    lift > 0.01 && lift_id == Some(id)
+}
+
 fn hit_key(h: Hit) -> usize {
     match h {
         Hit::NewTab => 1,
@@ -367,7 +371,7 @@ impl Toolbar {
                 // New tabs start collapsed at their slot and grow in place.
                 let x = self.slot_x(i);
                 // New tabs start part-open (not from nothing) so opening one feels immediate.
-                self.vis.push(TabVis { id: *id, x, w: self.tab_w * 0.45, alpha: 0.5, hover: 0.0, act: 0.0, leaving: false });
+                self.vis.push(TabVis { id: *id, x, w: self.tab_w * 0.6, alpha: 0.9, hover: 0.0, act: if model.active == *id { 1.0 } else { 0.0 }, leaving: false });
                 fresh = true;
             }
         }
@@ -1445,6 +1449,7 @@ impl Toolbar {
         // Leaving tabs underneath, then normal ones, then the active tab, then the dragged one on top.
         let mut idx: Vec<usize> = (0..self.vis.len()).collect();
         let lift_id = self.lift_id.filter(|_| self.lift > 0.01);
+        let drag_slot = lift_id.and_then(|l| slots.iter().position(|t| *t == l));
         idx.sort_by_key(|&i| {
             let v = &self.vis[i];
             (v.leaving as u8 == 0, v.id == active, Some(v.id) == lift_id)
@@ -1460,6 +1465,19 @@ impl Toolbar {
             let lift = if Some(id) == lift_id { self.lift } else { 0.0 };
             let dragging = lift > 0.01;
             let slot = slots.iter().position(|t| *t == id);
+            // While another tab is being dragged, this one is blurred more the closer it is to it.
+            if let (Some(dragged), Some(mine)) = (drag_slot, slot)
+                && !leaving
+                && Some(id) != lift_id
+            {
+                let d = mine.abs_diff(dragged).max(1) as i32;
+                let amount = 0.9 * 0.68_f32.powi(d - 1) * self.lift;
+                c.blur_region(x, TAB_Y, w, TITLE_H - TAB_Y, 10.0, amount);
+            }
+            // The dragged tab is drawn above the blur layer, so it stays sharp.
+            if dragging_tab(lift_id, id, self.lift) {
+                c.layer(2);
+            }
             // A lifted tab grows a little and floats on a soft shadow.
             let (x, w) = (x - 2.0 * lift, w + 4.0 * lift);
             if dragging {
@@ -1491,6 +1509,7 @@ impl Toolbar {
                 }
             }
             self.draw_tab_content(c, i, x, w, alpha, is_active || dragging, th);
+            c.layer(0);
         }
     }
 
