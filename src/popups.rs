@@ -40,12 +40,14 @@ const TIP_H: f32 = 28.0;
 const TIP_FONT: f32 = 12.5;
 /// Width of the form dialogs (persona editor, confirmations).
 pub const FORM_W: f32 = 400.0;
-pub const PERSONA_H: f32 = 352.0;
+pub const PERSONA_H: f32 = 428.0;
 pub const CONFIRM_H: f32 = 168.0;
 const MODAL_HEAD: f32 = 74.0;
 /// Height of the persona editor's animated preview, and the size of a color dot.
 const HERO_H: f32 = 160.0;
 const DOT: f32 = 30.0;
+/// Where the sliders' tracks start (their labels sit to the left).
+const SLIDER_X: f32 = 92.0;
 const MODAL_ROW: f32 = 56.0;
 const MODAL_FOOT: f32 = 62.0;
 
@@ -153,8 +155,15 @@ pub struct PersonaForm {
     pub name: String,
     /// Caret position in characters.
     pub caret: usize,
-    pub selected: usize,
+    /// The preset that is chosen, or `None` when the color comes from the sliders.
+    pub selected: Option<usize>,
     pub colors: Vec<Rgba>,
+    /// The color being built: its hue and vibrancy (0..1), and the resulting accent.
+    pub hue: f32,
+    pub vibrancy: f32,
+    pub accent: Rgba,
+    /// 1 right after any interaction, fading out: makes the orb flare.
+    pub pulse: f32,
     /// Names of the colors, in the same order (the selected one is shown under its dot).
     pub color_names: Vec<String>,
     /// The persona's picture, shown in the preview, if it has one (a loaded photo URL).
@@ -192,6 +201,8 @@ struct Row {
     /// Horizontal extent for rows that do not span the card (color swatches, buttons); `w` 0 = full width.
     x: f32,
     w: f32,
+    /// A draggable track (reports a 0..1 position instead of a click).
+    slider: bool,
     label: Option<String>,
     icon: Option<Icon>,
     avatar: Option<Avatar>,
@@ -245,6 +256,8 @@ pub enum Pick {
     Modal(usize),
     /// A row of a submenu.
     Sub(usize),
+    /// A slider row was pressed or dragged: (row, position 0..1).
+    Slide(usize, f32),
     /// The pointer moved onto row `i` of the main menu (to open or close its submenu).
     Hover(usize),
 }
@@ -375,7 +388,10 @@ impl Popups {
             p.v.hover = None;
         }
         p.v.selected = 0;
-        p.v.pressed = None;
+        // A dialog that refreshes itself while a slider is being dragged keeps the drag going.
+        if !was_open || kind != Kind::Modal {
+            p.v.pressed = None;
+        }
         // Refreshing the content of an open popup (a toggled switch, new suggestions) keeps the hover
         // fades going instead of snapping every row back to unhovered.
         if !was_open || p.v.hover_fade.len() != rows.len() {
@@ -457,7 +473,8 @@ impl Popups {
                         return hover.map(Pick::Hover);
                     }
                 }
-                None
+                // Dragging a slider follows the pointer even when it leaves the track.
+                p.v.pressed.and_then(|i| slide_at(&p.v.rows, i, x))
             }
             WindowEvent::CursorLeft { .. } => {
                 p.v.hover = None;
@@ -479,9 +496,15 @@ impl Popups {
                 (Kind::Menu | Kind::Modal | Kind::Sub, ElementState::Pressed) => {
                     p.v.pressed = p.v.hover;
                     p.window.request_redraw();
-                    None
+                    // A slider reports a position right away and keeps reporting while dragged.
+                    p.v.pressed.and_then(|i| slide_at(&p.v.rows, i, p.cursor.0))
                 }
                 (Kind::Menu | Kind::Modal | Kind::Sub, ElementState::Released) => {
+                    if p.v.pressed.is_some_and(|i| p.v.rows.get(i).is_some_and(|r| r.slider)) {
+                        p.v.pressed = None;
+                        p.window.request_redraw();
+                        return None;
+                    }
                     let picked = p.v.pressed.take().filter(|i| Some(*i) == p.v.hover);
                     picked.map(match kind {
                         Kind::Modal => Pick::Modal,
@@ -513,7 +536,8 @@ impl Popups {
                 moved = true;
             }
             // The persona editor's orb is a live shader: keep drawing while it is open.
-            if matches!(p.v.content, Content::Persona(_)) {
+            if let Content::Persona(f) = &mut p.v.content {
+                f.pulse = (f.pulse - dt * 1.4).max(0.0);
                 moved = true;
             }
             for (i, f) in p.v.hover_fade.iter_mut().enumerate() {
@@ -649,7 +673,7 @@ impl Popup {
 fn layout(content: &Content) -> (Vec<Row>, f32) {
     let mut rows = Vec::new();
     let mut y = PAD;
-    let row = |y: f32, h: f32, label: Option<String>, hint: Option<String>, enabled: bool| Row { y, h, x: 0.0, w: 0.0, label, icon: None, avatar: None, sub: false, tail: String::new(), hint, enabled };
+    let row = |y: f32, h: f32, label: Option<String>, hint: Option<String>, enabled: bool| Row { y, h, x: 0.0, w: 0.0, slider: false, label, icon: None, avatar: None, sub: false, tail: String::new(), hint, enabled };
     match content {
         Content::Empty => return (rows, 1.0),
         Content::Menu(items) => {
@@ -692,7 +716,7 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
         }
         Content::Scrim { h, .. } => return (rows, *h),
         Content::Persona(f) => {
-            // Preview area on top (HERO_H), then the name field, the color dots, the buttons.
+            // Preview area on top (HERO_H), then the name field, color dots, two sliders, buttons.
             let mut r = row(HERO_H + 12.0, 42.0, Some("name".into()), None, true);
             (r.x, r.w) = (22.0, FORM_W - 44.0);
             rows.push(r);
@@ -702,12 +726,21 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
                 (r.x, r.w) = (22.0 + i as f32 * step, DOT);
                 rows.push(r);
             }
-            let by = HERO_H + 78.0 + DOT + 26.0;
+            let by = HERO_H + 210.0;
             for (k, (x, w)) in [(22.0, 96.0), (FORM_W - 22.0 - 92.0 - 8.0 - 92.0, 92.0), (FORM_W - 22.0 - 92.0, 92.0)].into_iter().enumerate() {
                 let mut r = row(by, 36.0, Some(String::new()), None, k != 0 || f.can_delete);
                 (r.x, r.w) = (x, w);
                 rows.push(r);
             }
+            // 12 = hue, 13 = vibrancy, 14 = shuffle
+            for y in [HERO_H + 134.0, HERO_H + 168.0] {
+                let mut r = row(y, 24.0, Some(String::new()), None, true);
+                (r.x, r.w, r.slider) = (SLIDER_X, FORM_W - 22.0 - SLIDER_X, true);
+                rows.push(r);
+            }
+            let mut r = row(12.0, 30.0, Some(String::new()), None, true);
+            (r.x, r.w) = (FORM_W - 22.0 - 30.0, 30.0);
+            rows.push(r);
             return (rows, by + 36.0 + 22.0);
         }
         Content::Confirm { .. } => {
@@ -860,12 +893,13 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
                 c.rect(0.0, 0.0, w, h, Rgba(0, 0, 0, 255).with_alpha(if dark { 0.42 * a } else { 0.30 * a }));
             }
             Content::Persona(f) => {
-                let accent = f.colors.get(f.selected).copied().unwrap_or(th.accent);
-                // The preview: a shader-driven glowing orb in the chosen color, with the persona's
-                // picture (or initial) floating in the middle of it.
-                c.orb(0.0, 0.0, w, HERO_H, 0.0, time, 1.0, accent, bg);
+                let accent = f.accent;
+                // The preview: a shader-driven glowing orb in the chosen color that flares when
+                // something changes, with the persona's picture (or initial) floating in it.
+                c.orb(0.0, 0.0, w, HERO_H, 0.0, time, 1.0 + 0.9 * f.pulse, accent, bg);
                 let (ax, ay, ad) = (w / 2.0 - 34.0, HERO_H / 2.0 - 34.0, 68.0);
-                c.circle(ax + ad / 2.0, ay + ad / 2.0, ad / 2.0 + 3.0, accent.with_alpha(a));
+                let ring = ad / 2.0 + 3.0 + 2.5 * f.pulse;
+                c.circle(ax + ad / 2.0, ay + ad / 2.0, ring, accent.with_alpha(a));
                 let shown = f.avatar_url.as_ref().is_some_and(|u| images.contains_key(u));
                 if !(shown && c.image_cover(&format!("av:{}", f.avatar_url.clone().unwrap_or_default()), ax, ay, ad, ad, ad / 2.0)) {
                     c.circle(ax + ad / 2.0, ay + ad / 2.0, ad / 2.0, accent.mix(Rgba(0, 0, 0, 255), 0.25).with_alpha(a));
@@ -873,7 +907,13 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
                     let (lw, lh) = (c.text_width(&letter, 28.0, Weight::SemiBold), c.line_height(28.0, Weight::SemiBold));
                     c.text(&letter, ax + (ad - lw) / 2.0, ay + (ad - lh) / 2.0, 28.0, Weight::SemiBold, Rgba(255, 255, 255, 255).with_alpha(a), w);
                 }
-                c.text(&f.title, 22.0, 18.0, 12.0, Weight::SemiBold, th.fg.with_alpha(0.75 * a), w - 22.0);
+                c.text(&f.title, 22.0, 20.0, 12.0, Weight::SemiBold, th.fg.with_alpha(0.75 * a), w - 80.0);
+                // Shuffle: a round chip with sparkles, top right.
+                if let Some(r) = p.rows.get(14) {
+                    let hov = p.hover_fade.get(14).copied().unwrap_or(0.0);
+                    c.circle(r.x + r.w / 2.0, r.y + r.h / 2.0, r.w / 2.0, Rgba(255, 255, 255, 255).with_alpha((0.10 + 0.14 * hov) * a));
+                    c.icon(Icon::Sparkles, r.x + 6.0, r.y + 6.0, 18.0, th.fg.with_alpha(a));
+                }
                 // Name field: accent rim (it always has the keyboard), text and a caret.
                 if let Some(r) = p.rows.first() {
                     c.rrect(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0, 11.0, accent.with_alpha(a));
@@ -889,21 +929,45 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
                     let lh = c.line_height(14.0, Weight::Regular);
                     c.rect(cx, ty, 1.5, lh, th.fg.with_alpha(a));
                 }
-                // Color dots, the chosen one ringed and named underneath.
+                // Color dots, the chosen preset ringed.
                 for (i, col) in f.colors.iter().enumerate() {
                     let Some(r) = p.rows.get(1 + i) else { break };
                     let hov = p.hover_fade.get(1 + i).copied().unwrap_or(0.0);
                     let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
-                    if i == f.selected {
+                    if Some(i) == f.selected {
                         c.circle(cx, cy, DOT / 2.0 + 5.0, col.with_alpha(a));
                         c.circle(cx, cy, DOT / 2.0 + 2.5, bg);
                     }
                     c.circle(cx, cy, DOT / 2.0 - 1.0 + 1.5 * hov, col.with_alpha(a));
                 }
-                if let (Some(name), Some(r)) = (f.color_names.get(f.selected), p.rows.get(1 + f.selected)) {
-                    let tw = c.text_width(name, 11.5, Weight::SemiBold);
-                    let x = (r.x + r.w / 2.0 - tw / 2.0).clamp(22.0, w - 22.0 - tw);
-                    c.text(name, x, r.y + r.h + 12.0, 11.5, Weight::SemiBold, accent.with_alpha(a), w);
+                // The name of the color (or its hex when it is a custom one) under the dots.
+                let label = match f.selected {
+                    Some(i) => f.color_names.get(i).cloned().unwrap_or_default(),
+                    None => format!("Custom  #{:02x}{:02x}{:02x}", accent.0, accent.1, accent.2),
+                };
+                let tw = c.text_width(&label, 11.5, Weight::SemiBold);
+                c.text(&label, (w - tw) / 2.0, HERO_H + 78.0 + DOT + 8.0, 11.5, Weight::SemiBold, accent.with_alpha(a), w);
+                // Sliders: hue (a rainbow track) and vibrancy (grey to the full color).
+                for (k, (name, frac)) in [("Hue", f.hue), ("Vibrancy", f.vibrancy)].into_iter().enumerate() {
+                    let Some(r) = p.rows.get(12 + k) else { continue };
+                    let ty = r.y + (r.h - c.line_height(12.0, Weight::Regular)) / 2.0;
+                    c.text(name, 22.0, ty, 12.0, Weight::Regular, th.dim.with_alpha(a), SLIDER_X - 6.0);
+                    let (tx, tw, th_) = (r.x, r.w, 10.0);
+                    let ty = r.y + (r.h - th_) / 2.0;
+                    if k == 0 {
+                        let seg = tw / 6.0;
+                        for i in 0..6 {
+                            let (c1, c2) = (crate::gfx::hsl(i as f32 / 6.0, 0.85, 0.55), crate::gfx::hsl((i + 1) as f32 / 6.0, 0.85, 0.55));
+                            c.hgrad(tx + seg * i as f32, ty, seg + 0.5, th_, if i == 0 || i == 5 { th_ / 2.0 } else { 0.0 }, c1.with_alpha(a), c2.with_alpha(a));
+                        }
+                    } else {
+                        c.hgrad(tx, ty, tw, th_, th_ / 2.0, crate::gfx::hsl(f.hue, 0.12, 0.5).with_alpha(a), crate::gfx::hsl(f.hue, 1.0, 0.55).with_alpha(a));
+                    }
+                    let kx = tx + tw * frac.clamp(0.0, 1.0);
+                    let grabbed = p.pressed == Some(12 + k);
+                    c.circle(kx, ty + th_ / 2.0, 11.0 + if grabbed { 1.5 } else { 0.0 }, Rgba(0, 0, 0, 255).with_alpha(0.25 * a));
+                    c.circle(kx, ty + th_ / 2.0, 10.0 + if grabbed { 1.5 } else { 0.0 }, Rgba(255, 255, 255, 255).with_alpha(a));
+                    c.circle(kx, ty + th_ / 2.0, 6.5, accent.with_alpha(a));
                 }
                 let btn = |c: &mut crate::anvil::Painter, r: &Row, label: &str, fill: Rgba, fg: Rgba, f: f32| {
                     c.rrect(r.x, r.y, r.w, r.h, 10.0, fill.mix(Rgba(255, 255, 255, 255), 0.12 * f).with_alpha(a));
@@ -1005,6 +1069,12 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
     crate::anvil::copy_to_pixmap(&frame, pm);
 }
 
+/// The 0..1 position of `x` along row `i` if it is a slider.
+fn slide_at(rows: &[Row], i: usize, x: f32) -> Option<Pick> {
+    let r = rows.get(i).filter(|r| r.slider)?;
+    Some(Pick::Slide(i, ((x - r.x) / r.w).clamp(0.0, 1.0)))
+}
+
 /// Whether a point (card coordinates) is on an enabled row, honouring rows narrower than the card.
 fn row_hit(r: &Row, x: f32, y: f32) -> bool {
     r.enabled && y >= r.y && y < r.y + r.h && (r.w == 0.0 || (x >= r.x && x < r.x + r.w))
@@ -1086,7 +1156,11 @@ mod tests {
                 title: "New persona".into(),
                 name: String::new(),
                 caret: 0,
-                selected: 0,
+                selected: Some(0),
+                hue: 0.0,
+                vibrancy: 1.0,
+                accent: Rgba(255, 0, 0, 255),
+                pulse: 0.0,
                 colors: vec![Rgba(255, 0, 0, 255); 8],
                 color_names: vec![String::new(); 8],
                 avatar_url: None,
@@ -1094,8 +1168,10 @@ mod tests {
             })
         };
         let (rows, h) = layout(&form(false));
-        // name field, 8 colors, delete / cancel / save
-        assert_eq!(rows.len(), 12);
+        // name field, 8 colors, delete / cancel / save, 2 sliders, shuffle
+        assert_eq!(rows.len(), 15);
+        assert!(rows[12].slider && rows[13].slider && !rows[14].slider);
+        assert!(matches!(slide_at(&rows, 12, rows[12].x + rows[12].w / 2.0), Some(Pick::Slide(12, f)) if (f - 0.5).abs() < 0.01));
         assert!((h - PERSONA_H).abs() < 0.5);
         assert!(!rows[9].enabled, "Delete is off when the persona cannot be deleted");
         assert!(rows[10].enabled && rows[11].enabled);

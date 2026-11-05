@@ -1304,7 +1304,7 @@ impl Prefs {
         } else {
             clean_name.to_string()
         };
-        let valid_color = PersonaColor::from_str_name(color).name().to_string();
+        let valid_color = PersonaColor::from_str_name(color).to_key();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -1342,7 +1342,7 @@ impl Prefs {
             if !clean_name.is_empty() {
                 p.name = clean_name.to_string();
             }
-            p.color = PersonaColor::from_str_name(color).name().to_string();
+            p.color = PersonaColor::from_str_name(color).to_key();
             if let Some(new_pfp) = pfp {
                 p.pfp = new_pfp.filter(|s| s.starts_with("data:image/") || s.starts_with("http"));
             }
@@ -1480,7 +1480,67 @@ struct PersonaFormState {
     editing: Option<String>,
     name: String,
     ed: anvil_ui::Editor,
-    color: usize,
+    choice: ColorChoice,
+    /// Set after any interaction so the orb flares once; the popup fades it back out.
+    pulse: f32,
+}
+
+/// The persona color being chosen: one of the presets, or a custom hue and vibrancy.
+#[derive(Clone, Copy)]
+enum ColorChoice {
+    Preset(usize),
+    Custom { hue: f32, sat: f32 },
+}
+
+impl ColorChoice {
+    /// Lightness used for custom colors.
+    const L: f32 = 0.55;
+
+    fn from_color(c: PersonaColor) -> Self {
+        match c {
+            PersonaColor::Custom(v) => {
+                let (hue, sat, _) = gfx::to_hsl(gfx::Rgba::hex(v));
+                Self::Custom { hue, sat }
+            }
+            c => Self::Preset(PersonaColor::ALL.iter().position(|p| *p == c).unwrap_or(0)),
+        }
+    }
+
+    fn rgba(self) -> gfx::Rgba {
+        match self {
+            Self::Preset(i) => PersonaColor::ALL.get(i).map_or(gfx::Rgba::hex(0xff6a3d), |c| gfx::Rgba::hex(u32::from_str_radix(c.hex_string().trim_start_matches('#'), 16).unwrap_or(0xff6a3d))),
+            Self::Custom { hue, sat } => gfx::hsl(hue, sat, Self::L),
+        }
+    }
+
+    fn persona_color(self) -> PersonaColor {
+        match self {
+            Self::Preset(i) => PersonaColor::ALL.get(i).copied().unwrap_or(PersonaColor::Orange),
+            Self::Custom { .. } => {
+                let c = self.rgba();
+                PersonaColor::Custom(((c.0 as u32) << 16) | ((c.1 as u32) << 8) | c.2 as u32)
+            }
+        }
+    }
+
+    /// (hue, vibrancy) for the sliders; a preset shows where it sits.
+    fn hue_sat(self) -> (f32, f32) {
+        match self {
+            Self::Custom { hue, sat } => (hue, sat),
+            p => {
+                let (h, s, _) = gfx::to_hsl(p.rgba());
+                (h, s)
+            }
+        }
+    }
+}
+
+/// Vibrancy slider position (0..1) to saturation, and back.
+fn sat_from_slide(f: f32) -> f32 {
+    0.15 + 0.85 * f.clamp(0.0, 1.0)
+}
+fn slide_from_sat(s: f32) -> f32 {
+    ((s - 0.15) / 0.85).clamp(0.0, 1.0)
 }
 
 #[derive(Clone)]
@@ -1557,7 +1617,7 @@ struct PersonaDto<'a> {
     id: &'a str,
     name: &'a str,
     color: &'a str,
-    color_hex: &'a str,
+    color_hex: String,
     pfp: Option<&'a str>,
     is_active: bool,
     bookmark_count: usize,
@@ -1570,7 +1630,7 @@ struct NewTabState<'a> {
     active_persona_id: &'a str,
     persona_name: &'a str,
     persona_color: &'a str,
-    persona_color_hex: &'a str,
+    persona_color_hex: String,
     persona_pfp: Option<&'a str>,
     bookmarks: &'a [Bookmark],
     history: &'a [HistoryEntry],
@@ -1717,7 +1777,7 @@ impl Browser {
         let bg = self.newtab_color();
         let brand_key = if self.prefs.active_color() == PersonaColor::Slate { "uzaki" } else { "cederic" };
         let persona_name = self.prefs.active_name().to_string();
-        let persona_color_hex = self.prefs.active_color().hex_code();
+        let persona_color_hex = self.prefs.active_color().hex_string();
 
         let p_title = self.proxy.clone();
         let p_load = self.proxy.clone();
@@ -2057,7 +2117,7 @@ impl Browser {
                 id: &p.id,
                 name: &p.name,
                 color: &p.color,
-                color_hex: p.parsed_color().hex_code(),
+                color_hex: p.parsed_color().hex_string(),
                 pfp: p.pfp.as_deref(),
                 is_active: p.id == prefs.active_persona_id,
                 bookmark_count: p.bookmarks.len(),
@@ -2069,7 +2129,7 @@ impl Browser {
             active_persona_id: &prefs.active_persona_id,
             persona_name: &active.name,
             persona_color: color.name(),
-            persona_color_hex: color.hex_code(),
+            persona_color_hex: color.hex_string(),
             persona_pfp: active.pfp.as_deref(),
             bookmarks: prefs.active_bookmarks(),
             history: history.entries(),
@@ -2515,8 +2575,11 @@ impl Browser {
         self.close_menu();
         self.hide_preview();
         self.hide_tip();
-        let first_open = !self.popups.is_open(PopupKind::Scrim);
-        self.show_scrim(first_open);
+        // The blurred page behind is drawn once; a dialog that updates itself (sliders) must not
+        // repaint the whole window each time.
+        if !self.popups.is_open(PopupKind::Scrim) {
+            self.show_scrim(true);
+        }
         let size = self.logical_size();
         let pos = self.to_screen(((size.width - w as f64) / 2.0).max(0.0), ((size.height - h as f64) / 2.0 - 20.0).max(0.0));
         self.popups.show(PopupKind::Modal, content, pos, w);
@@ -2524,28 +2587,37 @@ impl Browser {
 
     /// The persona editor and the delete confirmation: native dialogs, no web page involved.
     fn open_persona_editor(&mut self, id: Option<&str>) {
-        let (name, color) = match id.and_then(|i| self.prefs.personas.iter().find(|p| p.id == i)) {
-            Some(p) => (p.name.clone(), PersonaColor::ALL.iter().position(|c| *c == p.parsed_color()).unwrap_or(0)),
-            None => (String::new(), self.prefs.personas.len() % PersonaColor::ALL.len()),
+        let (name, choice) = match id.and_then(|i| self.prefs.personas.iter().find(|p| p.id == i)) {
+            Some(p) => (p.name.clone(), ColorChoice::from_color(p.parsed_color())),
+            None => (String::new(), ColorChoice::Preset(self.prefs.personas.len() % PersonaColor::ALL.len())),
         };
         let n = name.chars().count();
-        self.persona_form = Some(PersonaFormState { editing: id.map(str::to_owned), name, ed: anvil_ui::Editor::at_end(n), color });
+        self.persona_form = Some(PersonaFormState { editing: id.map(str::to_owned), name, ed: anvil_ui::Editor::at_end(n), choice, pulse: 0.6 });
         self.modal_kind = Some(ModalKind::Persona);
         self.focus_chrome_for_typing();
         self.show_persona_form();
     }
 
     fn show_persona_form(&mut self) {
+        let Some(f) = self.persona_form.as_mut() else { return };
+        let pulse = std::mem::take(&mut f.pulse);
         let Some(f) = &self.persona_form else { return };
         let colors = PersonaColor::ALL
             .iter()
-            .map(|c| gfx::Rgba::hex(u32::from_str_radix(c.hex_code().trim_start_matches('#'), 16).unwrap_or(0xff6a3d)))
+            .map(|c| gfx::Rgba::hex(u32::from_str_radix(c.hex_string().trim_start_matches('#'), 16).unwrap_or(0xff6a3d)))
             .collect();
         let form = popups::PersonaForm {
             title: if f.editing.is_some() { "Edit persona".into() } else { "New persona".into() },
             name: f.name.clone(),
             caret: f.ed.caret,
-            selected: f.color,
+            selected: match f.choice {
+                ColorChoice::Preset(i) => Some(i),
+                ColorChoice::Custom { .. } => None,
+            },
+            hue: f.choice.hue_sat().0,
+            vibrancy: slide_from_sat(f.choice.hue_sat().1),
+            accent: f.choice.rgba(),
+            pulse,
             colors,
             color_names: PersonaColor::ALL.iter().map(|c| c.label().to_string()).collect(),
             avatar_url: self.persona_form_avatar(f),
@@ -2570,7 +2642,7 @@ impl Browser {
     /// Shows the chosen color on the chrome while editing, so the persona can be judged live.
     fn preview_persona_color(&mut self) {
         let Some(f) = &self.persona_form else { return };
-        let color = PersonaColor::ALL.get(f.color).copied().unwrap_or(PersonaColor::Orange);
+        let color = f.choice.persona_color();
         let letter = f.name.trim().chars().next().map_or("P".to_string(), |c| c.to_uppercase().to_string());
         self.toolbar.set_persona_theme(self.dark, color, &letter);
         self.window.request_redraw();
@@ -2646,7 +2718,8 @@ impl Browser {
     fn save_persona_form(&mut self) {
         let Some(f) = self.persona_form.take() else { return };
         let name = if f.name.trim().is_empty() { "Persona".to_owned() } else { f.name.trim().to_owned() };
-        let color = PersonaColor::ALL.get(f.color).map_or("orange", |c| c.name());
+        let color = f.choice.persona_color().to_key();
+        let color = color.as_str();
         self.hide_modal();
         match f.editing {
             None => {
@@ -2849,7 +2922,7 @@ impl Browser {
         let brand_key = if color == PersonaColor::Slate { "uzaki" } else { "cederic" };
         let js = format!(
             "window.__cedericBrand = {:?}; window.__cedericBrandName = {:?}; window.__cedericBrandColor = {:?}; window.__cedericSetBrand && window.__cedericSetBrand({:?});",
-            brand_key, persona.name, color.hex_code(), brand_key
+            brand_key, persona.name, color.hex_string(), brand_key
         );
         for tab in &mut self.tabs {
             if tab.newtab_bg {
@@ -3324,6 +3397,23 @@ impl Browser {
 
     fn handle_pick(&mut self, pick: Pick) {
         match pick {
+            Pick::Slide(index, frac) => {
+                if matches!(self.modal_kind, Some(ModalKind::Persona))
+                    && let Some(f) = self.persona_form.as_mut()
+                {
+                    // Dragging a slider turns the choice into a custom color, starting from what was shown.
+                    let (mut hue, mut sat) = f.choice.hue_sat();
+                    match index {
+                        12 => hue = frac,
+                        13 => sat = sat_from_slide(frac),
+                        _ => return,
+                    }
+                    f.choice = ColorChoice::Custom { hue, sat };
+                    f.pulse = 0.5;
+                    self.preview_persona_color();
+                    self.show_persona_form();
+                }
+            }
             Pick::Hover(index) => {
                 if self.menu_subs.get(index).is_some_and(|s| s.is_some()) {
                     self.show_sub(index);
@@ -3350,7 +3440,20 @@ impl Browser {
                 Some(ModalKind::Persona) => match index {
                     1..=8 => {
                         if let Some(f) = self.persona_form.as_mut() {
-                            f.color = index - 1;
+                            f.choice = ColorChoice::Preset(index - 1);
+                            f.pulse = 1.0;
+                        }
+                        self.preview_persona_color();
+                        self.show_persona_form();
+                    }
+                    14 => {
+                        // Shuffle: a random hue with a lively vibrancy.
+                        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |d| d.subsec_nanos());
+                        let hue = (n % 1000) as f32 / 1000.0;
+                        let sat = 0.55 + ((n / 1000) % 40) as f32 / 100.0;
+                        if let Some(f) = self.persona_form.as_mut() {
+                            f.choice = ColorChoice::Custom { hue, sat };
+                            f.pulse = 1.0;
                         }
                         self.preview_persona_color();
                         self.show_persona_form();

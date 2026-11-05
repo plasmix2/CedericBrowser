@@ -250,6 +250,16 @@ impl Painter<'_> {
         self.ui.rect(self.r(x, y, w, h), st);
     }
 
+    /// A rectangle filled with a left-to-right gradient from `c1` to `c2`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hgrad(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, c1: Rgba, c2: Rgba) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let st = RectStyle::fill(color(c1)).radius(radius.min(w / 2.0).min(h / 2.0) * self.s).linear(color(c2), 0.0);
+        self.ui.rect(self.r(x, y, w, h), st);
+    }
+
     /// A soft drop shadow for a rounded rectangle: `blur` px of falloff, shifted down by `dy`.
     #[allow(clippy::too_many_arguments)]
     pub fn shadow(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, blur: f32, dy: f32, alpha: f32) {
@@ -446,11 +456,11 @@ struct IconDef {
     grid: f32,
 }
 
-const ALL_ICONS: [Icon; 34] = [
+const ALL_ICONS: [Icon; 35] = [
     Icon::Back, Icon::Forward, Icon::Reload, Icon::Stop, Icon::Close, Icon::Plus, Icon::Lock, Icon::Info,
     Icon::Search, Icon::Globe, Icon::Star, Icon::StarFilled, Icon::Bookmarks, Icon::Pip, Icon::History,
     Icon::Code, Icon::WinMin, Icon::WinMax, Icon::WinRestore, Icon::WinClose,
-    Icon::ExternalLink, Icon::Copy, Icon::Link, Icon::Photo, Icon::Printer, Icon::Maximize, Icon::UserCircle, Icon::Users, Icon::Settings, Icon::ChevronRight, Icon::Check, Icon::Logout, Icon::ShieldLock, Icon::Trash,
+    Icon::ExternalLink, Icon::Copy, Icon::Link, Icon::Photo, Icon::Printer, Icon::Maximize, Icon::UserCircle, Icon::Users, Icon::Settings, Icon::ChevronRight, Icon::Check, Icon::Logout, Icon::ShieldLock, Icon::Trash, Icon::Sparkles,
 ];
 
 fn icon_def(icon: Icon) -> &'static IconDef {
