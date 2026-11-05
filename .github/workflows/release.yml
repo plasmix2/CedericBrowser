@@ -3,12 +3,22 @@
 #   git tag v0.2.0 && git push origin v0.2.0        -> release "Persona V0.2.0"
 #   git tag v0.2.0-pre && git push origin v0.2.0-pre -> the same, as a pre-release
 #
-# The tag must match `version` in Cargo.toml; anything after a '-' marks a pre-release. Installed copies of Persona pick the new release up automatically (src/update.rs).
+# The tag must match `version` in Cargo.toml; anything after a '-' marks a pre-release.
+# It can also be run from the Actions tab ("Run workflow") with the tag to create, which needs no
+# tag push: the release step creates the tag on the commit that was built. Installed copies of Persona pick the new release up automatically (src/update.rs).
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, e.g. v0.2.0 or v0.2.0-pre (must match Cargo.toml)"
+        required: true
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -24,8 +34,8 @@ jobs:
         shell: bash
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "v$version" != "${GITHUB_REF_NAME%%-*}" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version $version" >&2
+          if [ "v$version" != "${TAG%%-*}" ]; then
+            echo "Tag ${TAG} does not match Cargo.toml version $version" >&2
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -42,11 +52,13 @@ jobs:
 
       - name: Name the exe after the release
         shell: pwsh
-        run: Copy-Item target\release\Persona.exe "Persona-${env:GITHUB_REF_NAME}.exe"
+        run: Copy-Item target\release\Persona.exe "Persona-${env:TAG}.exe"
 
       - uses: softprops/action-gh-release@v2
         with:
           name: Persona V${{ steps.version.outputs.version }}
-          files: Persona-${{ github.ref_name }}.exe
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          files: Persona-${{ env.TAG }}.exe
+          prerelease: ${{ contains(env.TAG, '-') }}
           generate_release_notes: true
