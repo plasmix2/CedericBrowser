@@ -11,6 +11,7 @@ mod popups;
 mod suggest;
 mod thumbs;
 mod toolbar;
+mod update;
 
 use std::{
     collections::HashMap,
@@ -610,6 +611,8 @@ enum UserEvent {
     FullscreenState(TabId, bool),
     /// Time to check which Google account is signed in (scheduled, never run from a page event).
     ProbeAccount,
+    /// A newer version was downloaded and put in place; it runs after a restart.
+    UpdateReady(String),
     /// The hidden account probe finished loading Google's account list.
     AccountProbeLoaded,
     /// What the probe read, for the profile it ran in.
@@ -811,6 +814,7 @@ enum MenuAction {
     ToggleFullscreen,
     ClearSiteData,
     OpenTab(String),
+    RestartToUpdate,
     ToggleCamera,
     ToggleNotifications,
     ToggleMicrophone,
@@ -1516,6 +1520,10 @@ struct Browser {
     probe_again: bool,
     /// A probe is already scheduled to run shortly.
     probe_scheduled: bool,
+    /// A downloaded update waiting for a restart: its version.
+    update_ready: Option<String>,
+    /// The exe this process started from (an update replaces the file at this path).
+    exe_path: Option<PathBuf>,
     allow_camera: std::sync::Arc<std::sync::atomic::AtomicBool>,
     allow_notifications: std::sync::Arc<std::sync::atomic::AtomicBool>,
     allow_microphone: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1952,6 +1960,7 @@ impl Browser {
             brand,
             color,
             badge_letter,
+            update_ready: self.update_ready.is_some(),
             pfp: match &self.google {
                 Some(g) if !g.photo.is_empty() => g.photo.clone(),
                 _ => self.prefs.active_persona().pfp.clone().unwrap_or_default(),
@@ -2215,6 +2224,10 @@ impl Browser {
     fn theme_menu(&mut self, right: f64, y: f64) {
         let active_id = self.prefs.active_id().to_string();
         let mut items = Vec::new();
+        if let Some(v) = &self.update_ready {
+            items.push(MenuItem::new(format!("Restart to update to Persona {v}"), MenuAction::RestartToUpdate).hint("Update"));
+            items.push(MenuItem::sep());
+        }
         match &self.google {
             Some(g) => {
                 items.push(MenuItem::new(g.name.clone(), MenuAction::OpenTab(GOOGLE_ACCOUNT_URL.into())).hint("Google").enabled(false));
@@ -2596,6 +2609,14 @@ impl Browser {
             MenuAction::OpenUrl(url) => self.navigate_active(&url),
             MenuAction::ClearHistory => self.handle_chrome(ChromeCmd::ClearHistory),
             MenuAction::ClearSiteData => self.handle_chrome(ChromeCmd::ClearSiteData),
+            MenuAction::RestartToUpdate => {
+                // The exe at the path we started from is now the new version.
+                if let Some(exe) = &self.exe_path
+                    && std::process::Command::new(exe).spawn().is_ok()
+                {
+                    self.quit = true;
+                }
+            }
             MenuAction::OpenTab(url) => {
                 let _ = self.open_tab(Some(url), None, true);
             }
@@ -3184,6 +3205,10 @@ impl Browser {
                     self.sync_ui();
                 }
             }
+            UserEvent::UpdateReady(version) => {
+                self.update_ready = Some(version);
+                self.sync_ui();
+            }
             UserEvent::ProbeAccount => {
                 self.probe_scheduled = false;
                 self.probe_google_account();
@@ -3530,6 +3555,13 @@ fn load_app_icon() -> Option<WinIcon> {
 fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    update::cleanup();
+    {
+        let proxy = proxy.clone();
+        update::spawn(move |v| {
+            let _ = proxy.send_event(UserEvent::UpdateReady(v.to_string()));
+        });
+    }
 
     let dir = data_dir();
     // Release builds abort on panic with no message; keep the reason and location on disk so a
@@ -3647,6 +3679,8 @@ fn main() -> wry::Result<()> {
         account_probe: None,
         probe_again: false,
         probe_scheduled: false,
+        update_ready: None,
+        exe_path: std::env::current_exe().ok(),
         allow_camera,
         allow_notifications,
         allow_microphone,

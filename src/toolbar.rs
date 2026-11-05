@@ -65,6 +65,8 @@ pub struct Model {
     pub badge_letter: String,
     /// The active persona's profile picture (a data: or web URL), or empty for none.
     pub pfp: String,
+    /// A downloaded update is waiting for a restart: badge the persona button.
+    pub update_ready: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -845,6 +847,7 @@ impl Toolbar {
             Hit::Bookmarks => "Bookmarks (Ctrl+B)",
             Hit::Pip => "Picture in picture (Alt+P)",
             Hit::History => "Search history (Ctrl+H)",
+            Hit::Theme if self.model.update_ready => "Update ready: restart from this menu",
             Hit::Theme => "Persona and theme",
             Hit::Devtools => "Developer tools (F12)",
             Hit::NewTab => "New tab (Ctrl+T)",
@@ -1405,6 +1408,16 @@ impl Toolbar {
     /// The persona button: the active persona's profile picture in a circle, or its initial on
     /// its color when it has none.
     fn draw_avatar(&mut self, c: &mut Canvas, r: R, th: &Theme) {
+        self.draw_avatar_image(c, r, th);
+        if self.model.update_ready {
+            // Update badge: a dot on the top-right of the avatar, ringed in the toolbar color.
+            let (cx, cy) = (r.x + r.w / 2.0 + 9.0, r.y + r.h / 2.0 - 9.0);
+            c.circle(cx, cy, 5.0, th.toolbar);
+            c.circle(cx, cy, 3.5, Rgba(52, 199, 89, 255));
+        }
+    }
+
+    fn draw_avatar_image(&mut self, c: &mut Canvas, r: R, th: &Theme) {
         const D: f32 = 24.0;
         let (x, y) = (r.x + (r.w - D) / 2.0, r.y + (r.h - D) / 2.0);
         let s = self.s;
@@ -1579,6 +1592,7 @@ mod tests {
                 loading: false,
                 badge_letter: "M".into(),
                 pfp: if name == "toolbar-pfp" { "data:test-pfp".into() } else { String::new() },
+                update_ready: name == "toolbar-pfp",
                 ..Model::default()
             });
             if name == "toolbar-pfp" {

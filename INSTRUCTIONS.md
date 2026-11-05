@@ -101,6 +101,12 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`claude/kind-brown-esznx2` (combined branch, auto-update, v0.3.0)**:
+  - Merged `origin/gemini/picture-in-picture` (7df9d2d, site permissions) with the Google-accounts work. All four conflicts were additive and both sides were kept (`MenuAction`, `Browser` fields + init, tests).
+  - **Auto-update** (`src/update.rs`): about 15s after start, reads `api.github.com/repos/plasmix2/PersonaBrowser/releases`, picks the highest version above `CARGO_PKG_VERSION` with an `.exe` asset from this repo's release URLs, and downloads it (size, `MZ` and GitHub's `sha256:` digest checked with the `sha2` crate). It renames the running exe to `*.old.exe` and puts the new one in its place. `update::cleanup()` removes the old file at start. `UserEvent::UpdateReady`, `Browser::{update_ready, exe_path}`, `MenuAction::RestartToUpdate`, and `Model::update_ready` (green dot on the persona button) are new. Off for exes under a `target` folder or with `PERSONA_NO_UPDATE=1`.
+  - **Releases**: `.github/workflows/release.yml` builds, tests and publishes `Persona-vX.Y.Z.exe` when a `vX.Y.Z` tag is pushed (the tag must match `Cargo.toml`). Version bumped to **0.3.0**.
+  - The GitHub repo is now `plasmix2/PersonaBrowser` (the old name redirects).
+
 - **`claude/kind-brown-esznx2` (passkey crash)**: the account probe is no longer built straight from a page-load event. `schedule_account_probe` sends `UserEvent::ProbeAccount` after a delay, and skips sign-in/challenge pages. Building a WebView runs a nested message loop that can collide with Windows' modal Windows Hello (passkey) dialog. Release builds now append panics (message + file:line) to `%LOCALAPPDATA%\Persona\crash.log` (hook in `main`). Ask users for that file when something crashes.
 
 - **`claude/kind-brown-esznx2` (Google accounts per persona)**:
