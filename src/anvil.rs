@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use anvil_ui::{
-    Color, Fit, Frame, Icon as AnvilIcon, IconAtlas, Input, Rect, RectStyle, Renderer, TextStyle, TextureId, Ui,
+    Color, Fit, Frame, IconAtlas, Input, Rect, RectStyle, Renderer, TextStyle, TextureId, Ui,
 };
 use glam::Vec2;
 use tiny_skia::Pixmap;
@@ -198,6 +198,20 @@ impl Painter<'_> {
         self.ui.rect(self.r(x, y, w, h), st);
     }
 
+    /// A faint, slowly turning "AI mode" glow: blue, violet and pink washes (the Gemini palette)
+    /// pulled toward the theme `accent`, with a thin rim. `f` (0..1) fades it in; `phase` (0..1) turns it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ai_glow(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, f: f32, phase: f32, accent: Rgba, dark: bool) {
+        let k = if dark { 1.0 } else { 1.3 };
+        let tint = |c: Rgba| c.mix(accent, 0.35);
+        let blue = tint(Rgba(66, 133, 244, 255));
+        let violet = tint(Rgba(155, 114, 203, 255));
+        let pink = tint(Rgba(217, 101, 112, 255));
+        let a = phase * std::f32::consts::TAU;
+        self.rrect_gradient(x, y, w, h, radius, blue.with_alpha(0.30 * f * k), violet.with_alpha(0.16 * f * k), a, Some((violet.with_alpha(0.50 * f), 1.0)));
+        self.rrect_gradient(x, y, w, h, radius, pink.with_alpha(0.24 * f * k), pink.with_alpha(0.0), a + std::f32::consts::PI * 0.75, None);
+    }
+
     /// A soft drop shadow for a rounded rectangle: `blur` px of falloff, shifted down by `dy`.
     #[allow(clippy::too_many_arguments)]
     pub fn shadow(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, blur: f32, dy: f32, alpha: f32) {
@@ -290,21 +304,14 @@ impl Painter<'_> {
         let s = self.s;
         let (x, y) = ((x * s).round() / s, (y * s).round() / s);
         let size = ((size * s).round() / s).max(1.0 / s);
-        if let Some(a) = atlas_icon(icon) {
-            // ANVL's own Lucide icon: a texture, so translucency is exact.
-            if c.3 > 0 {
-                self.ui.icon(Rect::new(x * s, y * s, size * s, size * s), a, color(c));
-            }
-            return;
-        }
         let def = icon_def(icon);
         let k = size / def.grid;
         let fill_c = self.solid(c);
         let map = |p: [f32; 2]| [x + p[0] * k, y + p[1] * k];
-        for poly in &def.fills {
+        for poly in def.fills.iter() {
             self.fill_polygon(&poly.iter().map(|&p| map(p)).collect::<Vec<_>>(), fill_c);
         }
-        let w = def.width * k * if def.grid > 20.0 { 1.2 } else { 1.0 };
+        let w = def.width * k * 1.08;
         for line in &def.strokes {
             self.stroke(&line.iter().map(|&p| map(p)).collect::<Vec<_>>(), w, c);
         }
@@ -380,22 +387,8 @@ impl Painter<'_> {
 
 }
 
-/// The chrome icons that ANVL's own atlas has an exact match for.
-fn atlas_icon(icon: Icon) -> Option<AnvilIcon> {
-    Some(match icon {
-        Icon::Back => AnvilIcon::ArrowLeft,
-        Icon::Forward => AnvilIcon::ArrowRight,
-        Icon::Plus => AnvilIcon::Plus,
-        Icon::Close | Icon::Stop => AnvilIcon::X,
-        Icon::Search => AnvilIcon::Search,
-        Icon::Info => AnvilIcon::Info,
-        Icon::Code => AnvilIcon::Code,
-        _ => return None,
-    })
-}
-
 // ---------------------------------------------------------------------------------------------
-// Chrome icons: the same drawings the tiny-skia UI used, as polylines for ANVL's GPU strokes.
+// Chrome icons: Tabler Icons (see `tabler.rs`), parsed into polylines for ANVL's GPU strokes.
 
 struct IconDef {
     strokes: Vec<Vec<[f32; 2]>>,
@@ -404,6 +397,27 @@ struct IconDef {
     width: f32,
     /// Side of the drawing grid.
     grid: f32,
+}
+
+const ALL_ICONS: [Icon; 20] = [
+    Icon::Back, Icon::Forward, Icon::Reload, Icon::Stop, Icon::Close, Icon::Plus, Icon::Lock, Icon::Info,
+    Icon::Search, Icon::Globe, Icon::Star, Icon::StarFilled, Icon::Bookmarks, Icon::Pip, Icon::History,
+    Icon::Code, Icon::WinMin, Icon::WinMax, Icon::WinRestore, Icon::WinClose,
+];
+
+fn icon_def(icon: Icon) -> &'static IconDef {
+    static CACHE: std::sync::OnceLock<Vec<IconDef>> = std::sync::OnceLock::new();
+    let defs = CACHE.get_or_init(|| {
+        ALL_ICONS
+            .iter()
+            .map(|&ic| {
+                let strokes: Vec<Vec<[f32; 2]>> = crate::tabler::paths(ic).iter().flat_map(|d| parse_path(d)).collect();
+                let fills = if ic == Icon::StarFilled { strokes.clone() } else { Vec::new() };
+                IconDef { strokes, fills, width: 2.0, grid: 24.0 }
+            })
+            .collect()
+    });
+    &defs[icon as usize]
 }
 
 fn arc_points(cx: f32, cy: f32, r: f32, start: f32, sweep: f32) -> Vec<[f32; 2]> {
@@ -416,124 +430,220 @@ fn arc_points(cx: f32, cy: f32, r: f32, start: f32, sweep: f32) -> Vec<[f32; 2]>
         .collect()
 }
 
-fn ring(cx: f32, cy: f32, r: f32) -> Vec<[f32; 2]> {
-    arc_points(cx, cy, r, 0.0, std::f32::consts::TAU)
-}
-
 fn deg(d: f32) -> f32 {
     d.to_radians()
 }
 
-fn line(pts: &[(f32, f32)]) -> Vec<[f32; 2]> {
-    pts.iter().map(|&(x, y)| [x, y]).collect()
-}
-
-fn closed(pts: &[(f32, f32)]) -> Vec<[f32; 2]> {
-    let mut v = line(pts);
-    if let Some(&f) = v.first() {
-        v.push(f);
+/// Parses SVG path data (M L H V C S Q A Z, absolute and relative) into polylines, one per subpath.
+fn parse_path(d: &str) -> Vec<Vec<[f32; 2]>> {
+    struct Rd<'a> {
+        b: &'a [u8],
+        i: usize,
     }
-    v
-}
-
-fn rrect_outline(x: f32, y: f32, w: f32, h: f32, r: f32) -> Vec<[f32; 2]> {
-    let mut v = Vec::new();
-    for (cx, cy, a0) in [(x + w - r, y + r, -90.0), (x + w - r, y + h - r, 0.0), (x + r, y + h - r, 90.0), (x + r, y + r, 180.0)] {
-        v.extend(arc_points(cx, cy, r, deg(a0), deg(90.0)));
-    }
-    if let Some(&f) = v.first() {
-        v.push(f);
-    }
-    v
-}
-
-fn icon_def(icon: Icon) -> IconDef {
-    use std::f32::consts::PI;
-    let mut d = IconDef { strokes: Vec::new(), fills: Vec::new(), width: 1.9, grid: 24.0 };
-    match icon {
-        Icon::Back => {
-            d.strokes = vec![line(&[(19.0, 12.0), (5.0, 12.0)]), line(&[(11.0, 18.0), (5.0, 12.0), (11.0, 6.0)])];
-        }
-        Icon::Forward => {
-            d.strokes = vec![line(&[(5.0, 12.0), (19.0, 12.0)]), line(&[(13.0, 18.0), (19.0, 12.0), (13.0, 6.0)])];
-        }
-        Icon::Reload => {
-            let mut a = arc_points(12.0, 12.0, 8.0, 0.0, deg(315.0));
-            a.push([20.0, 8.5]);
-            d.strokes = vec![a, line(&[(20.0, 4.0), (20.0, 8.5), (15.5, 8.5)])];
-        }
-        Icon::Stop => d.strokes = vec![line(&[(17.0, 7.0), (7.0, 17.0)]), line(&[(7.0, 7.0), (17.0, 17.0)])],
-        Icon::Close => {
-            d.strokes = vec![line(&[(6.0, 6.0), (18.0, 18.0)]), line(&[(18.0, 6.0), (6.0, 18.0)])];
-            d.width = 2.4;
-        }
-        Icon::Plus => d.strokes = vec![line(&[(12.0, 5.0), (12.0, 19.0)]), line(&[(5.0, 12.0), (19.0, 12.0)])],
-        Icon::Lock => {
-            let mut shackle = line(&[(8.0, 11.0), (8.0, 8.0)]);
-            shackle.extend(arc_points(12.0, 8.0, 4.0, deg(180.0), PI));
-            shackle.push([16.0, 11.0]);
-            d.strokes = vec![rrect_outline(5.0, 11.0, 14.0, 10.0, 2.0), shackle];
-        }
-        Icon::Info => {
-            d.strokes = vec![ring(12.0, 12.0, 9.0), line(&[(12.0, 16.0), (12.0, 11.0)])];
-            d.fills = vec![ring(12.0, 8.0, 1.2)];
-        }
-        Icon::Search => d.strokes = vec![ring(11.0, 11.0, 7.0), line(&[(20.0, 20.0), (16.0, 16.0)])],
-        Icon::Globe => {
-            let oval: Vec<[f32; 2]> = ring(0.0, 0.0, 1.0).into_iter().map(|p| [12.0 + p[0] * 4.5, 12.0 + p[1] * 9.0]).collect();
-            d.strokes = vec![ring(12.0, 12.0, 9.0), line(&[(3.0, 12.0), (21.0, 12.0)]), oval];
-        }
-        Icon::Star | Icon::StarFilled => {
-            let star = [
-                (12.0, 3.2), (14.8, 8.9), (21.0, 9.8), (16.5, 14.2), (17.6, 20.4),
-                (12.0, 17.4), (6.4, 20.4), (7.5, 14.2), (3.0, 9.8), (9.2, 8.9),
-            ];
-            d.strokes = vec![closed(&star)];
-            d.width = 1.8;
-            if icon == Icon::StarFilled {
-                d.fills = vec![line(&star)];
+    impl Rd<'_> {
+        fn skip(&mut self) {
+            while self.i < self.b.len() && (self.b[self.i] == b' ' || self.b[self.i] == b',' || self.b[self.i] == b'\n') {
+                self.i += 1;
             }
         }
-        Icon::Bookmarks => {
-            d.strokes = vec![closed(&[(6.0, 4.0), (18.0, 4.0), (18.0, 20.5), (12.0, 16.5), (6.0, 20.5)])];
+        fn more(&mut self) -> bool {
+            self.skip();
+            self.i < self.b.len() && !self.b[self.i].is_ascii_alphabetic()
         }
-        Icon::Pip => {
-            d.strokes = vec![line(&[(21.0, 10.0), (21.0, 5.5), (3.0, 5.5), (3.0, 18.5), (10.5, 18.5)])];
-            d.fills = vec![rrect_outline(12.5, 12.5, 8.5, 6.5, 1.5)];
+        fn num(&mut self) -> f32 {
+            self.skip();
+            let st = self.i;
+            if self.i < self.b.len() && (self.b[self.i] == b'-' || self.b[self.i] == b'+') {
+                self.i += 1;
+            }
+            let mut dot = false;
+            while self.i < self.b.len() {
+                let c = self.b[self.i];
+                if c.is_ascii_digit() {
+                    self.i += 1;
+                } else if c == b'.' && !dot {
+                    dot = true;
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+            std::str::from_utf8(&self.b[st..self.i]).ok().and_then(|t| t.parse().ok()).unwrap_or(0.0)
         }
-        Icon::History => {
-            d.strokes = vec![
-                arc_points(12.0, 12.0, 9.0, deg(180.0), deg(312.0)),
-                line(&[(3.0, 4.0), (3.0, 8.5), (7.5, 8.5)]),
-                line(&[(12.0, 7.0), (12.0, 12.0), (15.0, 14.0)]),
-            ];
-        }
-        Icon::Code => d.strokes = vec![line(&[(8.0, 7.0), (3.0, 12.0), (8.0, 17.0)]), line(&[(16.0, 7.0), (21.0, 12.0), (16.0, 17.0)])],
-        Icon::WinMin => {
-            d.grid = 10.0;
-            d.width = 1.0;
-            d.strokes = vec![line(&[(0.0, 5.0), (10.0, 5.0)])];
-        }
-        Icon::WinMax => {
-            d.grid = 10.0;
-            d.width = 1.0;
-            d.strokes = vec![closed(&[(0.5, 0.5), (9.5, 0.5), (9.5, 9.5), (0.5, 9.5)])];
-        }
-        Icon::WinRestore => {
-            d.grid = 10.0;
-            d.width = 1.0;
-            d.strokes = vec![
-                closed(&[(0.5, 2.5), (7.5, 2.5), (7.5, 9.5), (0.5, 9.5)]),
-                line(&[(2.5, 2.5), (2.5, 0.5), (9.5, 0.5), (9.5, 7.5), (7.5, 7.5)]),
-            ];
-        }
-        Icon::WinClose => {
-            d.grid = 10.0;
-            d.width = 1.0;
-            d.strokes = vec![line(&[(0.0, 0.0), (10.0, 10.0)]), line(&[(10.0, 0.0), (0.0, 10.0)])];
+        fn flag(&mut self) -> bool {
+            self.skip();
+            let v = self.i < self.b.len() && self.b[self.i] == b'1';
+            self.i += 1;
+            v
         }
     }
-    d
+    let mut out: Vec<Vec<[f32; 2]>> = Vec::new();
+    let mut cur: Vec<[f32; 2]> = Vec::new();
+    let (mut x, mut y, mut sx, mut sy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let mut last_c: Option<[f32; 2]> = None;
+    let mut rd = Rd { b: d.as_bytes(), i: 0 };
+    let mut cmd = b'M';
+    while rd.i < rd.b.len() {
+        rd.skip();
+        if rd.i >= rd.b.len() {
+            break;
+        }
+        if rd.b[rd.i].is_ascii_alphabetic() {
+            cmd = rd.b[rd.i];
+            rd.i += 1;
+        } else if cmd == b'M' || cmd == b'm' {
+            cmd = if cmd == b'M' { b'L' } else { b'l' };
+        }
+        let rel = cmd.is_ascii_lowercase();
+        let (ox, oy) = if rel { (x, y) } else { (0.0, 0.0) };
+        match cmd.to_ascii_uppercase() {
+            b'Z' => {
+                if !cur.is_empty() {
+                    cur.push([sx, sy]);
+                    out.push(std::mem::take(&mut cur));
+                }
+                x = sx;
+                y = sy;
+                last_c = None;
+            }
+            b'M' => {
+                if cur.len() > 1 {
+                    out.push(std::mem::take(&mut cur));
+                }
+                cur.clear();
+                x = ox + rd.num();
+                y = oy + rd.num();
+                sx = x;
+                sy = y;
+                cur.push([x, y]);
+                last_c = None;
+            }
+            b'L' | b'H' | b'V' => {
+                while rd.more() {
+                    match cmd.to_ascii_uppercase() {
+                        b'H' => x = ox_for(rel, x) + rd.num(),
+                        b'V' => y = ox_for(rel, y) + rd.num(),
+                        _ => {
+                            let nx = ox_for(rel, x) + rd.num();
+                            let ny = ox_for(rel, y) + rd.num();
+                            x = nx;
+                            y = ny;
+                        }
+                    }
+                    if cur.is_empty() {
+                        cur.push([sx, sy]);
+                    }
+                    cur.push([x, y]);
+                }
+                last_c = None;
+            }
+            b'C' | b'S' | b'Q' => {
+                while rd.more() {
+                    let (bx, by) = (if rel { x } else { 0.0 }, if rel { y } else { 0.0 });
+                    let p0 = [x, y];
+                    let (c1, c2, p3);
+                    match cmd.to_ascii_uppercase() {
+                        b'C' => {
+                            c1 = [bx + rd.num(), by + rd.num()];
+                            c2 = [bx + rd.num(), by + rd.num()];
+                            p3 = [bx + rd.num(), by + rd.num()];
+                        }
+                        b'S' => {
+                            c1 = last_c.map_or(p0, |l| [2.0 * x - l[0], 2.0 * y - l[1]]);
+                            c2 = [bx + rd.num(), by + rd.num()];
+                            p3 = [bx + rd.num(), by + rd.num()];
+                        }
+                        _ => {
+                            let q = [bx + rd.num(), by + rd.num()];
+                            p3 = [bx + rd.num(), by + rd.num()];
+                            c1 = [p0[0] + 2.0 / 3.0 * (q[0] - p0[0]), p0[1] + 2.0 / 3.0 * (q[1] - p0[1])];
+                            c2 = [p3[0] + 2.0 / 3.0 * (q[0] - p3[0]), p3[1] + 2.0 / 3.0 * (q[1] - p3[1])];
+                        }
+                    }
+                    if cur.is_empty() {
+                        cur.push(p0);
+                    }
+                    for i in 1..=24 {
+                        let t = i as f32 / 24.0;
+                        let u = 1.0 - t;
+                        cur.push([
+                            u * u * u * p0[0] + 3.0 * u * u * t * c1[0] + 3.0 * u * t * t * c2[0] + t * t * t * p3[0],
+                            u * u * u * p0[1] + 3.0 * u * u * t * c1[1] + 3.0 * u * t * t * c2[1] + t * t * t * p3[1],
+                        ]);
+                    }
+                    x = p3[0];
+                    y = p3[1];
+                    last_c = Some(c2);
+                }
+            }
+            b'A' => {
+                while rd.more() {
+                    let (rx, ry, rot) = (rd.num(), rd.num(), rd.num());
+                    let (large, sweep) = (rd.flag(), rd.flag());
+                    let (ex, ey) = (ox_for(rel, x) + rd.num(), ox_for(rel, y) + rd.num());
+                    if cur.is_empty() {
+                        cur.push([x, y]);
+                    }
+                    cur.extend(arc_to(x, y, rx, ry, rot, large, sweep, ex, ey));
+                    x = ex;
+                    y = ey;
+                }
+                last_c = None;
+            }
+            _ => break,
+        }
+    }
+    if cur.len() > 1 {
+        out.push(cur);
+    }
+    out
+}
+
+fn ox_for(rel: bool, v: f32) -> f32 {
+    if rel { v } else { 0.0 }
+}
+
+/// Points along an SVG elliptical arc from (x0, y0) to (x1, y1), excluding the start point.
+#[allow(clippy::too_many_arguments)]
+fn arc_to(x0: f32, y0: f32, rx: f32, ry: f32, rot_deg: f32, large: bool, sweep: bool, x1: f32, y1: f32) -> Vec<[f32; 2]> {
+    let (mut rx, mut ry) = (rx.abs(), ry.abs());
+    if rx < 1e-6 || ry < 1e-6 || (x0 == x1 && y0 == y1) {
+        return vec![[x1, y1]];
+    }
+    let phi = rot_deg.to_radians();
+    let (cp, sp) = (phi.cos(), phi.sin());
+    let (dx, dy) = ((x0 - x1) / 2.0, (y0 - y1) / 2.0);
+    let (x1p, y1p) = (cp * dx + sp * dy, -sp * dx + cp * dy);
+    let lam = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+    if lam > 1.0 {
+        let k = lam.sqrt();
+        rx *= k;
+        ry *= k;
+    }
+    let num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
+    let den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+    let mut co = (num / den).max(0.0).sqrt();
+    if large == sweep {
+        co = -co;
+    }
+    let (cxp, cyp) = (co * rx * y1p / ry, -co * ry * x1p / rx);
+    let (cx, cy) = (cp * cxp - sp * cyp + (x0 + x1) / 2.0, sp * cxp + cp * cyp + (y0 + y1) / 2.0);
+    let ang = |ux: f32, uy: f32, vx: f32, vy: f32| (ux * vy - uy * vx).atan2(ux * vx + uy * vy);
+    let th1 = ang(1.0, 0.0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+    let mut dth = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
+    if !sweep && dth > 0.0 {
+        dth -= std::f32::consts::TAU;
+    } else if sweep && dth < 0.0 {
+        dth += std::f32::consts::TAU;
+    }
+    let n = ((dth.abs() / std::f32::consts::TAU) * 64.0).ceil().max(3.0) as usize;
+    (1..=n)
+        .map(|i| {
+            let t = th1 + dth * i as f32 / n as f32;
+            let (ex, ey) = (rx * t.cos(), ry * t.sin());
+            [cp * ex - sp * ey + cx, sp * ex + cp * ey + cy]
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ mod input;
 mod pacer;
 mod popups;
 mod suggest;
+mod tabler;
 mod thumbs;
 mod toolbar;
 mod update;

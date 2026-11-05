@@ -1250,7 +1250,7 @@ impl Toolbar {
                 (th.btn_hover.with_alpha(f), th.fg)
             };
             c.rect(r.x, r.y, r.w, r.h, bg);
-            c.icon(icon, r.x + (r.w - 10.0) / 2.0, r.y + (r.h - 10.0) / 2.0, 10.0, fg);
+            c.icon(icon, r.x + (r.w - 16.0) / 2.0, r.y + (r.h - 16.0) / 2.0, 16.0, fg);
         }
 
         // Toolbar buttons (translucent icons blend against the toolbar color).
@@ -1322,19 +1322,9 @@ impl Toolbar {
         let f = self.fade(h);
         if f > 0.01 {
             c.rrect(r.x, r.y, r.w, r.h, radius, th.btn_hover.with_alpha(f));
-            // A soft accent gradient that slowly turns, with a thin accent rim, fades in on hover.
-            let angle = self.shimmer * std::f32::consts::TAU;
-            c.rrect_gradient(
-                r.x,
-                r.y,
-                r.w,
-                r.h,
-                radius,
-                th.accent.with_alpha(0.34 * f),
-                th.accent2.with_alpha(0.10 * f),
-                angle,
-                Some((th.accent.with_alpha(0.5 * f), 1.0)),
-            );
+            // Faint Gemini-style glow, tinted by the persona's accent, turning slowly.
+            let phase = (self.shimmer + hit_key(h) as f32 * 0.11).fract();
+            c.ai_glow(r.x, r.y, r.w, r.h, radius, f, phase, th.accent, th.fg.0 > 128);
         }
     }
 
