@@ -95,8 +95,8 @@ impl Inner {
         let (x, y, cw, ch) = (card.0 / scale, card.1 / scale, card.2 / scale, card.3 / scale);
         let r = radius / scale;
         let f = self.frame(w, h, scale, Rgba(0, 0, 0, 0), |p| {
-            p.shadow(x, y, cw, ch, r, 30.0, 10.0, strength * 0.75);
-            p.shadow(x, y, cw, ch, r, 10.0, 2.5, strength * 0.5);
+            p.shadow(x, y, cw, ch, r, 32.0, 10.0, strength * 0.42);
+            p.shadow(x, y, cw, ch, r, 8.0, 2.0, strength * 0.28);
         });
         let mut pm = Pixmap::new(w, h)?;
         copy_to_pixmap(&f, &mut pm);
@@ -775,6 +775,20 @@ mod tests {
         assert_eq!(px(5, 5), [255, 0, 0, 255]);
         assert_eq!(px(90, 35), [0, 0, 0, 255]);
         assert!(f.rgba.chunks_exact(4).skip(20).any(|p| p[0] > 100 && p[1] > 100), "text drew nothing");
+    }
+
+    /// The vendored shader has Persona's own orb branch: a WGSL mistake there makes every frame
+    /// blank (the pipeline fails to build), so check it draws, on dark and on light.
+    #[test]
+    fn orb_shader_draws_on_dark_and_light() {
+        let Some(mut e) = Engine::new() else { return };
+        for base in [Rgba(30, 30, 34, 255), Rgba(255, 255, 255, 255)] {
+            let f = e.frame(120, 80, 1.0, base, |p| {
+                p.orb(0.0, 0.0, 120.0, 80.0, 0.0, 1.0, 1.0, Rgba(30, 200, 230, 255), base);
+            });
+            let differs = f.rgba.chunks_exact(4).any(|p| (p[0] as i32 - base.0 as i32).abs() > 30 || (p[2] as i32 - base.2 as i32).abs() > 30);
+            assert!(differs, "the orb drew nothing over {base:?}");
+        }
     }
 
     /// Renders icons, text and shapes headlessly: `CEDERIC_SHOT=<dir> cargo test render_anvil -- --ignored`.

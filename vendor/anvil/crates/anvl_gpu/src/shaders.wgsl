@@ -140,7 +140,11 @@ fn fill_at(inp: RectOut, p: vec2<f32>) -> vec4<f32> {
         col += mix(accent, vec3<f32>(1.0, 1.0, 1.0), 0.4) * glow * (0.92 + 0.08 * sin(t * 2.0));
         // A faint outer haze keeps the area from looking cut off.
         col += accent * exp(-r * 3.2) * 0.12 * e;
-        return vec4<f32>(clamp(inp.fill.rgb + col, vec3<f32>(0.0), vec3<f32>(1.0)), inp.fill.a);
+        // Blend the glow over the base by its strength instead of adding it, so the orb shows on a
+        // light card too (adding light to white changes nothing).
+        let amt = clamp(max(col.r, max(col.g, col.b)), 0.0, 1.0);
+        let hue_col = col / max(amt, 0.001);
+        return vec4<f32>(mix(inp.fill.rgb, clamp(hue_col, vec3<f32>(0.0), vec3<f32>(1.0)), amt), inp.fill.a);
     }
     if (kind > 2.5) {
         let res = max(inp.rect.zw, vec2<f32>(1.0, 1.0));

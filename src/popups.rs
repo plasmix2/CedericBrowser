@@ -41,7 +41,7 @@ const TIP_FONT: f32 = 12.5;
 /// Width of the form dialogs (persona editor, confirmations).
 pub const FORM_W: f32 = 400.0;
 pub const PERSONA_H: f32 = 428.0;
-pub const CONFIRM_H: f32 = 168.0;
+pub const CONFIRM_H: f32 = 150.0;
 const MODAL_HEAD: f32 = 74.0;
 /// Height of the persona editor's animated preview, and the size of a color dot.
 const HERO_H: f32 = 160.0;
@@ -763,7 +763,7 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
         }
         Content::Confirm { .. } => {
             for (x, w) in [(FORM_W - 22.0 - 92.0 - 8.0 - 92.0, 92.0), (FORM_W - 22.0 - 92.0, 92.0)] {
-                let mut r = row(112.0, 34.0, Some(String::new()), None, true);
+                let mut r = row(94.0, 34.0, Some(String::new()), None, true);
                 (r.x, r.w) = (x, w);
                 rows.push(r);
             }
@@ -861,10 +861,17 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
                         c.icon(ic, PAD + 10.0, cy - 8.0, 16.0, if r.enabled { th.dim } else { th.dim.with_alpha(0.5) }.with_alpha(a));
                     }
                     let chev = if r.sub { 18.0 } else { 0.0 };
-                    let hint_w = r.hint.as_deref().map_or(0.0, |h| c.text_width(h, 11.5, Weight::Regular));
+                    let mut hint_w = r.hint.as_deref().map_or(0.0, |h| c.text_width(h, 11.5, Weight::Regular));
+                    // The label wins: when label and hint do not both fit, the hint is left out
+                    // rather than cutting the label down to a few letters.
+                    let label_w = c.text_width(label, 13.0, Weight::Regular);
+                    let show_hint = tx + label_w + 12.0 <= w - PAD - 16.0 - hint_w - chev;
+                    if !show_hint {
+                        hint_w = 0.0;
+                    }
                     let ty = y + (r.h - c.line_height(13.0, Weight::Regular)) / 2.0;
                     c.text(label, tx, ty, 13.0, Weight::Regular, fg, w - PAD - 16.0 - hint_w - chev);
-                    if let Some(hint) = &r.hint {
+                    if show_hint && let Some(hint) = &r.hint {
                         let hy = y + (r.h - c.line_height(11.5, Weight::Regular)) / 2.0;
                         c.text(hint, w - PAD - 10.0 - hint_w - chev, hy, 11.5, Weight::Regular, th.dim.with_alpha(a), w);
                     }
@@ -905,7 +912,8 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
             Content::Scrim { img, .. } => {
                 c.rect(0.0, 0.0, w, h, Rgba(20, 22, 28, 255));
                 if img.is_some() {
-                    c.image("popup:scrim", 0.0, 0.0, w, h, 1.0);
+                    // Cropped to fill, not stretched: the snapshot rarely has the window's shape.
+                    c.image_cover("popup:scrim", 0.0, 0.0, w, h, 0.0);
                 }
                 // Dim what is behind the dialog; fades in with the popup.
                 c.rect(0.0, 0.0, w, h, Rgba(0, 0, 0, 255).with_alpha(if dark { 0.42 * a } else { 0.30 * a }));
@@ -929,7 +937,7 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
                 // Shuffle: a round chip with sparkles, top right.
                 if let Some(r) = p.rows.get(14) {
                     let hov = p.hover_fade.get(14).copied().unwrap_or(0.0);
-                    c.circle(r.x + r.w / 2.0, r.y + r.h / 2.0, r.w / 2.0, Rgba(255, 255, 255, 255).with_alpha((0.10 + 0.14 * hov) * a));
+                    c.circle(r.x + r.w / 2.0, r.y + r.h / 2.0, r.w / 2.0, th.fg.with_alpha((0.08 + 0.12 * hov) * a));
                     c.icon(Icon::Sparkles, r.x + 6.0, r.y + 6.0, 18.0, th.fg.with_alpha(a));
                 }
                 // Name field: accent rim (it always has the keyboard), text and a caret.
@@ -973,10 +981,17 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
                     let (tx, tw, th_) = (r.x, r.w, 10.0);
                     let ty = r.y + (r.h - th_) / 2.0;
                     if k == 0 {
-                        let seg = tw / 6.0;
+                        // Six square gradient segments between two round red caps (hue 0 and 1 are
+                        // both red), so no segment edge shows a notch.
+                        let cap = th_ / 2.0;
+                        let red = crate::gfx::hsl(0.0, 0.85, 0.55).with_alpha(a);
+                        c.circle(tx + cap, ty + cap, cap, red);
+                        c.circle(tx + tw - cap, ty + cap, cap, red);
+                        let (sx, sw) = (tx + cap, tw - 2.0 * cap);
+                        let seg = sw / 6.0;
                         for i in 0..6 {
                             let (c1, c2) = (crate::gfx::hsl(i as f32 / 6.0, 0.85, 0.55), crate::gfx::hsl((i + 1) as f32 / 6.0, 0.85, 0.55));
-                            c.hgrad(tx + seg * i as f32, ty, seg + 0.5, th_, if i == 0 || i == 5 { th_ / 2.0 } else { 0.0 }, c1.with_alpha(a), c2.with_alpha(a));
+                            c.hgrad(sx + seg * i as f32, ty, seg + 0.6, th_, 0.0, c1.with_alpha(a), c2.with_alpha(a));
                         }
                     } else {
                         c.hgrad(tx, ty, tw, th_, th_ / 2.0, crate::gfx::hsl(f.hue, 0.12, 0.5).with_alpha(a), crate::gfx::hsl(f.hue, 1.0, 0.55).with_alpha(a));
@@ -1212,14 +1227,32 @@ mod tests {
     fn render_popups() {
         let dir = std::path::PathBuf::from(std::env::var("CEDERIC_SHOT").expect("CEDERIC_SHOT"));
         let mut engine = Engine::new();
-        let th = Theme::new(true);
+        for dark in [true, false] {
+        let th = Theme::new(dark);
         let s = 2.0;
         let entry = |label: &str, hint: Option<&str>, disabled| MenuEntry { label: label.into(), hint: hint.map(Into::into), disabled, sep: false, ..Default::default() };
         let sep = || MenuEntry { sep: true, disabled: true, ..Default::default() };
         let mut thumb = Pixmap::new(320, 180).unwrap();
         thumb.fill(tiny_skia::Color::from_rgba8(40, 120, 90, 255));
+        let icon_entry = |label: &str, icon: Icon, hint: Option<&str>| MenuEntry { label: label.into(), hint: hint.map(Into::into), icon: Some(icon), ..Default::default() };
+        let av = |l: &str, c: Rgba| Avatar { url: None, letter: l.into(), color: c };
+        let toggle = |label: &str, desc: &str, on| ToggleEntry { label: label.into(), desc: desc.into(), on };
+        let persona = PersonaForm {
+            title: "Edit persona".into(),
+            name: "Work".into(),
+            caret: 4,
+            selected: None,
+            colors: PersonaColor::ALL.iter().map(|c| Rgba::hex(u32::from_str_radix(c.hex_string().trim_start_matches('#'), 16).unwrap())).collect(),
+            color_names: PersonaColor::ALL.iter().map(|c| c.label().to_string()).collect(),
+            hue: 0.52,
+            vibrancy: 0.8,
+            accent: crate::gfx::hsl(0.52, 0.8, 0.55),
+            pulse: 0.3,
+            avatar_url: None,
+            can_delete: true,
+        };
         let cases = [
-            ("popup-menu", 248.0, Content::Menu(vec![
+            ("popup-menu", 248.0, Kind::Menu, Content::Menu(vec![
                 entry("Open link in new tab", None, false),
                 entry("Copy link address", None, false),
                 sep(),
@@ -1228,7 +1261,16 @@ mod tests {
                 sep(),
                 entry("Inspect", Some("F12"), false),
             ])),
-            ("popup-suggest", 600.0, Content::Suggest {
+            ("popup-menu-icons", 248.0, Kind::Menu, Content::Menu(vec![
+                MenuEntry { label: "Merik Venne".into(), hint: Some("merik@example.com".into()), avatar: Some(av("M", Rgba::hex(0xff6a3d))), sub: true, ..Default::default() },
+                sep(),
+                MenuEntry { label: "Personas".into(), hint: Some("Work".into()), icon: Some(Icon::Users), sub: true, ..Default::default() },
+                sep(),
+                icon_entry("Set background…", Icon::Photo, None),
+                icon_entry("Site permissions…", Icon::ShieldLock, None),
+                icon_entry("Reload", Icon::Reload, Some("Ctrl+R")),
+            ])),
+            ("popup-suggest", 600.0, Kind::Suggest, Content::Suggest {
                 query: "rust bor".into(),
                 items: vec![
                     SuggestEntry { text: "rust bor".into(), url: false },
@@ -1236,9 +1278,17 @@ mod tests {
                     SuggestEntry { text: "rust borrow trait".into(), url: false },
                 ],
             }),
-            ("popup-card", CARD_W, Content::Preview(Card { title: "Rust Programming Language".into(), host: "rust-lang.org".into(), img: Some(thumb) })),
+            ("popup-card", CARD_W, Kind::Preview, Content::Preview(Card { title: "Rust Programming Language".into(), host: "rust-lang.org".into(), img: Some(thumb) })),
+            ("popup-tip", 150.0, Kind::Tip, Content::Tip("Developer tools (F12)".into())),
+            ("popup-settings", 420.0, Kind::Modal, Content::Modal {
+                title: "Site permissions".into(),
+                note: "On: sites may use it without asking again. Off: the request is blocked.".into(),
+                items: vec![toggle("Camera & video", "Websites may use your webcam", true), toggle("Microphone & audio", "Websites may use your microphone", false), toggle("Notifications", "Sites may send desktop notifications", true), toggle("Location", "Websites may read your location", false)],
+            }),
+            ("popup-persona", FORM_W, Kind::Modal, Content::Persona(persona)),
+            ("popup-confirm", FORM_W, Kind::Modal, Content::Confirm { title: "Delete persona?".into(), note: "“Work” and its bookmarks will be removed.".into(), ok: "Delete".into() }),
         ];
-        for (name, w, content) in cases {
+        for (name, w, kind, content) in cases {
             let (rows, h) = layout(&content);
             let mut v = View {
                 hover_fade: (0..rows.len()).map(|i| if i == 1 { 1.0 } else { 0.0 }).collect(),
@@ -1252,11 +1302,17 @@ mod tests {
                 shot_ready: false,
             };
             let mut pm = Pixmap::new((w * s) as u32, (h * s) as u32).unwrap();
-            draw(&mut v, &mut pm, &mut engine, &Default::default(), 0.0, &th, s);
-            let m = margins(Kind::Menu);
+            draw(&mut v, &mut pm, &mut engine, &Default::default(), 1.0, &th, s);
+            let m = margins(kind);
             let mut out = Pixmap::new(((w + m.l + m.r) * s) as u32, ((h + m.t + m.b) * s) as u32).unwrap();
-            compose(&pm, &mut out, &mut None, engine.as_mut(), m, corner_radius(Kind::Menu), true, s, &th);
-            out.save_png(dir.join(format!("{name}.png"))).unwrap();
+            compose(&pm, &mut out, &mut None, engine.as_mut(), m, corner_radius(kind), true, s, &th);
+            // Over a light page, the way it usually appears.
+            let mut page = Pixmap::new(out.width(), out.height()).unwrap();
+            page.fill(tiny_skia::Color::from_rgba8(236, 236, 240, 255));
+            page.draw_pixmap(0, 0, out.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            let out = page;
+            out.save_png(dir.join(format!("{name}{}.png", if dark { "" } else { "-light" }))).unwrap();
+        }
         }
     }
 

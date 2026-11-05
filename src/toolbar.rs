@@ -602,7 +602,9 @@ impl Toolbar {
     }
 
     fn close_rect(&self, v: &TabVis) -> R {
-        R { x: v.x + v.w - 7.0 - 22.0, y: TAB_Y + 6.0, w: 22.0, h: 22.0 }
+        // Narrow tabs show only the close button, centred.
+        let x = if v.w < NARROW_W { v.x + (v.w - 22.0) / 2.0 } else { v.x + v.w - 7.0 - 22.0 };
+        R { x, y: TAB_Y + 6.0, w: 22.0, h: 22.0 }
     }
 
     fn hit(&self, x: f32, y: f32) -> Hit {
@@ -1481,7 +1483,8 @@ impl Toolbar {
         }
         if self.locked {
             // Everything but the window buttons is blurred while setup runs.
-            c.veil(0.0, 0.0, self.width - 3.0 * WIN_BTN_W, HEIGHT, th.toolbar.with_alpha(0.35));
+            // Two regions that do not overlap: the tab strip up to the window buttons, then the toolbar row.
+            c.veil(0.0, 0.0, self.width - 3.0 * WIN_BTN_W, TITLE_H, th.strip.with_alpha(0.35));
             c.veil(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar.with_alpha(0.35));
         }
     }
@@ -1592,7 +1595,11 @@ impl Toolbar {
         let close = self.close_rect(&self.vis[i]);
         // Favicon, spinner, or the Persona logo badge.
         let has_favicon = matches!(self.icons.get(&favicon), Some(Some(_)));
-        if loading {
+        // A narrow active tab shows only its close button (centred), like other browsers: the icon
+        // and the button do not both fit.
+        let only_close = narrow && show_close;
+        if only_close {
+        } else if loading {
             c.spinner(icon_x + 8.0, cy, 6.0, self.spin, th.accent.with_alpha(alpha));
         } else if (favicon == BRAND_ICON || (favicon.is_empty() && (title.is_empty() || title == "New Tab")))
             && self.logo.is_some()
@@ -1612,7 +1619,7 @@ impl Toolbar {
         } else {
             c.icon(Icon::Globe, icon_x, cy - 8.0, 16.0, th.faint.with_alpha(alpha));
         }
-        if pip && !loading {
+        if pip && !loading && !only_close {
             let ring = if active { th.toolbar } else { th.strip };
             c.circle(icon_x + 14.5, cy + 6.5, 4.5, ring.with_alpha(alpha));
             c.circle(icon_x + 14.5, cy + 6.5, 3.0, th.accent.with_alpha(alpha));

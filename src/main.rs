@@ -2495,6 +2495,12 @@ impl Browser {
                 }
                 let color = self.prefs.active_color().accents(self.dark).0;
                 let av = popups::Avatar { url: photo, letter: g.name.chars().next().map_or("G".into(), |c| c.to_uppercase().to_string()), color };
+                // The email goes in the submenu: as a hint here it squeezed the name to "Merik...".
+                let mut sub = Vec::new();
+                if g.email != g.name {
+                    sub.push(MenuItem::new(g.email.clone(), MenuAction::OpenTab(GOOGLE_ACCOUNT_URL.into())).enabled(false));
+                    sub.push(MenuItem::sep());
+                }
                 let mut row = MenuItem::submenu(
                     g.name.clone(),
                     vec![
@@ -2503,8 +2509,9 @@ impl Browser {
                     ],
                 )
                 .avatar(av);
-                if g.email != g.name {
-                    row.hint = Some(g.email.clone());
+                if let Some(rows) = row.sub.as_mut() {
+                    sub.append(rows);
+                    *rows = sub;
                 }
                 items.push(row);
             }
@@ -2564,7 +2571,7 @@ impl Browser {
         let perms = &self.prefs.permissions;
         let content = Content::Modal {
             title: "Site permissions".into(),
-            note: "On: sites may use it without asking again. Off: the request is blocked.".into(),
+            note: "On: allowed without asking. Off: blocked.".into(),
             items: vec![
                 item("Camera & video", "Websites may use your webcam", perms.camera),
                 item("Microphone & audio", "Websites may use your microphone", perms.microphone),
