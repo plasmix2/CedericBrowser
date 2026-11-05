@@ -161,6 +161,8 @@ pub struct Toolbar {
     card_shown: bool,
     card_leave: Option<Instant>,
     last_frame: Instant,
+    bg: Option<Pixmap>,
+    logo: Option<Pixmap>,
     /// Requests for the browser, drained after each event.
     pub cmds: Vec<ChromeCmd>,
 }
@@ -258,6 +260,8 @@ impl Toolbar {
             card_shown: false,
             card_leave: None,
             last_frame: now,
+            bg: None,
+            logo: Pixmap::decode_png(include_bytes!("ui/logo_64.png")).ok(),
             cmds: Vec::new(),
         }
     }
@@ -268,6 +272,10 @@ impl Toolbar {
         self.theme = Theme::for_brand(dark, brand);
         self.model.brand = brand;
         self.pretty = None;
+    }
+
+    pub fn set_background(&mut self, bg: Option<Pixmap>) {
+        self.bg = bg;
     }
 
     pub fn set_size(&mut self, scale: f32, width: f32) {
@@ -864,6 +872,7 @@ impl Toolbar {
             (_, Some("w")) if ctrl => Some(ChromeCmd::CloseTab { id: self.model.active }),
             (_, Some("r")) if ctrl => Some(ChromeCmd::Reload),
             (Key::F5, _) => Some(ChromeCmd::Reload),
+            (Key::F11, _) => Some(ChromeCmd::ToggleFullscreen),
             (Key::F12, _) => Some(ChromeCmd::Devtools),
             (_, Some("i")) if ctrl && shift => Some(ChromeCmd::Devtools),
             (_, Some("d")) if ctrl && !shift && !alt => Some(ChromeCmd::ToggleBookmark),
@@ -1057,6 +1066,11 @@ impl Toolbar {
         let mut c = Canvas { pm, s };
         c.rect(0.0, 0.0, self.width, TITLE_H, th.strip);
         c.rect(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar);
+        if let Some(bg) = &self.bg {
+            c.image(bg, 0.0, 0.0, self.width, HEIGHT, 0.44);
+            c.rect(0.0, 0.0, self.width, TITLE_H, th.strip.with_alpha(0.56));
+            c.rect(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar.with_alpha(0.74));
+        }
 
         self.draw_tabs(&mut c, &th);
         let g = self.geo();
@@ -1211,9 +1225,13 @@ impl Toolbar {
         let icon_x = if narrow && !active { x + (w - 16.0) / 2.0 } else { x + 12.0 };
         let show_close = !self.vis[i].leaving && (active || hovered) && (!narrow || active) && w >= 44.0;
         let close = self.close_rect(&self.vis[i]);
-        // Favicon, spinner, or the Cederic/Uzaki badge.
+        // Favicon, spinner, or the Persona logo badge.
         if loading {
             c.spinner(icon_x + 8.0, cy, 6.0, self.spin, th.accent.with_alpha(alpha));
+        } else if (favicon == BRAND_ICON || (favicon.is_empty() && (title.is_empty() || title == "New Tab")))
+            && let Some(logo) = &self.logo
+        {
+            c.image(logo, icon_x, cy - 8.0, 16.0, 16.0, alpha);
         } else if favicon == BRAND_ICON {
             c.rrect(icon_x, cy - 8.0, 16.0, 16.0, [4.0; 4], th.accent.mix(th.accent2, 0.3).with_alpha(alpha));
             let brand = self.model.brand;

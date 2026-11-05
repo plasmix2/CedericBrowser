@@ -25,9 +25,6 @@ pub enum Request {
     Capture(u32),
     /// The tab was closed.
     Forget(u32),
-    /// Evaluate `js` in `tab` with `userGesture: true` over CDP (needed for Picture-in-Picture
-    /// when triggered from the toolbar or popup WebView rather than inside the content page).
-    EvalGesture(u32, String),
 }
 
 pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send + 'static) -> mpsc::Sender<Request> {
@@ -35,6 +32,18 @@ pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send
     std::thread::spawn(move || {
         let mut targets: HashMap<u32, String> = HashMap::new();
         let mut active: Option<u32> = None;
+        while let Ok(req) = rx.recv() {
+            let tab = match req {
+                Request::Active(t) => {
+                    active = t;
+                    continue;
+                }
+                Request::Forget(t) => {
+                    targets.remove(&t);
+                    continue;
+                }
+                Request::Capture(t) => t,
+            };
         while let Ok(first) = rx.recv() {
             let mut pending_capture: Option<u32> = None;
             for req in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
@@ -158,20 +167,6 @@ fn capture_at(port: u16, target: &str, width: f64) -> Option<tiny_skia::Pixmap> 
     let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
     small.draw_pixmap(0, 0, full.as_ref(), &paint, tiny_skia::Transform::from_scale(k, k), None);
     Some(small)
-}
-
-/// Evaluates `js` in `target` with a synthesized user gesture (`userGesture: true`).
-fn eval_gesture(port: u16, target: &str, js: &str) -> Option<Value> {
-    let mut s = Session::open(port, target)?;
-    s.call(
-        "Runtime.evaluate",
-        json!({
-            "expression": js,
-            "userGesture": true,
-            "awaitPromise": true,
-            "returnByValue": true,
-        }),
-    )
 }
 
 #[cfg(test)]

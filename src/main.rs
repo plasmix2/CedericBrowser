@@ -32,12 +32,12 @@ use tao::{
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     platform::windows::WindowBuilderExtWindows,
     keyboard::ModifiersState,
-    window::{CursorIcon, Theme, Window, WindowBuilder, WindowId},
+    window::{CursorIcon, Fullscreen, Icon as WinIcon, Theme, Window, WindowBuilder, WindowId},
 };
 use wry::{
     BackgroundThrottlingPolicy, MemoryUsageLevel, NewWindowResponse, PageLoadEvent,
-    PermissionResponse, Rect, ScrollBarStyle, WebContext, WebView, WebViewBuilder,
-    WebViewBuilderExtWindows, WebViewExtWindows,
+    PermissionKind, PermissionResponse, Rect, ScrollBarStyle, WebContext, WebView,
+    WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows,
 };
 
 /// Height of the native tab strip + toolbar, in logical pixels.
@@ -48,7 +48,66 @@ const DEVTOOLS_MIN: f64 = 280.0;
 
 const NEWTAB_HTML: &str = include_str!("ui/newtab.html");
 
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+
+const STEALTH_SCRIPT: &str = r#"
+(() => {
+  try {
+    delete Object.getPrototypeOf(navigator).webdriver;
+  } catch (_) {}
+  try {
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => undefined,
+      configurable: true,
+    });
+  } catch (_) {}
+
+  if (!window.chrome) window.chrome = {};
+  if (window.chrome.webview) {
+    const realWebview = window.chrome.webview;
+    let internalCall = false;
+    window.__cedericSendIpc = (msg) => {
+      internalCall = true;
+      try {
+        if (window.ipc && typeof window.ipc.postMessage === 'function') {
+          window.ipc.postMessage(msg);
+        } else if (realWebview && typeof realWebview.postMessage === 'function') {
+          realWebview.postMessage(msg);
+        }
+      } finally {
+        internalCall = false;
+      }
+    };
+    try {
+      delete window.chrome.webview;
+      Object.defineProperty(window.chrome, 'webview', {
+        get() {
+          if (internalCall) return realWebview;
+          return undefined;
+        },
+        configurable: true,
+        enumerable: false,
+      });
+    } catch (_) {}
+  }
+})();
+"#;
+
 /// Every WebView sharing a data directory must use identical arguments.
+const BROWSER_ARGS: &str = "\
+    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,UserAgentClientHint \
+    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,BackForwardCache,ParallelDownloading,CanvasOopRasterization \
+    --disable-blink-features=AutomationControlled \
+    --autoplay-policy=no-user-gesture-required \
+    --enable-gpu-rasterization \
+    --enable-zero-copy \
+    --enable-quic \
+    --enable-accelerated-video-decode \
+    --enable-smooth-scrolling \
+    --enable-fast-unload \
+    --ignore-gpu-blocklist \
+    --enable-native-gpu-memory-buffers \
+    --no-pings \
 /// Tuned for fast page loads, GPU rasterization, and Wi-Fi privacy:
 /// - In-process network service, async DNS, Happy Eyeballs v3, parallel downloading, back-forward
 ///   cache, GPU/zero-copy rasterization, and QUIC enabled.
@@ -70,14 +129,21 @@ const BROWSER_ARGS: &str = "\
     --disable-client-side-phishing-detection \
     --disable-sync \
     --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
-    --enforce-webrtc-ip-permission-check \
-    --remote-debugging-port=0";
+    --enforce-webrtc-ip-permission-check";
 
 /// Keyboard shortcuts, the context menu, speculative link preconnect/prefetch, and Wi-Fi form
 /// encryption guard for content pages. Untrusted web content can only trigger the fixed `Shortcut`
 /// whitelist and a validated `ContextRequest` over IPC.
 const SHORTCUT_SCRIPT: &str = r#"
 (() => {
+  if (window !== window.top) return;
+  const post = (msg) => {
+    if (typeof window.__cedericSendIpc === 'function') {
+      window.__cedericSendIpc(msg);
+    } else if (window.ipc && typeof window.ipc.postMessage === 'function') {
+      window.ipc.postMessage(msg);
+    }
+  };
   const preconnected = new Set();
   const preconnect = (raw) => {
     if (!raw || preconnected.size >= 48) return;
@@ -164,30 +230,37 @@ const SHORTCUT_SCRIPT: &str = r#"
     list.sort((a, b) => score(b) - score(a));
     return list[0];
   };
-  window.__cedericTogglePip = async (preferCtx = false) => {
+  const togglePip = async (preferCtx = false) => {
     try {
       if (document.pictureInPictureElement) {
         await document.exitPictureInPicture();
-        window.ipc.postMessage('pip_off');
+        post('pip_off');
         return true;
       }
       const v = bestVideo(preferCtx);
       if (!v) return false;
       v.disablePictureInPicture = false;
       v.removeAttribute('disablepictureinpicture');
-      v.addEventListener('leavepictureinpicture', () => window.ipc.postMessage('pip_off'), { once: true });
+      v.addEventListener('leavepictureinpicture', () => post('pip_off'), { once: true });
       await v.requestPictureInPicture();
-      window.ipc.postMessage('pip_on');
+      post('pip_on');
       return true;
     } catch (_) {
       return false;
     }
   };
-  window.addEventListener('enterpictureinpicture', () => window.ipc.postMessage('pip_on'), true);
-  window.addEventListener('leavepictureinpicture', () => window.ipc.postMessage('pip_off'), true);
+  window.addEventListener('enterpictureinpicture', () => post('pip_on'), true);
+  window.addEventListener('leavepictureinpicture', () => post('pip_off'), true);
   window.addEventListener('pagehide', () => {
-    if (document.pictureInPictureElement) window.ipc.postMessage('pip_off');
+    if (document.pictureInPictureElement) post('pip_off');
   }, true);
+
+  const updateFs = () => {
+    const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    post(isFs ? 'fs_on' : 'fs_off');
+  };
+  document.addEventListener('fullscreenchange', updateFs, true);
+  document.addEventListener('webkitfullscreenchange', updateFs, true);
 
   const map = (e) => {
     const c = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
@@ -202,17 +275,23 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (e.altKey && e.key === 'ArrowLeft') return 'back';
     if (e.altKey && e.key === 'ArrowRight') return 'forward';
     if (e.altKey && !c && !e.shiftKey && k === 'p') return 'pip';
+    if (e.key === 'F11') return 'fullscreen';
     if (e.key === 'F12' || (c && e.shiftKey && k === 'i')) return 'devtools';
     return null;
   };
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') window.ipc.postMessage('dismiss');
+    if (e.key === 'Escape') post('escape');
     const cmd = map(e);
     if (cmd === 'pip') {
       e.preventDefault(); e.stopPropagation();
-      window.__cedericTogglePip(false).then((ok) => { if (!ok) window.ipc.postMessage('pip'); });
+      togglePip(false).then((ok) => { if (!ok) post('pip'); });
       return;
     }
+    if (cmd) { e.preventDefault(); e.stopPropagation(); post(cmd); }
+  }, true);
+  // Popups never take focus, so a click or focus inside the page is what closes an open menu / address bar edit.
+  window.addEventListener('pointerdown', () => post('dismiss'), true);
+  window.addEventListener('focusin', () => post('dismiss'), true);
     if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); return; }
     if (!e.ctrlKey && !e.altKey && !e.metaKey && (location.protocol === 'about:' || location.protocol === 'data:')) {
       const a = document.activeElement;
@@ -238,6 +317,8 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (t && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
     e.preventDefault();
     const a = t && t.closest('a[href]'), img = t && t.closest('img');
+    ctxVideo = videoAt(e.clientX, e.clientY) || bestVideo(false);
+    post(JSON.stringify({
     ctxVideo = videoAt(e.clientX, e.clientY) || (document.querySelector('video') && bestVideo(false)) || null;
     window.ipc.postMessage(JSON.stringify({
       x: e.clientX, y: e.clientY, dpr: window.devicePixelRatio,
@@ -261,6 +342,99 @@ const SHORTCUT_SCRIPT: &str = r#"
       } catch (_) {}
     }
   }, true);
+
+  const sendBg = (rawUrl, keepRaw) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      let data = rawUrl;
+      if (!keepRaw) {
+        try {
+          const maxW = 1920, maxH = 1080;
+          let w = img.naturalWidth || 1920, h = img.naturalHeight || 1080;
+          const r = Math.min(1, maxW / w, maxH / h);
+          w = Math.max(1, Math.round(w * r));
+          h = Math.max(1, Math.round(h * r));
+          const c = document.createElement('canvas');
+          c.width = w; c.height = h;
+          c.getContext('2d').drawImage(img, 0, 0, w, h);
+          data = c.toDataURL('image/jpeg', 0.88);
+        } catch (_) {}
+      }
+      let strip = '';
+      try {
+        const sc = document.createElement('canvas');
+        sc.width = 640; sc.height = 84;
+        const sx = sc.getContext('2d');
+        const iw = img.naturalWidth || img.width || 640;
+        const ih = img.naturalHeight || img.height || 360;
+        const scale = Math.max(sc.width / iw, sc.height / ih);
+        const dw = iw * scale, dh = ih * scale;
+        sx.filter = 'blur(3px)';
+        sx.drawImage(img, (sc.width - dw) / 2, (sc.height - dh) * 0.2, dw, dh);
+        strip = sc.toDataURL('image/png');
+      } catch (_) {}
+      post(JSON.stringify({ nt: 'set_background', data, strip }));
+    };
+    img.onerror = () => {
+      if (rawUrl) post(JSON.stringify({ nt: 'set_background', data: rawUrl, strip: '' }));
+    };
+    img.src = rawUrl;
+  };
+  const openBgPicker = () => {
+    const existing = document.getElementById('bg-file');
+    if (existing) { existing.click(); return; }
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = 'image/*';
+    inp.style.display = 'none';
+    inp.onchange = () => {
+      const f = inp.files && inp.files[0];
+      if (f && f.type.startsWith('image/')) {
+        const reader = new FileReader();
+        const keepGif = f.type === 'image/gif' && f.size <= 4 * 1024 * 1024;
+        reader.onload = () => {
+          if (typeof reader.result === 'string') sendBg(reader.result, keepGif);
+        };
+        reader.readAsDataURL(f);
+      }
+      inp.remove();
+    };
+    (document.body || document.documentElement).appendChild(inp);
+    inp.click();
+  };
+  document.addEventListener('cederic:act', (e) => {
+    const d = e.detail;
+    if (!d) return;
+    if (d.cmd === 'pip') togglePip(!!d.preferCtx);
+    else if (d.cmd === 'pick_bg') openBgPicker();
+    else if (d.cmd === 'apply_bg' && d.url) sendBg(d.url, false);
+  });
+
+  if (location.hostname === 'www.youtube.com' || location.hostname === 'm.youtube.com') {
+    let lastPos = 0, lastRecover = 0;
+    setInterval(() => {
+      const v = document.querySelector('video');
+      if (v && v.currentTime > 1 && !v.paused) lastPos = v.currentTime;
+      const err = document.querySelector('.ytp-error');
+      if (err && err.offsetParent !== null && lastPos > 1 && Date.now() - lastRecover > 8000) {
+        lastRecover = Date.now();
+        const p = document.getElementById('movie_player');
+        if (p && typeof p.loadVideoById === 'function' && typeof p.getVideoData === 'function') {
+          const vd = p.getVideoData();
+          if (vd && vd.video_id) {
+            p.loadVideoById(vd.video_id, Math.max(0, lastPos - 0.5));
+            return;
+          }
+        }
+        const u = new URL(location.href);
+        if (u.pathname === '/watch' && u.searchParams.get('v')) {
+          u.searchParams.set('t', Math.floor(lastPos) + 's');
+          location.replace(u.toString());
+        }
+      }
+    }, 1000);
+  }
 })();
 "#;
 
@@ -429,6 +603,7 @@ enum UserEvent {
     Prewarm,
     /// Frame tick from the pacer while the UI animates.
     Frame,
+    FullscreenState(TabId, bool),
 }
 
 /// What the browser chrome (the native toolbar, menus) asks the browser to do.
@@ -467,6 +642,7 @@ enum ChromeCmd {
     ToggleBookmark,
     BookmarksMenu { x: f64, y: f64 },
     ThemeMenu { x: f64, y: f64 },
+    ToggleFullscreen,
 }
 
 /// Messages from the built-in New Tab page (accepted only while `tab.is_newtab` is true).
@@ -480,6 +656,12 @@ enum NewTabCmd {
     OpenBookmark { url: String },
     DeleteBookmark { url: String },
     SetBrand { brand: Brand },
+    SetBackground {
+        #[serde(default)]
+        data: String,
+        #[serde(default)]
+        strip: String,
+    },
     AutoKey { key: String },
 }
 
@@ -500,6 +682,8 @@ enum Shortcut {
     Pip,
     Bookmark,
     Bookmarks,
+    Fullscreen,
+    Escape,
 }
 
 impl Shortcut {
@@ -519,6 +703,8 @@ impl Shortcut {
             "pip" => Self::Pip,
             "bookmark" => Self::Bookmark,
             "bookmarks" => Self::Bookmarks,
+            "fullscreen" => Self::Fullscreen,
+            "escape" => Self::Escape,
             _ => return None,
         })
     }
@@ -578,6 +764,10 @@ enum MenuAction {
     ToggleBookmark,
     DeleteBookmark(String),
     SetBrand(Brand),
+    ChooseBackground,
+    SetBackgroundUrl(String),
+    ClearBackground,
+    ToggleFullscreen,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -596,18 +786,102 @@ struct PrefsData {
 
 struct Prefs {
     path: PathBuf,
+    data_dir: PathBuf,
     brand: Brand,
     bookmarks: Vec<Bookmark>,
+    bg_cederic: Option<String>,
+    strip_cederic: Option<Pixmap>,
+    bg_uzaki: Option<String>,
+    strip_uzaki: Option<Pixmap>,
 }
 
 impl Prefs {
     fn open(data_dir: &std::path::Path) -> Self {
         let path = data_dir.join("prefs.json");
+        let legacy_bg_path = data_dir.join("background.txt");
+        let legacy_strip_path = data_dir.join("background_strip.png");
+        let cederic_bg_path = data_dir.join("background_cederic.txt");
+        let cederic_strip_path = data_dir.join("background_strip_cederic.png");
+
+        if legacy_bg_path.exists() && !cederic_bg_path.exists() {
+            let _ = std::fs::rename(&legacy_bg_path, &cederic_bg_path);
+        }
+        if legacy_strip_path.exists() && !cederic_strip_path.exists() {
+            let _ = std::fs::rename(&legacy_strip_path, &cederic_strip_path);
+        }
+
+        let uzaki_bg_path = data_dir.join("background_uzaki.txt");
+        let uzaki_strip_path = data_dir.join("background_strip_uzaki.png");
+
         let data: PrefsData = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        Self { path, brand: data.brand, bookmarks: data.bookmarks }
+
+        let bg_cederic = std::fs::read_to_string(&cederic_bg_path)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let strip_cederic = std::fs::read(&cederic_strip_path)
+            .ok()
+            .and_then(|b| Pixmap::decode_png(&b).ok());
+
+        let bg_uzaki = std::fs::read_to_string(&uzaki_bg_path)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let strip_uzaki = std::fs::read(&uzaki_strip_path)
+            .ok()
+            .and_then(|b| Pixmap::decode_png(&b).ok());
+
+        Self {
+            path,
+            data_dir: data_dir.to_path_buf(),
+            brand: data.brand,
+            bookmarks: data.bookmarks,
+            bg_cederic,
+            strip_cederic,
+            bg_uzaki,
+            strip_uzaki,
+        }
+    }
+
+    fn background(&self) -> Option<&str> {
+        self.background_for(self.brand)
+    }
+
+    fn background_for(&self, brand: Brand) -> Option<&str> {
+        match brand {
+            Brand::Cederic => self.bg_cederic.as_deref(),
+            Brand::Uzaki => self.bg_uzaki.as_deref(),
+        }
+    }
+
+    fn bg_strip(&self) -> Option<Pixmap> {
+        self.bg_strip_for(self.brand)
+    }
+
+    fn bg_strip_for(&self, brand: Brand) -> Option<Pixmap> {
+        match brand {
+            Brand::Cederic => self.strip_cederic.clone(),
+            Brand::Uzaki => self.strip_uzaki.clone(),
+        }
+    }
+
+    fn bg_path(&self, brand: Brand) -> PathBuf {
+        let suffix = match brand {
+            Brand::Cederic => "cederic",
+            Brand::Uzaki => "uzaki",
+        };
+        self.data_dir.join(format!("background_{suffix}.txt"))
+    }
+
+    fn strip_path(&self, brand: Brand) -> PathBuf {
+        let suffix = match brand {
+            Brand::Cederic => "cederic",
+            Brand::Uzaki => "uzaki",
+        };
+        self.data_dir.join(format!("background_strip_{suffix}.png"))
     }
 
     fn save(&self) {
@@ -619,6 +893,58 @@ impl Prefs {
             }
             if std::fs::write(&tmp, json).is_ok() {
                 let _ = std::fs::rename(&tmp, &self.path);
+            }
+        }
+    }
+
+    fn set_background(&mut self, brand: Brand, data: Option<String>, strip_png: Option<&str>) {
+        let bg_path = self.bg_path(brand);
+        let strip_path = self.strip_path(brand);
+        let clean = data
+            .map(|s| s.trim().to_owned())
+            .filter(|s| s.starts_with("data:image/") || s.starts_with("https://") || s.starts_with("http://"));
+
+        if let Some(bg) = clean {
+            if let Some(p) = bg_path.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = std::fs::write(&bg_path, &bg);
+            let strip_pm = if let Some(b64) = strip_png.map(str::trim).filter(|s| !s.is_empty()) {
+                let raw = b64.strip_prefix("data:image/png;base64,").unwrap_or(b64);
+                if let Some(bytes) = favicons::base64_decode(raw)
+                    && let Ok(pm) = Pixmap::decode_png(&bytes)
+                {
+                    let _ = std::fs::write(&strip_path, &bytes);
+                    Some(pm)
+                } else {
+                    None
+                }
+            } else {
+                let _ = std::fs::remove_file(&strip_path);
+                None
+            };
+            match brand {
+                Brand::Cederic => {
+                    self.bg_cederic = Some(bg);
+                    self.strip_cederic = strip_pm;
+                }
+                Brand::Uzaki => {
+                    self.bg_uzaki = Some(bg);
+                    self.strip_uzaki = strip_pm;
+                }
+            }
+        } else {
+            let _ = std::fs::remove_file(&bg_path);
+            let _ = std::fs::remove_file(&strip_path);
+            match brand {
+                Brand::Cederic => {
+                    self.bg_cederic = None;
+                    self.strip_cederic = None;
+                }
+                Brand::Uzaki => {
+                    self.bg_uzaki = None;
+                    self.strip_uzaki = None;
+                }
             }
         }
     }
@@ -711,10 +1037,17 @@ struct Tab {
     thumb: Option<Pixmap>,
 }
 
+static LOGO_DATA_URI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("data:image/png;base64,{}", base64_encode(include_bytes!("ui/logo_64.png")))
+});
+
 #[derive(Serialize)]
 struct NewTabState<'a> {
     brand: Brand,
     bookmarks: &'a [Bookmark],
+    history: &'a [HistoryEntry],
+    background: Option<&'a str>,
+    logo: &'a str,
 }
 
 struct Devtools {
@@ -768,6 +1101,10 @@ struct Browser {
     suggestions: Vec<Suggestion>,
     devtools: Devtools,
     clipboard: Option<arboard::Clipboard>,
+    fullscreen: bool,
+    html_fullscreen: bool,
+    surface_size: (u32, u32),
+    last_title: String,
 }
 
 impl Browser {
@@ -776,11 +1113,15 @@ impl Browser {
     }
 
     fn top_bar_height(&self) -> f64 {
-        CHROME_HEIGHT
+        if self.fullscreen {
+            0.0
+        } else {
+            CHROME_HEIGHT
+        }
     }
 
     fn devtools_width(&self) -> f64 {
-        if !self.devtools.open || self.devtools.view.is_none() {
+        if self.fullscreen || !self.devtools.open || self.devtools.view.is_none() {
             return 0.0;
         }
         let w = self.logical_size().width;
@@ -828,8 +1169,10 @@ impl Browser {
         let mut builder = WebViewBuilder::new_with_web_context(&mut self.context)
             .with_bounds(bounds)
             .with_visible(false)
+            .with_user_agent(USER_AGENT)
+            .with_initialization_script(STEALTH_SCRIPT)
             .with_initialization_script(format!(
-                "Object.defineProperty(window, '__cedericTab', {{ value: {id} }}); window.__cedericBrand = {brand_key:?};"
+                "if (window === window.top && location.hostname === 'search.brave.com') window.__cedericBrand = {brand_key:?};"
             ))
             .with_initialization_script(SHORTCUT_SCRIPT)
             .with_initialization_script(BRAND_SCRIPT)
@@ -838,8 +1181,14 @@ impl Browser {
             .with_devtools(true)
             .with_hotkeys_zoom(true)
             .with_general_autofill_enabled(false)
-            .with_background_throttling(BackgroundThrottlingPolicy::Suspend)
-            .with_permission_handler(|_kind| PermissionResponse::Deny)
+            .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
+            .with_permission_handler(|kind| match kind {
+                PermissionKind::Microphone
+                | PermissionKind::Camera
+                | PermissionKind::Geolocation
+                | PermissionKind::Notifications => PermissionResponse::Deny,
+                _ => PermissionResponse::Allow,
+            })
             .with_navigation_handler(move |nav_url| {
                 if let Some(https_url) = input::upgrade_to_https(&nav_url) {
                     let _ = p_nav.send_event(UserEvent::UpgradeHttps(id, https_url));
@@ -863,6 +1212,10 @@ impl Browser {
                     let _ = p_ipc.send_event(UserEvent::PipState(id, true));
                 } else if body == "pip_off" {
                     let _ = p_ipc.send_event(UserEvent::PipState(id, false));
+                } else if body == "fs_on" {
+                    let _ = p_ipc.send_event(UserEvent::FullscreenState(id, true));
+                } else if body == "fs_off" {
+                    let _ = p_ipc.send_event(UserEvent::FullscreenState(id, false));
                 } else if let Some(s) = Shortcut::parse(body) {
                     let _ = p_ipc.send_event(UserEvent::Shortcut(s));
                 } else if let Ok(cmd) = serde_json::from_str::<NewTabCmd>(body) {
@@ -930,6 +1283,9 @@ impl Browser {
         if idx >= self.tabs.len() {
             return;
         }
+        if idx == self.active && self.html_fullscreen {
+            self.set_fullscreen(false, true);
+        }
         let was_active = idx == self.active;
         if self.tabs.len() == 1 {
             // Last tab: open the replacement first so the window is never empty.
@@ -995,6 +1351,9 @@ impl Browser {
 
     fn switch_to(&mut self, idx: usize) {
         if idx < self.tabs.len() && idx != self.active {
+            if self.html_fullscreen {
+                self.set_fullscreen(false, true);
+            }
             let previous = self.tabs[self.active].id;
             self.active = idx;
             self.show_active();
@@ -1006,9 +1365,9 @@ impl Browser {
     /// bare window never shows through for a frame.
     fn hide_tab(&self, id: TabId) {
         if let Some(t) = self.index_of(id).map(|i| &self.tabs[i]) {
-            if t.pip {
-                // Keep a tab with active Picture-in-Picture alive and decoding frames while
-                // parked outside the visible client area, so switching tabs never freezes PiP.
+            if t.pip || t.url.contains("youtube.com") || t.url.contains("youtu.be") {
+                // Keep a tab with active Picture-in-Picture or YouTube playback alive while
+                // parked outside the visible client area, so switching tabs never drops video/audio.
                 let _ = t.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             } else {
                 let _ = t.view.set_visible(false);
@@ -1078,6 +1437,9 @@ impl Browser {
         let state = NewTabState {
             brand: prefs.brand,
             bookmarks: &prefs.bookmarks,
+            history: history.entries(),
+            background: prefs.background(),
+            logo: LOGO_DATA_URI.as_str(),
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -1110,6 +1472,13 @@ impl Browser {
             bookmarked: self.prefs.is_bookmarked(&tab.url),
             brand,
         };
+        if tab.is_newtab {
+            Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+        }
+        let title = if tab.title.is_empty() { "Persona" } else { &tab.title };
+        if title != self.last_title {
+            self.window.set_title(&format!("{title} - Persona"));
+            self.last_title = title.to_owned();
         let brand_name = brand.name();
         let title = if tab.title.is_empty() { brand_name } else { &tab.title };
         let full_title = format!("{title} - {brand_name}");
@@ -1207,6 +1576,8 @@ impl Browser {
         let active = self.active_tab().map(|t| t.id) == Some(id);
         if !active
             && let Some(cur) = self.active_tab()
+            && !cur.url.contains("youtube.com")
+            && !cur.url.contains("youtu.be")
         {
             let _ = self.thumbs_tx.send(thumbs::Request::Capture(cur.id));
         }
@@ -1336,16 +1707,40 @@ impl Browser {
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
-    /// Theme & persona dropdown under the palette button: switch between Cederic (Orange) and Uzaki (Slate Blue).
+    /// Theme & persona dropdown under the palette button: switch between Cederic (Orange) and Uzaki (Slate Blue),
+    /// or choose / clear a custom background image.
     fn theme_menu(&mut self, right: f64, y: f64) {
         let cur = self.prefs.brand;
         let c_check = if cur == Brand::Cederic { "✓  Cederic (Orange)" } else { "   Cederic (Orange)" };
         let u_check = if cur == Brand::Uzaki { "✓  Uzaki (Slate Blue)" } else { "   Uzaki (Slate Blue)" };
+        let has_bg = self.prefs.background().is_some();
+        let bg_label = if has_bg {
+            format!("Change {} background image…", cur.name())
+        } else {
+            format!("Set {} background image…", cur.name())
+        };
+        let rm_label = format!("Remove {} background image", cur.name());
         let items = vec![
             MenuItem::new(c_check, MenuAction::SetBrand(Brand::Cederic)).hint("Default"),
             MenuItem::new(u_check, MenuAction::SetBrand(Brand::Uzaki)).hint("Slate Blue"),
+            MenuItem::sep(),
+            MenuItem::new(bg_label, MenuAction::ChooseBackground),
+            MenuItem::new(rm_label, MenuAction::ClearBackground).enabled(has_bg),
         ];
         self.show_menu(items, (right - 248.0).max(0.0), y);
+    }
+
+    fn apply_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
+        let brand = self.prefs.brand;
+        self.prefs.set_background(brand, data, strip_png);
+        self.toolbar.set_background(self.prefs.bg_strip());
+        self.sync_all_newtabs();
+        self.sync_ui();
+    }
+
+    fn choose_background(&mut self) {
+        let js = "document.dispatchEvent(new CustomEvent('cederic:act', { detail: { cmd: 'pick_bg' } }))";
+        self.with_active(|v| v.evaluate_script(js));
     }
 
     fn set_brand(&mut self, brand: Brand) {
@@ -1355,6 +1750,7 @@ impl Browser {
         self.prefs.brand = brand;
         self.prefs.save();
         self.toolbar.set_theme(self.dark, brand);
+        self.toolbar.set_background(self.prefs.bg_strip());
         self.popups.set_theme(self.dark, brand);
         let bg = self.newtab_color();
         let brand_key = if brand == Brand::Uzaki { "uzaki" } else { "cederic" };
@@ -1394,7 +1790,8 @@ impl Browser {
         }
         if !r.image.is_empty() {
             items.push(MenuItem::new("Open image in new tab", MenuAction::OpenBackground(r.image.clone())));
-            items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image)));
+            items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image.clone())));
+            items.push(MenuItem::new("Set image as background", MenuAction::SetBackgroundUrl(r.image)));
             items.push(MenuItem::sep());
         }
         if r.video || r.pip || tab.pip {
@@ -1420,6 +1817,8 @@ impl Browser {
         items.push(MenuItem::sep());
         items.push(MenuItem::new("View page source", MenuAction::ViewSource).enabled(web));
         items.push(MenuItem::new("Inspect", MenuAction::Inspect).hint("F12"));
+        let fs_label = if self.fullscreen { "Exit Full Screen" } else { "Full Screen" };
+        items.push(MenuItem::new(fs_label, MenuAction::ToggleFullscreen).hint("F11"));
 
         // Page coordinates are CSS pixels of the (possibly zoomed) page.
         let zoom = r.dpr / self.window.scale_factor();
@@ -1493,6 +1892,16 @@ impl Browser {
                 }
             }
             MenuAction::SetBrand(brand) => self.set_brand(brand),
+            MenuAction::ChooseBackground => self.choose_background(),
+            MenuAction::SetBackgroundUrl(url) => {
+                self.apply_background(Some(url.clone()), None);
+                if let Ok(u) = serde_json::to_string(&url) {
+                    let js = format!("document.dispatchEvent(new CustomEvent('cederic:act', {{ detail: {{ cmd: 'apply_bg', url: {u} }} }}))");
+                    self.with_active(|v| v.evaluate_script(&js));
+                }
+            }
+            MenuAction::ClearBackground => self.apply_background(None, None),
+            MenuAction::ToggleFullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
         }
     }
 
@@ -1544,7 +1953,34 @@ impl Browser {
         self.popups.hide(PopupKind::Suggest);
     }
 
-    // ---------- Picture-in-Picture & DevTools ----------
+    // ---------- Fullscreen, Picture-in-Picture & DevTools ----------
+
+    fn toggle_fullscreen(&mut self) {
+        let next = !self.fullscreen;
+        self.set_fullscreen(next, false);
+    }
+
+    fn set_fullscreen(&mut self, on: bool, is_html: bool) {
+        if self.fullscreen == on {
+            return;
+        }
+        self.fullscreen = on;
+        self.html_fullscreen = on && is_html;
+        if on {
+            self.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        } else {
+            self.window.set_fullscreen(None);
+            if !is_html {
+                let js = "if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document).catch(() => {}); }";
+                self.with_active(|v| v.evaluate_script(js));
+            }
+        }
+        self.close_menu();
+        self.close_suggest();
+        self.hide_preview();
+        self.layout();
+        self.sync_ui();
+    }
 
     fn toggle_pip(&mut self, target: Option<TabId>, prefer_ctx: bool) {
         let id = target.or_else(|| {
@@ -1562,12 +1998,8 @@ impl Browser {
             let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             let _ = self.tabs[i].view.set_visible(true);
         }
-        let js = format!("window.__cedericTogglePip && window.__cedericTogglePip({prefer_ctx})");
-        if devtools::port(&self.data_dir).is_some() {
-            let _ = self.thumbs_tx.send(thumbs::Request::EvalGesture(id, js));
-        } else {
-            let _ = self.tabs[i].view.evaluate_script(&js);
-        }
+        let js = format!("document.dispatchEvent(new CustomEvent('cederic:act', {{ detail: {{ cmd: 'pip', preferCtx: {prefer_ctx} }} }}))");
+        let _ = self.tabs[i].view.evaluate_script(&js);
     }
 
     fn toggle_devtools(&mut self) {
@@ -1640,6 +2072,7 @@ impl Browser {
                     .with_background_color(if self.dark { (36, 36, 36, 255) } else { (255, 255, 255, 255) })
                     .with_initialization_script(DEVTOOLS_SCRIPT)
                     .with_additional_browser_args(BROWSER_ARGS)
+                    .with_user_agent(USER_AGENT)
                     .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
                     .with_ipc_handler(move |req| {
                         if req.body() == "devtools" {
@@ -1701,7 +2134,12 @@ impl Browser {
             ChromeCmd::HistoryMenu { x, y } => self.history_menu(x, y),
             ChromeCmd::TabHover { id, x, y } => self.show_preview(id, x, y),
             ChromeCmd::TabHoverEnd => self.hide_preview(),
-            ChromeCmd::Dismiss => self.close_menu(),
+            ChromeCmd::Dismiss => {
+                if self.fullscreen {
+                    self.set_fullscreen(false, false);
+                }
+                self.close_menu();
+            }
             ChromeCmd::Query { text, x, y, w } => self.query(text, x, y, w),
             ChromeCmd::SuggestSelect { index } => {
                 self.popups.select(PopupKind::Suggest, index);
@@ -1729,6 +2167,7 @@ impl Browser {
             ChromeCmd::ToggleBookmark => self.toggle_bookmark(),
             ChromeCmd::BookmarksMenu { x, y } => self.bookmarks_menu(x, y),
             ChromeCmd::ThemeMenu { x, y } => self.theme_menu(x, y),
+            ChromeCmd::ToggleFullscreen => self.toggle_fullscreen(),
         }
     }
 
@@ -1766,7 +2205,17 @@ impl Browser {
             Shortcut::Back => self.handle_chrome(ChromeCmd::Back),
             Shortcut::Forward => self.handle_chrome(ChromeCmd::Forward),
             Shortcut::Devtools => self.toggle_devtools(),
+            Shortcut::Fullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
+            Shortcut::Escape => {
+                if self.fullscreen {
+                    self.set_fullscreen(false, false);
+                }
+                self.close_menu();
+                self.toolbar.blur_address();
+                self.window.request_redraw();
+            }
             Shortcut::Dismiss => {
+                // A click or focus in the page: close menus and stop editing the address bar.
                 // A click or Escape in the page: close menus and stop editing the address bar.
                 let active = self.popups.is_open(PopupKind::Menu) || self.toolbar.is_editing();
                 self.close_menu();
@@ -1785,6 +2234,12 @@ impl Browser {
     }
 
     fn handle_newtab(&mut self, id: TabId, cmd: NewTabCmd) {
+        if let NewTabCmd::SetBackground { data, strip } = cmd {
+            let d = (!data.trim().is_empty()).then_some(data);
+            let s = (!strip.trim().is_empty()).then_some(strip);
+            self.apply_background(d, s.as_deref());
+            return;
+        }
         if let Some(spare) = &self.spare
             && spare.id == id
         {
@@ -1836,6 +2291,7 @@ impl Browser {
                 }
             }
             NewTabCmd::SetBrand { brand } => self.set_brand(brand),
+            NewTabCmd::SetBackground { .. } => {}
         }
     }
 
@@ -1888,6 +2344,11 @@ impl Browser {
                         }
                     }
                     self.sync_ui();
+                }
+            }
+            UserEvent::FullscreenState(id, on) => {
+                if self.active_tab().map(|t| t.id) == Some(id) {
+                    self.set_fullscreen(on, true);
                 }
             }
             UserEvent::UpgradeHttps(id, https_url) => {
@@ -1988,6 +2449,15 @@ impl Browser {
                 let is_newtab = tab.is_newtab;
                 let view_ref = &tab.view;
                 if !started {
+                    if !tab.url.contains("youtube.com") && !tab.url.contains("youtu.be") {
+                        let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
+                    }
+                    let proxy = self.proxy.clone();
+                    let _ = tab.view.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
+                        if let Some(icon) = parse_favicon(&res) {
+                            let _ = proxy.send_event(UserEvent::Favicon(id, icon));
+                        }
+                    });
                     if !is_newtab {
                         let proxy = self.proxy.clone();
                         let _ = view_ref.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
@@ -2066,7 +2536,7 @@ impl Browser {
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f64>(self.window.scale_factor());
                 self.mouse = (p.x, p.y);
-                if p.y < CHROME_HEIGHT || self.toolbar.captures_mouse() {
+                if !self.fullscreen && (p.y < CHROME_HEIGHT || self.toolbar.captures_mouse()) {
                     let icon = self.toolbar.mouse_move(p.x as f32, p.y as f32);
                     self.set_cursor(icon);
                     self.devtools.hover = false;
@@ -2081,18 +2551,20 @@ impl Browser {
                 self.window.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
-                match state {
-                    ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
-                    ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => {
-                        self.toolbar.mouse_up(button, x, y)
+                if !self.fullscreen {
+                    let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
+                    match state {
+                        ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
+                        ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => {
+                            self.toolbar.mouse_up(button, x, y)
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                    if button == MouseButton::Left {
+                        self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
+                    }
+                    self.window.request_redraw();
                 }
-                if button == MouseButton::Left {
-                    self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
-                }
-                self.window.request_redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => {
@@ -2130,6 +2602,9 @@ impl Browser {
     /// pane) is put on screen: the rest of the window is covered by page windows, and painting
     /// under them would flicker.
     fn redraw(&mut self) {
+        if self.fullscreen {
+            return;
+        }
         let now = Instant::now();
         self.next_frame = self.toolbar.tick(now);
         self.flush_toolbar();
@@ -2144,6 +2619,12 @@ impl Browser {
         self.toolbar.render(&mut self.frame);
         let dt = self.devtools_width();
         let logical_w = self.logical_size().width;
+        let (w_u32, h_u32) = (w.get(), h.get());
+        if self.surface_size != (w_u32, h_u32) {
+            if self.surface.resize(w, h).is_err() {
+                return;
+            }
+            self.surface_size = (w_u32, h_u32);
         if self.surface_size != (w.get(), h.get()) {
             if self.surface.resize(w, h).is_err() {
                 return;
@@ -2220,6 +2701,37 @@ fn data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Cederic")
 }
 
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 0x3F) as usize] as char);
+        out.push(T[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn load_app_icon() -> Option<WinIcon> {
+    let pm = Pixmap::decode_png(include_bytes!("ui/logo_64.png")).ok()?;
+    let (w, h) = (pm.width(), pm.height());
+    let mut rgba = pm.data().to_vec();
+    for p in rgba.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        if a > 0 && a < 255 {
+            p[0] = ((p[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+            p[1] = ((p[1] as u32 * 255 + a / 2) / a).min(255) as u8;
+            p[2] = ((p[2] as u32 * 255 + a / 2) / a).min(255) as u8;
+        }
+    }
+    WinIcon::from_rgba(rgba, w, h).ok()
+}
+
 fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -2230,7 +2742,8 @@ fn main() -> wry::Result<()> {
 
     let window = Rc::new(
         WindowBuilder::new()
-        .with_title(brand.name())
+        .with_title("Persona")
+        .with_window_icon(load_app_icon())
         .with_decorations(false)
         .with_undecorated_shadow(true)
         .with_inner_size(LogicalSize::new(1280.0, 820.0))
@@ -2249,7 +2762,8 @@ fn main() -> wry::Result<()> {
 
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
-    let toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
+    let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
+    toolbar.set_background(prefs.bg_strip());
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
@@ -2313,6 +2827,10 @@ fn main() -> wry::Result<()> {
         suggestions: Vec::new(),
         devtools: Devtools { view: None, open: false, width: 520.0, tab: None, dragging: false, hover: false, seq: 0 },
         clipboard: None,
+        fullscreen: false,
+        html_fullscreen: false,
+        surface_size: (0, 0),
+        last_title: String::new(),
     };
     let start = std::env::args().nth(1).and_then(|a| {
         let resolved = input::resolve_with_info(&unmask(&a))?;
@@ -2415,5 +2933,50 @@ mod tests {
         assert!(matches!(Shortcut::parse("pip"), Some(Shortcut::Pip)));
         assert!(matches!(Shortcut::parse("bookmark"), Some(Shortcut::Bookmark)));
         assert!(matches!(Shortcut::parse("bookmarks"), Some(Shortcut::Bookmarks)));
+        assert!(matches!(Shortcut::parse("fullscreen"), Some(Shortcut::Fullscreen)));
+        assert!(matches!(Shortcut::parse("escape"), Some(Shortcut::Escape)));
+    }
+
+    #[test]
+    fn prefs_per_persona_custom_background() {
+        let dir = std::env::temp_dir().join(format!(
+            "cederic_bg_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut prefs = Prefs::open(&dir);
+        assert_eq!(prefs.brand, Brand::Cederic);
+        assert_eq!(prefs.background(), None);
+
+        // Set Cederic background
+        prefs.set_background(Brand::Cederic, Some("https://example.com/cederic.jpg".into()), None);
+        assert_eq!(prefs.background(), Some("https://example.com/cederic.jpg"));
+
+        // Switch to Uzaki: should not have a background yet
+        prefs.brand = Brand::Uzaki;
+        assert_eq!(prefs.background(), None);
+
+        // Set Uzaki background
+        prefs.set_background(Brand::Uzaki, Some("https://example.com/uzaki.png".into()), None);
+        assert_eq!(prefs.background(), Some("https://example.com/uzaki.png"));
+
+        // Switch back to Cederic: should still have Cederic background
+        prefs.brand = Brand::Cederic;
+        assert_eq!(prefs.background(), Some("https://example.com/cederic.jpg"));
+
+        // Reload prefs from disk: both backgrounds must be preserved
+        let reloaded = Prefs::open(&dir);
+        assert_eq!(reloaded.background_for(Brand::Cederic), Some("https://example.com/cederic.jpg"));
+        assert_eq!(reloaded.background_for(Brand::Uzaki), Some("https://example.com/uzaki.png"));
+
+        // Clear Uzaki background: Cederic must remain untouched
+        let mut reloaded = reloaded;
+        reloaded.set_background(Brand::Uzaki, None, None);
+        assert_eq!(reloaded.background_for(Brand::Uzaki), None);
+        assert_eq!(reloaded.background_for(Brand::Cederic), Some("https://example.com/cederic.jpg"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

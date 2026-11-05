@@ -299,7 +299,12 @@ impl Canvas<'_> {
     pub fn image(&mut self, img: &Pixmap, x: f32, y: f32, w: f32, h: f32, alpha: f32) {
         let sx = w * self.s / img.width() as f32;
         let sy = h * self.s / img.height() as f32;
-        let paint = PixmapPaint { opacity: alpha, quality: tiny_skia::FilterQuality::Bicubic, ..PixmapPaint::default() };
+        let quality = if w > 64.0 {
+            tiny_skia::FilterQuality::Bilinear
+        } else {
+            tiny_skia::FilterQuality::Bicubic
+        };
+        let paint = PixmapPaint { opacity: alpha, quality, ..PixmapPaint::default() };
         let t = Transform::from_row(sx, 0.0, 0.0, sy, x * self.s, y * self.s);
         self.pm.draw_pixmap(0, 0, img.as_ref(), &paint, t, None);
     }
@@ -315,6 +320,21 @@ impl Canvas<'_> {
         let color = TextColor::rgba(c.0, c.1, c.2, c.3);
         let data = self.pm.data_mut();
         buf.draw(&mut fonts.system, &mut fonts.cache, color, |gx, gy, gw, gh, col| {
+            if col.a() == 0 {
+                return;
+            }
+            let (cr, cg, cb, ca) = (col.r(), col.g(), col.b(), col.a() as f32 / 255.0);
+            for py in oy + gy..oy + gy + gh as i32 {
+                if py < 0 || py >= h {
+                    continue;
+                }
+                let row_offset = py as usize * w as usize;
+                for px in ox + gx..ox + gx + gw as i32 {
+                    if px < 0 || px >= w || px >= clip {
+                        continue;
+                    }
+                    let fade_a = if fade > 0.0 { ((clip - px) as f32 / fade_px).clamp(0.0, 1.0) } else { 1.0 };
+                    blend(data, row_offset + px as usize, cr, cg, cb, ca * fade_a);
             let ca = col.a();
             if ca == 0 {
                 return;
@@ -347,6 +367,26 @@ pub fn blend_px(data: &mut [u8], i: usize, c: TextColor) {
     blend_u8(data, i, c.r(), c.g(), c.b(), c.a() as u32);
 }
 
+/// Source-over blend of a straight-alpha color into premultiplied RGBA pixel `i`.
+#[inline(always)]
+fn blend(data: &mut [u8], i: usize, r: u8, g: u8, b: u8, a: f32) {
+    if a <= 0.001 {
+        return;
+    }
+    let p = &mut data[i * 4..i * 4 + 4];
+    if a >= 0.999 {
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
+        p[3] = 255;
+        return;
+    }
+    let alpha = (a * 256.0 + 0.5) as u32;
+    let inv = 256 - alpha;
+    p[0] = ((r as u32 * alpha + p[0] as u32 * inv) >> 8) as u8;
+    p[1] = ((g as u32 * alpha + p[1] as u32 * inv) >> 8) as u8;
+    p[2] = ((b as u32 * alpha + p[2] as u32 * inv) >> 8) as u8;
+    p[3] = ((255u32 * alpha + p[3] as u32 * inv) >> 8) as u8;
 /// Fast integer source-over blend of straight-alpha `(r, g, b, a)` into premultiplied RGBA pixel `i`.
 #[inline(always)]
 fn blend_u8(data: &mut [u8], i: usize, r: u8, g: u8, b: u8, a: u32) {

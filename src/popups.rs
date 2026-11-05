@@ -295,6 +295,12 @@ impl Popups {
         }
         let s = p.window.scale_factor() as f32;
         draw(&mut p.v, &mut p.pm, fonts, &th, s);
+        let (w_u32, h_u32) = (w.get(), h.get());
+        if p.surface_size != (w_u32, h_u32) {
+            if p.surface.resize(w, h).is_err() {
+                return;
+            }
+            p.surface_size = (w_u32, h_u32);
         if p.surface_size != (w.get(), h.get()) {
             if p.surface.resize(w, h).is_err() {
                 return;

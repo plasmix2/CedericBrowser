@@ -18,20 +18,52 @@
     font: 15px "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; transition: background-color .2s, color .2s; }
   body::before { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .55;
     background: radial-gradient(40% 35% at 30% 20%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 70%),
+      radial-gradient(35% 30% at 75% 75%, rgba(120, 90, 255, .18), transparent 70%);
+    animation: drift 18s ease-in-out infinite alternate;
+    will-change: transform; transform: translateZ(0); }
+  @keyframes drift { to { transform: translate(4%, -3%) scale(1.08); } }
+  #bg { position: fixed; inset: 0; z-index: 0; background-size: cover; background-position: center; background-repeat: no-repeat;
+    opacity: 0; transition: opacity .3s var(--ease); pointer-events: none;
+    will-change: opacity; transform: translateZ(0); }
+  #bg::after { content: ""; position: absolute; inset: 0;
+    background: radial-gradient(circle at center, rgba(10, 12, 18, .18) 0%, rgba(10, 12, 18, .54) 100%); }
+  :root[data-has-bg="1"] #bg { opacity: 1; }
+  :root[data-has-bg="1"] body::before { opacity: 0; }
+  :root[data-has-bg="1"] h1 { color: #f6f7fb; text-shadow: 0 4px 24px rgba(0, 0, 0, .55); }
+  :root[data-has-bg="1"] p { color: rgba(240, 242, 248, .85); text-shadow: 0 2px 10px rgba(0, 0, 0, .6); }
+  :root[data-has-bg="1"] kbd { border-color: rgba(255, 255, 255, .28); background: rgba(15, 17, 24, .45); color: #f6f7fb; }
+  :root[data-has-bg="1"] input,
+  :root[data-has-bg="1"] .bm,
+  :root[data-has-bg="1"] .top-pill { background: color-mix(in srgb, var(--field) 76%, transparent);
+    backdrop-filter: blur(16px) saturate(1.25); -webkit-backdrop-filter: blur(16px) saturate(1.25); }
+  body.drag-over::after { content: "Drop image to set browser background"; position: fixed; inset: 14px; z-index: 10;
+    border: 2px dashed var(--accent); border-radius: 18px; background: color-mix(in srgb, var(--bg) 72%, transparent);
+    backdrop-filter: blur(8px); display: grid; place-items: center; color: var(--fg);
+    font: 600 18px "Segoe UI Variable Display", "Segoe UI", system-ui; pointer-events: none; }
+  #top-bar { position: fixed; top: 18px; right: 20px; z-index: 2; display: inline-flex; align-items: center; gap: 8px; }
+  .top-pill { display: inline-flex; align-items: center; gap: 7px; height: 34px; padding: 0 13px; border-radius: 17px;
+    border: 1px solid var(--border); background: var(--field); color: var(--dim);
+    font: 12.5px "Segoe UI Variable Text", "Segoe UI", system-ui; cursor: pointer; user-select: none;
       radial-gradient(35% 30% at 75% 75%, rgba(120, 90, 255, .18), transparent 70%); }
   #theme-btn { position: fixed; top: 18px; right: 20px; z-index: 2; display: inline-flex; align-items: center; gap: 8px;
     height: 34px; padding: 0 14px; border-radius: 17px; border: 1px solid var(--border); background: var(--field);
     color: var(--dim); font: 12.5px "Segoe UI Variable Text", "Segoe UI", system-ui; cursor: pointer;
     transition: border-color .2s, color .2s, transform .2s var(--ease); }
-  #theme-btn:hover { border-color: var(--accent); color: var(--fg); transform: translateY(-1px); }
+  .top-pill:hover { border-color: var(--accent); color: var(--fg); transform: translateY(-1px); }
+  .top-pill svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+  #bg-clear { display: none; width: 34px; padding: 0; justify-content: center; font-size: 16px; line-height: 1; }
+  :root[data-has-bg="1"] #bg-clear { display: inline-flex; }
   #theme-btn .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
-  main { position: relative; min-height: 100%; display: grid; place-content: center; justify-items: center;
+  main { position: relative; z-index: 1; min-height: 100%; display: grid; place-content: center; justify-items: center;
     gap: 24px; padding: 16px; text-align: center; }
   main > * { animation: rise .55s var(--ease) both; }
   main > :nth-child(2) { animation-delay: .06s; }
   main > :nth-child(3) { animation-delay: .10s; }
   main > :nth-child(4) { animation-delay: .14s; }
   @keyframes rise { from { opacity: 0; transform: translateY(14px) scale(.98); } }
+  .hero { display: inline-flex; align-items: center; gap: 14px; }
+  #app-logo { width: 52px; height: 52px; border-radius: 14px; object-fit: cover; display: none;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .28); border: 1.5px solid var(--border); }
   h1 { margin: 0; font: 650 48px "Segoe UI Variable Display", "Segoe UI", system-ui; letter-spacing: -1.5px; }
   h1 span { color: var(--accent); }
   form { position: relative; width: min(640px, calc(100vw - 32px)); }
@@ -62,9 +94,21 @@
 </style>
 </head>
 <body>
-<button id="theme-btn" type="button" title="Switch between Cederic and Uzaki theme"><span class="dot"></span><span id="theme-lbl">Theme: Cederic</span></button>
+<div id="bg"></div>
+<div id="top-bar">
+  <label id="bg-btn" class="top-pill" for="bg-file" title="Choose a background image from your computer (or drag &amp; drop an image anywhere)">
+    <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="M21 15l-4.5-4.5a1.5 1.5 0 0 0-2.1 0L6 19"/></svg>
+    <span id="bg-lbl">Background</span>
+  </label>
+  <input id="bg-file" type="file" accept="image/*" hidden>
+  <button id="bg-clear" class="top-pill" type="button" title="Remove background image">×</button>
+  <button id="theme-btn" class="top-pill" type="button" title="Switch between Cederic and Uzaki persona"><span class="dot"></span><span id="theme-lbl">Persona: Cederic</span></button>
+</div>
 <main>
-  <h1 id="brand"><b id="brand-name" style="font-weight:inherit">Cederic</b><span>.</span></h1>
+  <div class="hero">
+    <img id="app-logo" alt="Persona">
+    <h1 id="brand"><b id="brand-name" style="font-weight:inherit">Cederic</b><span>.</span></h1>
+  </div>
   <form id="f">
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
     <input id="q" placeholder="Search the web" autocomplete="off">
@@ -73,8 +117,98 @@
   <p><kbd>Ctrl T</kbd> new tab &nbsp; <kbd>Ctrl L</kbd> address bar &nbsp; <kbd>Ctrl D</kbd> bookmark &nbsp; <kbd>Ctrl B</kbd> bookmarks &nbsp; <kbd>Ctrl H</kbd> history &nbsp; <kbd>Alt P</kbd> PiP &nbsp; <kbd>F12</kbd> dev tools</p>
 </main>
 <script>
-  const send = (o) => window.ipc.postMessage(JSON.stringify(o));
+  const send = (o) => {
+    const s = JSON.stringify(o);
+    if (typeof window.__cedericSendIpc === 'function') window.__cedericSendIpc(s);
+    else if (window.ipc) window.ipc.postMessage(s);
+  };
   let curBrand = 'cederic';
+  let curBg = '';
+
+  const makeStripPng = (img) => {
+    try {
+      const sc = document.createElement('canvas');
+      sc.width = 640; sc.height = 84;
+      const sx = sc.getContext('2d');
+      const iw = img.naturalWidth || img.width || 640;
+      const ih = img.naturalHeight || img.height || 360;
+      const scale = Math.max(sc.width / iw, sc.height / ih);
+      const dw = iw * scale, dh = ih * scale;
+      sx.filter = 'blur(3px)';
+      sx.drawImage(img, (sc.width - dw) / 2, (sc.height - dh) * 0.2, dw, dh);
+      return sc.toDataURL('image/png');
+    } catch (_) {
+      return '';
+    }
+  };
+
+  const applyDataUrl = (rawUrl, keepRaw) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      let data = rawUrl;
+      if (!keepRaw) {
+        try {
+          const maxW = 1920, maxH = 1080;
+          let w = img.naturalWidth || 1920, h = img.naturalHeight || 1080;
+          const r = Math.min(1, maxW / w, maxH / h);
+          w = Math.max(1, Math.round(w * r));
+          h = Math.max(1, Math.round(h * r));
+          const c = document.createElement('canvas');
+          c.width = w; c.height = h;
+          c.getContext('2d').drawImage(img, 0, 0, w, h);
+          data = c.toDataURL('image/jpeg', 0.88);
+        } catch (_) {}
+      }
+      const strip = makeStripPng(img);
+      send({ nt: 'set_background', data, strip });
+    };
+    img.onerror = () => {
+      if (rawUrl) send({ nt: 'set_background', data: rawUrl, strip: '' });
+    };
+    img.src = rawUrl;
+  };
+
+  const handleFile = (file) => {
+    if (!file || !file.type.startsWith('image/')) return;
+    const reader = new FileReader();
+    const keepGif = file.type === 'image/gif' && file.size <= 4 * 1024 * 1024;
+    reader.onload = () => {
+      if (typeof reader.result === 'string') applyDataUrl(reader.result, keepGif);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  window.__cedericOpenBgPicker = () => document.getElementById('bg-file').click();
+  window.__cedericApplyBgUrl = (url) => applyDataUrl(url, false);
+
+  document.getElementById('bg-file').addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) handleFile(f);
+    e.target.value = '';
+  });
+  document.getElementById('bg-clear').addEventListener('click', () => {
+    send({ nt: 'set_background', data: '', strip: '' });
+  });
+  window.addEventListener('dragover', (e) => {
+    if (e.dataTransfer && [...e.dataTransfer.items].some((i) => i.kind === 'file')) {
+      e.preventDefault();
+      document.body.classList.add('drag-over');
+    }
+  });
+  window.addEventListener('dragleave', (e) => {
+    if (!e.relatedTarget || e.relatedTarget === document.documentElement) {
+      document.body.classList.remove('drag-over');
+    }
+  });
+  window.addEventListener('drop', (e) => {
+    document.body.classList.remove('drag-over');
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f && f.type.startsWith('image/')) {
+      e.preventDefault();
+      handleFile(f);
+    }
+  });
   document.getElementById('f').addEventListener('submit', (e) => {
     e.preventDefault();
     const q = document.getElementById('q').value.trim();
@@ -86,11 +220,32 @@
   window.renderNewTab = (s) => {
     curBrand = s.brand || 'cederic';
     document.documentElement.dataset.brand = curBrand;
-    const name = curBrand === 'uzaki' ? 'Uzaki' : 'Cederic';
-    document.getElementById('brand-name').textContent = name;
-    document.getElementById('theme-lbl').textContent = curBrand === 'uzaki' ? 'Theme: Uzaki (Slate Blue)' : 'Theme: Cederic';
+    const brandTitle = curBrand === 'uzaki' ? 'Uzaki' : 'Cederic';
+    document.getElementById('brand-name').textContent = brandTitle;
+    document.getElementById('theme-lbl').textContent = curBrand === 'uzaki' ? 'Persona: Uzaki (Slate Blue)' : 'Persona: Cederic';
+    if (s.logo) {
+      const logoEl = document.getElementById('app-logo');
+      if (!logoEl.src) logoEl.src = s.logo;
+      logoEl.style.display = 'block';
+    }
+    const bg = s.background || '';
+    if (bg !== curBg) {
+      curBg = bg;
+      const bgEl = document.getElementById('bg');
+      bgEl.style.backgroundImage = bg ? `url(${JSON.stringify(bg)})` : '';
+    }
+    document.getElementById('bg-btn').title = `Choose a ${brandTitle} background image from your computer (or drag & drop an image anywhere)`;
+    document.getElementById('bg-clear').title = `Remove ${brandTitle} background image`;
+    if (bg) {
+      document.documentElement.dataset.hasBg = '1';
+      document.getElementById('bg-lbl').textContent = `Change ${brandTitle} Background`;
+    } else {
+      delete document.documentElement.dataset.hasBg;
+      document.getElementById('bg-lbl').textContent = `${brandTitle} Background`;
+    }
     const box = document.getElementById('bms');
     box.textContent = '';
+    const frag = document.createDocumentFragment();
     for (const b of (s.bookmarks || [])) {
       if (window.__cedericPreconnect) window.__cedericPreconnect(b.url);
       const el = document.createElement('div');
@@ -110,8 +265,9 @@
       del.onclick = (e) => { e.stopPropagation(); send({ nt: 'delete_bookmark', url: b.url }); };
       el.onclick = () => send({ nt: 'open_bookmark', url: b.url });
       el.append(star, lbl, del);
-      box.append(el);
+      frag.append(el);
     }
+    box.append(frag);
   };
   send({ nt: 'ready' });
 </script>
