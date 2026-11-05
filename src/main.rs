@@ -11,6 +11,7 @@ mod popups;
 mod suggest;
 mod thumbs;
 mod toolbar;
+mod updater;
 
 use std::{
     collections::HashMap,
@@ -613,6 +614,7 @@ enum UserEvent {
     /// Frame tick from the pacer while the UI animates.
     Frame,
     FullscreenState(TabId, bool),
+    UpdateAvailable(updater::UpdateInfo),
 }
 
 /// What the browser chrome (the native toolbar, menus) asks the browser to do.
@@ -694,6 +696,8 @@ enum NewTabCmd {
         strip: String,
     },
     AutoKey { key: String },
+    ApplyUpdate { download_url: String },
+    DismissUpdate,
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -1371,6 +1375,14 @@ struct NewTabState<'a> {
     allow_notifications: bool,
     allow_microphone: bool,
     allow_geolocation: bool,
+    update_available: Option<UpdateInfoDto<'a>>,
+}
+
+#[derive(Serialize)]
+struct UpdateInfoDto<'a> {
+    version: &'a str,
+    tag: &'a str,
+    download_url: &'a str,
 }
 
 struct Devtools {
@@ -1430,6 +1442,7 @@ struct Browser {
     allow_notifications: std::sync::Arc<std::sync::atomic::AtomicBool>,
     allow_microphone: std::sync::Arc<std::sync::atomic::AtomicBool>,
     allow_geolocation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    available_update: Option<updater::UpdateInfo>,
 }
 
 impl Browser {
@@ -1738,7 +1751,7 @@ impl Browser {
             let _ = tab.view.set_bounds(bounds);
             let _ = tab.view.set_visible(true);
             if tab.is_newtab {
-                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+                Self::push_newtab_state(&tab.view, &self.prefs, &self.history, self.available_update.as_ref());
             } else {
                 let _ = tab.view.focus();
             }
@@ -1788,7 +1801,7 @@ impl Browser {
         }
     }
 
-    fn push_newtab_state(view: &WebView, prefs: &Prefs, history: &HistoryStore) {
+    fn push_newtab_state(view: &WebView, prefs: &Prefs, history: &HistoryStore, update: Option<&updater::UpdateInfo>) {
         let active = prefs.active_persona();
         let color = active.parsed_color();
         let personas = prefs
@@ -1822,6 +1835,11 @@ impl Browser {
             allow_notifications: prefs.permissions.notifications,
             allow_microphone: prefs.permissions.microphone,
             allow_geolocation: prefs.permissions.geolocation,
+            update_available: update.map(|u| UpdateInfoDto {
+                version: &u.version,
+                tag: &u.tag,
+                download_url: &u.download_url,
+            }),
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -1860,7 +1878,7 @@ impl Browser {
             badge_letter,
         };
         if tab.is_newtab {
-            Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+            Self::push_newtab_state(&tab.view, &self.prefs, &self.history, self.available_update.as_ref());
         }
         let title = if tab.title.is_empty() { &active_name } else { &tab.title };
         let full_title = format!("{title} - {active_name}");
@@ -2038,13 +2056,13 @@ impl Browser {
     fn sync_all_newtabs(&self) {
         for tab in &self.tabs {
             if tab.is_newtab {
-                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+                Self::push_newtab_state(&tab.view, &self.prefs, &self.history, self.available_update.as_ref());
             }
         }
         if let Some(spare) = &self.spare
             && spare.is_newtab
         {
-            Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
+            Self::push_newtab_state(&spare.view, &self.prefs, &self.history, self.available_update.as_ref());
         }
     }
 
@@ -2726,7 +2744,7 @@ impl Browser {
             && spare.id == id
         {
             if matches!(cmd, NewTabCmd::Ready) {
-                Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
+                Self::push_newtab_state(&spare.view, &self.prefs, &self.history, self.available_update.as_ref());
             }
             return;
         }
@@ -2736,7 +2754,7 @@ impl Browser {
         }
         match cmd {
             NewTabCmd::Ready => {
-                Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history);
+                Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history, self.available_update.as_ref());
                 self.ensure_chrome_focus();
             }
             NewTabCmd::AutoKey { key } => {
@@ -2799,6 +2817,17 @@ impl Browser {
             }
             NewTabCmd::SetBrand { brand } => self.set_brand(brand),
             NewTabCmd::SetBackground { .. } => {}
+            NewTabCmd::ApplyUpdate { download_url } => {
+                std::thread::spawn(move || {
+                    if let Err(err) = updater::apply_update_and_restart(&download_url) {
+                        eprintln!("Failed to apply update: {err}");
+                    }
+                });
+            }
+            NewTabCmd::DismissUpdate => {
+                self.available_update = None;
+                self.sync_all_newtabs();
+            }
         }
     }
 
@@ -2884,6 +2913,10 @@ impl Browser {
                 let _ = self.open_tab(Some(target), Some(self.active + 1), true);
             }
             UserEvent::Frame => self.window.request_redraw(),
+            UserEvent::UpdateAvailable(info) => {
+                self.available_update = Some(info);
+                self.sync_all_newtabs();
+            }
             UserEvent::Prewarm => {
                 if self.spare.is_none()
                     && let Ok(spare) = self.build_tab(None)
@@ -3364,6 +3397,7 @@ fn main() -> wry::Result<()> {
         allow_notifications,
         allow_microphone,
         allow_geolocation,
+        available_update: None,
     };
     let start = std::env::args().nth(1).and_then(|a| {
         let resolved = input::resolve_with_info(&unmask(&a))?;
@@ -3372,6 +3406,11 @@ fn main() -> wry::Result<()> {
     });
     browser.open_tab(start, None, true)?;
     browser.layout();
+
+    let p_update = browser.proxy.clone();
+    updater::check_on_startup(move |info| {
+        let _ = p_update.send_event(UserEvent::UpdateAvailable(info));
+    });
 
     event_loop.run(move |event, _, control_flow| {
         match event {

@@ -327,6 +327,23 @@
   </div>
 </div>
 
+<!-- Update Available Modal -->
+<div id="update-modal-backdrop" class="modal-backdrop">
+  <div class="modal-box" style="text-align: center; align-items: center; gap: 16px;">
+    <div style="width: 52px; height: 52px; border-radius: 50%; background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); display: grid; place-items: center;">
+      <svg viewBox="0 0 24 24" style="width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:6px;">
+      <h2 style="margin: 0; font-size: 20px; font-weight: 700;">Update Available</h2>
+      <p style="margin: 0; color: var(--dim); font-size: 13.5px; line-height: 1.4;">A newer version of Persona (<b id="update-version-label" style="color:var(--fg)"></b>) is available. Would you like to update now?</p>
+    </div>
+    <div class="modal-actions" style="width: 100%; justify-content: flex-end; gap: 10px; margin-top: 6px;">
+      <button id="update-cancel-btn" class="btn-subtle" type="button">Cancel</button>
+      <button id="update-confirm-btn" class="btn-primary" type="button">Update Now</button>
+    </div>
+  </div>
+</div>
+
 <main>
   <div class="hero">
     <img id="app-logo" alt="Persona">
@@ -620,6 +637,36 @@
     if (el) el.addEventListener('change', sendCurrentPermissions);
   });
 
+  // Update modal handling
+  let curUpdateUrl = '';
+
+  const showUpdateModal = (version, url) => {
+    curUpdateUrl = url;
+    const lbl = document.getElementById('update-version-label');
+    if (lbl) lbl.textContent = version;
+    const m = document.getElementById('update-modal-backdrop');
+    if (m) m.classList.add('open');
+  };
+
+  const closeUpdateModal = () => {
+    const m = document.getElementById('update-modal-backdrop');
+    if (m) m.classList.remove('open');
+  };
+
+  document.getElementById('update-cancel-btn').onclick = () => {
+    closeUpdateModal();
+    send({ nt: 'dismiss_update' });
+  };
+
+  document.getElementById('update-confirm-btn').onclick = () => {
+    const btn = document.getElementById('update-confirm-btn');
+    btn.textContent = 'Updating...';
+    btn.disabled = true;
+    send({ nt: 'apply_update', download_url: curUpdateUrl });
+  };
+
+  window.__personaShowUpdateModal = (version, url) => showUpdateModal(version, url);
+
   // Background pick / clear
   window.__cedericOpenBgPicker = () => document.getElementById('bg-file').click();
   window.__cedericApplyBgUrl = (url) => applyDataUrl(url, false);
@@ -694,6 +741,13 @@
     if (typeof s.allow_geolocation === 'boolean') {
       const el = document.getElementById('perm-geolocation');
       if (el) el.checked = s.allow_geolocation;
+    }
+
+    // Update notification
+    if (s.update_available && s.update_available.download_url) {
+      showUpdateModal(s.update_available.version, s.update_available.download_url);
+    } else {
+      closeUpdateModal();
     }
 
     // Dropdown list
