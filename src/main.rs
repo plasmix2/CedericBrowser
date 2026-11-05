@@ -647,6 +647,8 @@ enum ChromeCmd {
     BookmarksMenu { x: f64, y: f64 },
     ThemeMenu { x: f64, y: f64 },
     ToggleFullscreen,
+    /// Clears cookies and all site data in every tab: signs out of every account.
+    ClearSiteData,
     /// Tooltip centred under a toolbar button.
     Tip { text: String, x: f64, y: f64 },
     TipEnd,
@@ -794,6 +796,7 @@ enum MenuAction {
     SetBackgroundUrl(String),
     ClearBackground,
     ToggleFullscreen,
+    ClearSiteData,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1954,6 +1957,8 @@ impl Browser {
                     .map(|e| MenuItem::new(e.query.clone(), MenuAction::OpenUrl(e.url.clone())).hint("Anonymous")),
             );
         }
+        items.push(MenuItem::sep());
+        items.push(MenuItem::new("Clear cookies and site data", MenuAction::ClearSiteData).hint("Signs you out"));
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
@@ -2239,6 +2244,7 @@ impl Browser {
             }
             MenuAction::OpenUrl(url) => self.navigate_active(&url),
             MenuAction::ClearHistory => self.handle_chrome(ChromeCmd::ClearHistory),
+            MenuAction::ClearSiteData => self.handle_chrome(ChromeCmd::ClearSiteData),
             MenuAction::ToggleBookmark => self.toggle_bookmark(),
             MenuAction::DeleteBookmark(url) => {
                 if self.prefs.remove_bookmark(&url) {
@@ -2519,7 +2525,12 @@ impl Browser {
             ChromeCmd::Drag => {
                 let _ = self.window.drag_window();
             }
+            // Only the search history: cookies stay, so saved Google (and other) sign-ins survive.
             ChromeCmd::ClearHistory => {
+                self.history.clear();
+                self.sync_ui();
+            }
+            ChromeCmd::ClearSiteData => {
                 self.history.clear();
                 for t in &self.tabs {
                     let _ = t.view.clear_all_browsing_data();
@@ -3272,10 +3283,8 @@ fn main() -> wry::Result<()> {
             _ => ControlFlow::Wait,
         };
         if browser.quit {
+            // Search history is per session; cookies are kept so accounts stay signed in.
             browser.history.clear();
-            for t in &browser.tabs {
-                let _ = t.view.clear_all_browsing_data();
-            }
             *control_flow = ControlFlow::Exit;
         }
     });

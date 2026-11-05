@@ -48,6 +48,13 @@ struct Margins {
     b: f32,
 }
 
+/// The parts of a popup frame that only change with its size: the shadow and the rounded clip.
+struct Frame {
+    key: (u32, u32, u32, u32, u32, u32, bool),
+    shadow: Pixmap,
+    mask: Mask,
+}
+
 const NO_MARGIN: Margins = Margins { l: 0.0, t: 0.0, r: 0.0, b: 0.0 };
 
 /// Rounded, shadowed popups need a transparent window. `PERSONA_FLAT_POPUPS=1` falls back to plain
@@ -145,6 +152,7 @@ pub struct Popup {
     pm: Pixmap,
     /// The card's content at its own size, before it is clipped to the rounded shape.
     card: Pixmap,
+    frame: Option<Frame>,
     open: bool,
     /// Where to move the window once it has been repainted at its new size.
     pending_pos: Option<LogicalPosition<f64>>,
@@ -397,7 +405,7 @@ impl Popups {
             p.card = pm;
         }
         draw(&mut p.v, &mut p.card, fonts, &th, s);
-        compose(&p.card, &mut p.pm, margins(kind), corner_radius(kind), s, &th);
+        compose(&p.card, &mut p.pm, &mut p.frame, margins(kind), corner_radius(kind), s, &th);
         let (w_u32, h_u32) = (w.get(), h.get());
         if p.surface_size != (w_u32, h_u32) {
             if p.surface.resize(w, h).is_err() {
@@ -451,6 +459,7 @@ impl Popup {
             surface_size: (0, 0),
             pm: Pixmap::new(1, 1).expect("1x1 pixmap"),
             card: Pixmap::new(1, 1).expect("1x1 pixmap"),
+            frame: None,
             open: false,
             pending_pos: None,
             v: View {
@@ -620,37 +629,44 @@ fn window_bg(card: Rgba) -> (u8, u8, u8, u8) {
 
 /// Puts the card on the window pixmap: a soft drop shadow, the card clipped to a rounded
 /// rectangle, and a 1px border. Everything outside the card and its shadow stays transparent.
-fn compose(card: &Pixmap, out: &mut Pixmap, m: Margins, radius: f32, s: f32, th: &Theme) {
-    out.fill(tiny_skia::Color::TRANSPARENT);
+/// The shadow and clip mask are cached in `frame` and only rebuilt when the size changes, so an
+/// animation frame is a copy, a masked blit and a border stroke.
+fn compose(card: &Pixmap, out: &mut Pixmap, frame: &mut Option<Frame>, m: Margins, radius: f32, s: f32, th: &Theme) {
     let (x, y) = ((m.l * s).round(), (m.t * s).round());
     let (w, h) = (card.width() as f32, card.height() as f32);
     let r = radius * s;
-    if m != NO_MARGIN {
-        // No blur in tiny-skia: stack growing, fading rounded rectangles instead. The shadow sits
-        // a little low, as if lit from above.
-        let dark = th.fg.0 > 128;
-        // Equal-alpha layers growing outward stack into a smooth falloff away from the card.
-        let layers = 16;
-        let spread = ((m.b - 2.0) * s).max(1.0);
-        let drop = 2.0 * s;
-        let strength = if dark { 0.42 } else { 0.18 };
-        for i in 1..=layers {
-            let e = spread * i as f32 / layers as f32;
-            let alpha = strength / layers as f32;
-            if let Some(path) = rrect_path(x - e * 0.55, y - e * 0.3 + drop, w + e * 1.1, h + e * 0.8, [r + e * 0.6; 4]) {
-                let mut paint = Paint::default();
-                paint.set_color_rgba8(0, 0, 0, (alpha * 255.0).round().clamp(1.0, 255.0) as u8);
-                paint.anti_alias = true;
-                out.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    let dark = th.fg.0 > 128;
+    let key = (out.width(), out.height(), card.width(), card.height(), r.to_bits(), (m.l * s).to_bits() ^ (m.b * s).to_bits(), dark);
+    if frame.as_ref().is_none_or(|f| f.key != key) {
+        let (Some(mut shadow), Some(mut mask)) = (Pixmap::new(out.width(), out.height()), Mask::new(out.width(), out.height())) else {
+            return;
+        };
+        if m != NO_MARGIN {
+            // No blur in tiny-skia: equal-alpha layers growing outward stack into a smooth falloff.
+            // The shadow sits a little low, as if lit from above.
+            let layers = 16;
+            let spread = ((m.b - 2.0) * s).max(1.0);
+            let drop = 2.0 * s;
+            let strength = if dark { 0.42 } else { 0.18 };
+            for i in 1..=layers {
+                let e = spread * i as f32 / layers as f32;
+                let alpha = strength / layers as f32;
+                if let Some(path) = rrect_path(x - e * 0.55, y - e * 0.3 + drop, w + e * 1.1, h + e * 0.8, [r + e * 0.6; 4]) {
+                    let mut paint = Paint::default();
+                    paint.set_color_rgba8(0, 0, 0, (alpha * 255.0).round().clamp(1.0, 255.0) as u8);
+                    paint.anti_alias = true;
+                    shadow.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                }
             }
         }
+        if let Some(path) = rrect_path(x, y, w, h, [r; 4]) {
+            mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+        }
+        *frame = Some(Frame { key, shadow, mask });
     }
-    let shape = rrect_path(x, y, w, h, [r; 4]);
-    let mut mask = Mask::new(out.width(), out.height());
-    if let (Some(path), Some(mask)) = (&shape, mask.as_mut()) {
-        mask.fill_path(path, FillRule::Winding, true, Transform::identity());
-    }
-    out.draw_pixmap(x as i32, y as i32, card.as_ref(), &PixmapPaint::default(), Transform::identity(), mask.as_ref());
+    let Some(f) = frame.as_ref() else { return };
+    out.data_mut().copy_from_slice(f.shadow.data());
+    out.draw_pixmap(x as i32, y as i32, card.as_ref(), &PixmapPaint::default(), Transform::identity(), Some(&f.mask));
     // Border, inset half a pixel so the 1px line lands on whole pixels.
     if let Some(path) = rrect_path(x + 0.5, y + 0.5, w - 1.0, h - 1.0, [(r - 0.5).max(0.0); 4]) {
         let mut paint = Paint::default();
@@ -713,7 +729,7 @@ mod tests {
             draw(&mut v, &mut pm, &mut fonts, &th, s);
             let m = margins(Kind::Menu);
             let mut out = Pixmap::new(((w + m.l + m.r) * s) as u32, ((h + m.t + m.b) * s) as u32).unwrap();
-            compose(&pm, &mut out, m, corner_radius(Kind::Menu), s, &th);
+            compose(&pm, &mut out, &mut None, m, corner_radius(Kind::Menu), s, &th);
             out.save_png(dir.join(format!("{name}.png"))).unwrap();
         }
     }
@@ -753,5 +769,29 @@ mod tests {
                 *flow = ControlFlow::Exit;
             }
         });
+    }
+
+    /// Times one popup frame (draw + compose) at 2x: `cargo test --release bench_popup -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_popup() {
+        let mut fonts = Fonts::load();
+        let th = Theme::new(true);
+        let s = 2.0;
+        let items = (0..8).map(|i| MenuEntry { label: format!("Menu entry {i}"), hint: Some("Ctrl+X".into()), disabled: false, sep: false }).collect();
+        let content = Content::Menu(items);
+        let (rows, h) = layout(&mut fonts, &content, s);
+        let w = 248.0;
+        let mut v = View { hover_fade: vec![0.0; rows.len()], rows, content, size: (w, h), enter: 0.5, hover: Some(1), selected: 0, pressed: None };
+        let m = margins(Kind::Menu);
+        let mut card = Pixmap::new((w * s) as u32, (h * s) as u32).unwrap();
+        let mut out = Pixmap::new(((w + m.l + m.r) * s) as u32, ((h + m.t + m.b) * s) as u32).unwrap();
+        let mut cache = None;
+        let start = Instant::now();
+        for _ in 0..120 {
+            draw(&mut v, &mut card, &mut fonts, &th, s);
+            compose(&card, &mut out, &mut cache, m, corner_radius(Kind::Menu), s, &th);
+        }
+        println!("popup frame (draw + compose at 2x): {:?}", start.elapsed() / 120);
     }
 }
