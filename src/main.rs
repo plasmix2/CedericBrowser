@@ -97,7 +97,7 @@ const STEALTH_SCRIPT: &str = r#"
 /// Every WebView sharing a data directory must use identical arguments.
 const BROWSER_ARGS: &str = "\
     --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,UserAgentClientHint \
-    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,BackForwardCache,ParallelDownloading,CanvasOopRasterization \
+    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,BackForwardCache,ParallelDownloading,CanvasOopRasterization,PictureInPicture,PictureInPictureAPI,AutoPictureInPictureForVideoPlayback,BrowserInitiatedAutomaticPictureInPicture,MediaSessionEnterPictureInPicture \
     --disable-blink-features=AutomationControlled \
     --autoplay-policy=no-user-gesture-required \
     --enable-gpu-rasterization \
@@ -179,13 +179,17 @@ const SHORTCUT_SCRIPT: &str = r#"
   let ctxVideo = null;
   const videos = (root = document, out = []) => {
     for (const v of root.querySelectorAll('video')) out.push(v);
-    if (out.length) return out;
     for (const el of root.querySelectorAll('*')) {
       if (el.shadowRoot) videos(el.shadowRoot, out);
     }
+    for (const f of root.querySelectorAll('iframe')) {
+      try {
+        if (f.contentDocument) videos(f.contentDocument, out);
+      } catch (_) {}
+    }
     return out;
   };
-  const usable = (v) => v instanceof HTMLVideoElement && v.isConnected && (v.readyState >= 1 || v.videoWidth > 0 || !!(v.currentSrc || v.src));
+  const usable = (v) => v instanceof HTMLVideoElement && v.isConnected && (v.readyState >= 1 || v.videoWidth > 0 || !!(v.currentSrc || v.src || v.srcObject) || !v.paused);
   const videoAt = (x, y) => {
     for (const el of document.elementsFromPoint(x, y)) {
       if (usable(el)) return el;
@@ -210,7 +214,7 @@ const SHORTCUT_SCRIPT: &str = r#"
       const r = v.getBoundingClientRect();
       const area = Math.max(0, r.width) * Math.max(0, r.height);
       const playing = (!v.paused && !v.ended) ? 1e9 : 0;
-      return playing + (area || (v.videoWidth * v.videoHeight));
+      return playing + (area || (v.videoWidth * v.videoHeight) || 1);
     };
     list.sort((a, b) => score(b) - score(a));
     return list[0];
@@ -227,9 +231,19 @@ const SHORTCUT_SCRIPT: &str = r#"
       v.disablePictureInPicture = false;
       v.removeAttribute('disablepictureinpicture');
       v.addEventListener('leavepictureinpicture', () => post('pip_off'), { once: true });
-      await v.requestPictureInPicture();
-      post('pip_on');
-      return true;
+      try {
+        await v.requestPictureInPicture();
+        post('pip_on');
+        return true;
+      } catch (_) {
+        const pipBtn = document.querySelector('.ytp-pip-button, [aria-label*="Picture in picture" i], [title*="Picture in picture" i]');
+        if (pipBtn) {
+          pipBtn.click();
+          post('pip_on');
+          return true;
+        }
+        return false;
+      }
     } catch (_) {
       return false;
     }
@@ -272,27 +286,24 @@ const SHORTCUT_SCRIPT: &str = r#"
       togglePip(false).then((ok) => { if (!ok) post('pip'); });
       return;
     }
-    if (cmd) { e.preventDefault(); e.stopPropagation(); post(cmd); }
-  }, true);
-  // Popups never take focus, so a click or focus inside the page is what closes an open menu / address bar edit.
-  window.addEventListener('pointerdown', () => post('dismiss'), true);
-  window.addEventListener('focusin', () => post('dismiss'), true);
-    if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); return; }
+    if (cmd) { e.preventDefault(); e.stopPropagation(); post(cmd); return; }
     if (!e.ctrlKey && !e.altKey && !e.metaKey && (location.protocol === 'about:' || location.protocol === 'data:')) {
       const a = document.activeElement;
       const inField = a && a.closest && a.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])');
       if (!inField && (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Enter')) {
         e.preventDefault(); e.stopPropagation();
-        window.ipc.postMessage(JSON.stringify({ nt: 'auto_key', key: e.key }));
+        post(JSON.stringify({ nt: 'auto_key', key: e.key }));
       }
     }
   }, true);
-  // Popups never take focus, so a click in the page is what closes an open menu.
+
+  // Popups never take focus, so a click or focus inside the page is what closes an open menu / address bar edit.
   window.addEventListener('pointerdown', (e) => {
     const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
     if (a && a.href) preconnect(a.href);
-    window.ipc.postMessage('dismiss');
+    post('dismiss');
   }, true);
+  window.addEventListener('focusin', () => post('dismiss'), true);
 
   // Bubble phase: pages with their own context menu call preventDefault first and keep it.
   // Editable fields keep the engine's menu so cut/paste/spellcheck work.
@@ -302,10 +313,8 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (t && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
     e.preventDefault();
     const a = t && t.closest('a[href]'), img = t && t.closest('img');
-    ctxVideo = videoAt(e.clientX, e.clientY) || bestVideo(false);
-    post(JSON.stringify({
     ctxVideo = videoAt(e.clientX, e.clientY) || (document.querySelector('video') && bestVideo(false)) || null;
-    window.ipc.postMessage(JSON.stringify({
+    post(JSON.stringify({
       x: e.clientX, y: e.clientY, dpr: window.devicePixelRatio,
       link: a ? a.href : '', image: img ? (img.currentSrc || img.src) : '',
       selection: String(getSelection()).slice(0, 20000),
@@ -2437,6 +2446,7 @@ impl Browser {
         }
         self.fullscreen = on;
         self.html_fullscreen = on && is_html;
+        self.laid_out = (0, 0, 0.0);
         if on {
             self.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
         } else {
@@ -2469,6 +2479,7 @@ impl Browser {
             let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             let _ = self.tabs[i].view.set_visible(true);
         }
+        let _ = self.tabs[i].view.focus();
         let js = format!("document.dispatchEvent(new CustomEvent('cederic:act', {{ detail: {{ cmd: 'pip', preferCtx: {prefer_ctx} }} }}))");
         let _ = self.tabs[i].view.evaluate_script(&js);
     }
@@ -3392,10 +3403,6 @@ fn main() -> wry::Result<()> {
             _ => ControlFlow::Wait,
         };
         if browser.quit {
-            browser.history.clear();
-            for t in &browser.tabs {
-                let _ = t.view.clear_all_browsing_data();
-            }
             *control_flow = ControlFlow::Exit;
         }
     });
