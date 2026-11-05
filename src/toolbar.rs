@@ -117,6 +117,11 @@ struct TabVis {
     hover: f32,
     /// 0..1: how "selected" the tab looks; eases when the active tab changes.
     act: f32,
+    /// Velocities for the spring motion of `x` and `w`.
+    vx: f32,
+    vw: f32,
+    /// 0..1 progressive blur while a neighbouring tab is being dragged.
+    blur: f32,
     leaving: bool,
 }
 
@@ -164,6 +169,11 @@ pub struct Toolbar {
     /// 0..1 lift of the tab being dragged (and of the one just dropped, while it settles).
     lift: f32,
     lift_id: Option<TabId>,
+    /// The selected-tab shape: one shape that morphs (springs) from tab to tab, with its velocities.
+    sel: (f32, f32, f32, f32),
+    sel_init: bool,
+    /// Some tab or the selection shape is still moving: draw without pixel snapping.
+    moving: bool,
     spin: f32,
     icons: HashMap<String, Option<Pixmap>>,
     icon_requests: Vec<String>,
@@ -194,6 +204,42 @@ pub struct Toolbar {
     pub cmds: Vec<ChromeCmd>,
 }
 
+/// One step of a critically damped spring: eases to `target` without overshoot and carries its
+/// velocity over when the target moves, so motion never snaps or restarts. True while moving.
+fn damp(v: &mut f32, vel: &mut f32, target: f32, dt: f32, omega: f32) -> bool {
+    let x = *v - target;
+    let e = (-omega * dt).exp();
+    let tmp = *vel + omega * x;
+    *v = target + (x + tmp * dt) * e;
+    *vel = (*vel - omega * tmp * dt) * e;
+    if (*v - target).abs() < 0.02 && vel.abs() < 0.5 {
+        *v = target;
+        *vel = 0.0;
+        false
+    } else {
+        true
+    }
+}
+
+/// A damped spring with a little overshoot (`zeta` < 1), for the selection morph.
+fn spring(v: &mut f32, vel: &mut f32, target: f32, dt: f32, omega: f32, zeta: f32) -> bool {
+    let steps = 4;
+    let h = dt / steps as f32;
+    for _ in 0..steps {
+        let a = -omega * omega * (*v - target) - 2.0 * zeta * omega * *vel;
+        *vel += a * h;
+        *v += *vel * h;
+    }
+    if (*v - target).abs() < 0.02 && vel.abs() < 0.5 {
+        *v = target;
+        *vel = 0.0;
+        false
+    } else {
+        true
+    }
+}
+
+#[allow(dead_code)]
 fn approach(v: &mut f32, target: f32, k: f32) -> bool {
     let d = target - *v;
     if d.abs() < 0.25 {
@@ -281,6 +327,9 @@ impl Toolbar {
             star_pop: 0.0,
             lift: 0.0,
             lift_id: None,
+            sel: (0.0, 0.0, 0.0, 0.0),
+            sel_init: false,
+            moving: false,
             spin: 0.0,
             icons: HashMap::new(),
             icon_requests: Vec::new(),
@@ -371,7 +420,7 @@ impl Toolbar {
                 // New tabs start collapsed at their slot and grow in place.
                 let x = self.slot_x(i);
                 // New tabs start part-open (not from nothing) so opening one feels immediate.
-                self.vis.push(TabVis { id: *id, x, w: self.tab_w * 0.6, alpha: 0.9, hover: 0.0, act: if model.active == *id { 1.0 } else { 0.0 }, leaving: false });
+                self.vis.push(TabVis { id: *id, x, w: self.tab_w * 0.6, alpha: 0.9, hover: 0.0, act: if model.active == *id { 1.0 } else { 0.0 }, vx: 0.0, vw: 0.0, blur: 0.0, leaving: false });
                 fresh = true;
             }
         }
@@ -487,6 +536,12 @@ impl Toolbar {
     }
 
     // ---------- geometry ----------
+
+    /// A tab edge on screen: on the pixel grid when everything is still, exact while moving so the
+    /// motion is smooth rather than stepping a pixel at a time.
+    fn px(&self, v: f32) -> f32 {
+        if self.moving { v } else { self.snap(v) }
+    }
 
     fn snap(&self, v: f32) -> f32 {
         (v * self.s).round() / self.s
@@ -1169,9 +1224,9 @@ impl Toolbar {
         self.update_hover_card(now);
         self.update_tip(now);
         // Rates tuned so motion settles in ~0.2s and hover fades in ~0.12s.
-        let k = 1.0 - (-dt * if self.drag.as_ref().is_some_and(|d| d.active) { 36.0 } else { 32.0 }).exp();
         let kf = 1.0 - (-dt * 30.0).exp();
         let mut busy = false;
+        let mut moving = false;
 
         self.layout();
         let slots = self.slots();
@@ -1194,18 +1249,47 @@ impl Toolbar {
             let hovered = matches!(hover, Hit::Tab(id) | Hit::TabClose(id) if id == v.id);
             busy |= approach01(&mut v.hover, if hovered && v.id != active { 1.0 } else { 0.0 }, kf);
             if v.leaving {
-                busy |= approach(&mut v.w, 0.0, k);
+                moving |= damp(&mut v.w, &mut v.vw, 0.0, dt, 30.0);
                 busy |= approach01(&mut v.alpha, 0.0, kf);
                 continue;
             }
-            busy |= approach(&mut v.w, tab_w, k);
+            moving |= damp(&mut v.w, &mut v.vw, tab_w, dt, 26.0);
             busy |= approach01(&mut v.alpha, 1.0, kf);
             if Some(v.id) != drag_id
                 && let Some((_, tx)) = targets.iter().find(|(id, _)| *id == v.id)
             {
-                busy |= approach(&mut v.x, *tx, k);
+                moving |= damp(&mut v.x, &mut v.vx, *tx, dt, if drag_id.is_some() { 34.0 } else { 26.0 });
+            } else {
+                v.vx = 0.0;
             }
         }
+        // The selected-tab shape follows the active tab, springing (and overshooting a touch) when
+        // the active tab changes, so it looks like one shape morphing from tab to tab.
+        if let Some((tx, tw)) = self.vis.iter().find(|v| v.id == active && !v.leaving).map(|v| (v.x, v.w)) {
+            if !self.sel_init {
+                self.sel = (tx, tw, 0.0, 0.0);
+                self.sel_init = true;
+            } else {
+                moving |= spring(&mut self.sel.0, &mut self.sel.2, tx, dt, 30.0, 0.72);
+                moving |= spring(&mut self.sel.1, &mut self.sel.3, tw, dt, 30.0, 0.72);
+            }
+        }
+        // Progressive blur of the tabs around a dragged one: strongest next to it, easing off with
+        // the real distance (not the slot count), and eased in time so nothing pops.
+        let drag_c = self.lift_id.and_then(|l| self.vis.iter().find(|v| v.id == l)).map(|v| (v.x + v.w / 2.0, v.w));
+        let (lift, lift_id) = (self.lift, self.lift_id);
+        for v in &mut self.vis {
+            let target = match drag_c {
+                Some((dc, dw)) if Some(v.id) != lift_id && !v.leaving => {
+                    let gap = ((v.x + v.w / 2.0) - dc).abs() - (v.w + dw) / 2.0;
+                    0.88 * (-gap.max(0.0) / (tab_w * 1.25)).exp() * lift
+                }
+                _ => 0.0,
+            };
+            busy |= approach01(&mut v.blur, target, kf * 0.8);
+        }
+        self.moving = moving;
+        busy |= moving;
         self.vis.retain(|v| !(v.leaving && v.w < 0.5));
         busy |= drag_id.is_some();
 
@@ -1449,15 +1533,21 @@ impl Toolbar {
         // Leaving tabs underneath, then normal ones, then the active tab, then the dragged one on top.
         let mut idx: Vec<usize> = (0..self.vis.len()).collect();
         let lift_id = self.lift_id.filter(|_| self.lift > 0.01);
-        let drag_slot = lift_id.and_then(|l| slots.iter().position(|t| *t == l));
         idx.sort_by_key(|&i| {
             let v = &self.vis[i];
             (v.leaving as u8 == 0, v.id == active, Some(v.id) == lift_id)
         });
+        // The one selected-tab shape, morphing between tabs.
+        if self.sel_init && self.sel.1 > 1.0 {
+            let (sx, sw) = (self.px(self.sel.0), self.px(self.sel.0 + self.sel.1) - self.px(self.sel.0));
+            c.rrect_top(sx, TAB_Y, sw, TAB_H, 10.0, th.toolbar);
+            c.foot(sx - 10.0, TITLE_H, 10.0, false, th.toolbar);
+            c.foot(sx + sw, TITLE_H, 10.0, true, th.toolbar);
+        }
         for i in idx {
-            let (id, x, w, alpha, hover, leaving, act) = {
+            let (id, x, w, alpha, hover, leaving, act, blur) = {
                 let v = &self.vis[i];
-                (v.id, self.snap(v.x), self.snap(v.x + v.w) - self.snap(v.x), v.alpha, v.hover, v.leaving, v.act)
+                (v.id, self.px(v.x), self.px(v.x + v.w) - self.px(v.x), v.alpha, v.hover, v.leaving, v.act, v.blur)
             };
             if w < 1.0 || alpha <= 0.01 {
                 continue;
@@ -1466,13 +1556,8 @@ impl Toolbar {
             let dragging = lift > 0.01;
             let slot = slots.iter().position(|t| *t == id);
             // While another tab is being dragged, this one is blurred more the closer it is to it.
-            if let (Some(dragged), Some(mine)) = (drag_slot, slot)
-                && !leaving
-                && Some(id) != lift_id
-            {
-                let d = mine.abs_diff(dragged).max(1) as i32;
-                let amount = 0.9 * 0.68_f32.powi(d - 1) * self.lift;
-                c.blur_region(x, TAB_Y, w, TITLE_H - TAB_Y, 10.0, amount);
+            if blur > 0.01 && !leaving && Some(id) != lift_id {
+                c.blur_region(x, TAB_Y, w, TITLE_H - TAB_Y, 10.0, blur);
             }
             // The dragged tab is drawn above the blur layer, so it stays sharp.
             if dragging_tab(lift_id, id, self.lift) {
@@ -1486,13 +1571,6 @@ impl Toolbar {
                 }
                 c.rrect(x, TAB_Y, w, TAB_H, 10.0, th.toolbar.mix(Rgba(255, 255, 255, 255), 0.05 * lift));
             } else {
-                // The selected look fades in and out as the active tab changes.
-                if act > 0.01 {
-                    let col = th.toolbar.with_alpha(act);
-                    c.rrect_top(x, TAB_Y, w, TAB_H, 10.0, col);
-                    c.foot(x - 10.0, TITLE_H, 10.0, false, col);
-                    c.foot(x + w, TITLE_H, 10.0, true, col);
-                }
                 if hover > 0.0 && act < 0.99 {
                     c.rrect_top(x, TAB_Y, w, TAB_H, 10.0, th.tab_hover.with_alpha(hover * alpha * (1.0 - act)));
                 }
