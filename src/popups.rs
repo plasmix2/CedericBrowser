@@ -101,6 +101,8 @@ pub struct Popup {
     surface_size: (u32, u32),
     pm: Pixmap,
     open: bool,
+    /// Where to move the window once it has been repainted at its new size.
+    pending_pos: Option<LogicalPosition<f64>>,
     v: View,
 }
 
@@ -166,6 +168,7 @@ impl Popups {
         let s = self.get(kind).window.scale_factor() as f32;
         let (rows, h) = layout(&mut self.fonts, &content, s);
         let p = self.get(kind);
+        let fresh = !p.open || p.v.size != (w, h);
         // Moving between hover cards or refreshing suggestions only swaps the content, without replaying the entrance.
         if !p.open {
             p.v.enter = 0.0;
@@ -178,8 +181,15 @@ impl Popups {
         p.v.content = content;
         p.v.size = (w, h);
         p.open = true;
-        p.window.set_inner_size(LogicalSize::new(w as f64, h as f64));
-        p.window.set_outer_position(pos);
+        if fresh {
+            // Resizing exposes unpainted pixels (white slivers, stale content). Keep the window
+            // off-screen until `redraw` has painted it at the new size, then move it into place.
+            p.window.set_outer_position(PARKED);
+            p.window.set_inner_size(LogicalSize::new(w as f64, h as f64));
+            p.pending_pos = Some(pos);
+        } else {
+            p.window.set_outer_position(pos);
+        }
         p.window.request_redraw();
         h
     }
@@ -190,6 +200,7 @@ impl Popups {
             p.open = false;
             p.v.content = Content::Empty;
             p.v.rows.clear();
+            p.pending_pos = None;
             p.window.set_outer_position(PARKED);
         }
     }
@@ -316,6 +327,9 @@ impl Popups {
             *d = (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
         }
         let _ = buf.present();
+        if let Some(pos) = p.pending_pos.take() {
+            p.window.set_outer_position(pos);
+        }
     }
 }
 
@@ -348,6 +362,7 @@ impl Popup {
             surface_size: (0, 0),
             pm: Pixmap::new(1, 1).expect("1x1 pixmap"),
             open: false,
+            pending_pos: None,
             v: View {
                 content: Content::Empty,
                 rows: Vec::new(),
