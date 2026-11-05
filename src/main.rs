@@ -3751,7 +3751,13 @@ impl Browser {
                 }
                 let _ = self.open_tab(Some(target), Some(self.active + 1), true);
             }
-            UserEvent::Frame => self.window.request_redraw(),
+            UserEvent::Frame => {
+                // The pacer also runs for popup animations (the persona editor's shader); only repaint
+                // the toolbar when the toolbar itself has a frame due.
+                if self.next_frame.is_some_and(|t| t <= Instant::now() + pacer::FRAME) {
+                    self.window.request_redraw();
+                }
+            }
             UserEvent::Prewarm => {
                 if self.spare.is_none()
                     && let Ok(spare) = self.build_tab(None)

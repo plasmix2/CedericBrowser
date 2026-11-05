@@ -280,6 +280,11 @@ pub struct Popups {
     images: std::collections::HashMap<String, Pixmap>,
     /// For shader animation time.
     t0: Instant,
+    /// When the next animation frame may be drawn, and whether something was still animating.
+    /// `tick` runs after every event of the event loop; without this it would repaint on each
+    /// mouse move and key press, and the GPU frames would starve input.
+    next_anim: Instant,
+    animating: bool,
     last_frame: Instant,
 }
 
@@ -300,6 +305,8 @@ impl Popups {
             sub: make(Kind::Sub),
             images: std::collections::HashMap::new(),
             t0: Instant::now(),
+            next_anim: Instant::now(),
+            animating: false,
             theme,
             last_frame: Instant::now(),
         }
@@ -524,6 +531,9 @@ impl Popups {
 
     /// Advances entrance and hover animations. Returns when the next frame is needed.
     pub fn tick(&mut self, now: Instant) -> Option<Instant> {
+        if now < self.next_anim {
+            return self.animating.then_some(self.next_anim);
+        }
         let dt = now.saturating_duration_since(self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         let k = 1.0 - (-dt * 30.0).exp();
@@ -561,7 +571,12 @@ impl Popups {
         for kind in dirty {
             self.redraw(kind);
         }
-        busy.then(|| now + crate::pacer::FRAME)
+        // The persona editor's live shader only needs ~30 frames a second; everything else 60.
+        let shader = matches!(self.modal.v.content, Content::Persona(_)) && self.modal.open;
+        let frame = if shader { std::time::Duration::from_millis(33) } else { crate::pacer::FRAME };
+        self.animating = busy;
+        self.next_anim = Instant::now() + frame;
+        busy.then_some(self.next_anim)
     }
 
     /// Draws a popup and puts it on screen.
