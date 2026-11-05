@@ -330,7 +330,7 @@ pub fn aead_open(
 }
 
 /// Generates 32 bytes of entropy seeded from OS `RandomState` (which uses OS CSPRNG on Windows)
-/// and high-resolution system clocks.
+/// and high-resolution system clocks, without including any OS user or process identifiers.
 pub fn random_bytes_32() -> [u8; 32] {
     let mut material = Vec::with_capacity(64);
     for i in 0..4u64 {
@@ -340,7 +340,6 @@ pub fn random_bytes_32() -> [u8; 32] {
         if let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) {
             h.write_u128(d.as_nanos());
         }
-        h.write_u32(std::process::id());
         material.extend_from_slice(&h.finish().to_le_bytes());
     }
     sha256(&material)
@@ -353,17 +352,11 @@ fn random_nonce() -> [u8; 12] {
     nonce
 }
 
-/// Derives a machine/user-scoped 256-bit encryption key using the stored key seed plus OS identity.
+/// Derives an anonymous 256-bit encryption key from the random key seed alone (no OS username or hostname).
 pub fn derive_vault_key(seed: &[u8; 32]) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(128);
-    buf.extend_from_slice(b"CedericBrowser::EncryptedSearchVault::v1::");
+    let mut buf = Vec::with_capacity(96);
+    buf.extend_from_slice(b"CedericBrowser::AnonymousEncryptedVault::v2::");
     buf.extend_from_slice(seed);
-    if let Some(user) = std::env::var_os("USERNAME") {
-        buf.extend_from_slice(user.to_string_lossy().as_bytes());
-    }
-    if let Some(comp) = std::env::var_os("COMPUTERNAME") {
-        buf.extend_from_slice(comp.to_string_lossy().as_bytes());
-    }
     sha256(&buf)
 }
 

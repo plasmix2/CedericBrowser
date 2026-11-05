@@ -32,6 +32,12 @@ struct PersistedHistory {
     entries: Vec<HistoryEntry>,
 }
 
+#[derive(Serialize)]
+struct PersistedHistoryRef<'a> {
+    next_id: u64,
+    entries: &'a [HistoryEntry],
+}
+
 pub struct HistoryStore {
     file_path: PathBuf,
     key: [u8; 32],
@@ -93,13 +99,20 @@ impl HistoryStore {
             && now_ms.saturating_sub(top.timestamp_ms) <= DEDUP_WINDOW_MS
             && (top.query.eq_ignore_ascii_case(q) || top.url == url)
         {
+            let mut changed = false;
             if is_search && !top.is_search {
                 top.query = q.to_owned();
                 top.engine = engine.to_owned();
                 top.is_search = true;
+                changed = true;
             }
-            top.url = url.to_owned();
-            self.save();
+            if top.url != url {
+                top.url = url.to_owned();
+                changed = true;
+            }
+            if changed {
+                self.save();
+            }
             return;
         }
 
@@ -136,16 +149,22 @@ impl HistoryStore {
         removed
     }
 
-    /// Clears all saved search history and removes the encrypted payload.
+    /// Clears all saved search history, rotates the vault key, and overwrites the encrypted file.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.next_id = 1;
+        let fresh = crypto::random_bytes_32();
+        if let Some(parent) = self.file_path.parent() {
+            let _ = fs::write(parent.join("history.key"), fresh);
+        }
+        self.key = crypto::derive_vault_key(&fresh);
         self.save();
     }
 
     fn save(&self) {
-        let persisted = PersistedHistory {
+        let persisted = PersistedHistoryRef {
             next_id: self.next_id,
-            entries: self.entries.clone(),
+            entries: &self.entries,
         };
         if let Ok(json) = serde_json::to_vec(&persisted) {
             let encrypted = crypto::encrypt_envelope(&self.key, &json);

@@ -32,18 +32,21 @@ pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send
     std::thread::spawn(move || {
         let mut targets: HashMap<u32, String> = HashMap::new();
         let mut active: Option<u32> = None;
-        while let Ok(req) = rx.recv() {
-            let tab = match req {
-                Request::Active(t) => {
-                    active = t;
-                    continue;
+        while let Ok(first) = rx.recv() {
+            let mut pending_capture: Option<u32> = None;
+            for req in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+                match req {
+                    Request::Active(t) => active = t,
+                    Request::Forget(t) => {
+                        targets.remove(&t);
+                        if pending_capture == Some(t) {
+                            pending_capture = None;
+                        }
+                    }
+                    Request::Capture(t) => pending_capture = Some(t),
                 }
-                Request::Forget(t) => {
-                    targets.remove(&t);
-                    continue;
-                }
-                Request::Capture(t) => t,
-            };
+            }
+            let Some(tab) = pending_capture else { continue };
             // Only the visible tab renders; a hidden one would give a stale or blank frame.
             if active != Some(tab) {
                 continue;
@@ -53,7 +56,7 @@ pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send
                 .get(&tab)
                 .and_then(|id| capture(port, id))
                 .or_else(|| {
-                    let id = find_target(port, tab)?;
+                    let id = find_target(port, tab, &targets)?;
                     let shot = capture(port, &id);
                     targets.insert(tab, id);
                     shot
@@ -103,15 +106,21 @@ impl Drop for Session {
 }
 
 /// Finds the page target whose `window.__cedericTab` is `tab`.
-fn find_target(port: u16, tab: u32) -> Option<String> {
-    devtools::page_targets(port)?.into_iter().find(|id| {
-        Session::open(port, id)
-            .and_then(|mut s| {
-                s.call("Runtime.evaluate", json!({ "expression": "window.__cedericTab", "returnByValue": true }))
-            })
-            .and_then(|r| r["result"]["value"].as_u64())
-            == Some(u64::from(tab))
-    })
+fn find_target(port: u16, tab: u32, known: &HashMap<u32, String>) -> Option<String> {
+    let all = devtools::page_targets(port)?;
+    // Probe targets not yet assigned to another tab first.
+    all.iter()
+        .filter(|id| !known.values().any(|k| k == *id))
+        .chain(all.iter().filter(|id| known.values().any(|k| k == *id)))
+        .find(|id| {
+            Session::open(port, id)
+                .and_then(|mut s| {
+                    s.call("Runtime.evaluate", json!({ "expression": "window.__cedericTab", "returnByValue": true }))
+                })
+                .and_then(|r| r["result"]["value"].as_u64())
+                == Some(u64::from(tab))
+        })
+        .cloned()
 }
 
 /// A small snapshot of what the tab currently shows.
@@ -163,7 +172,7 @@ mod tests {
             }
         }
         for tab in 1..=3 {
-            let shot = find_target(port, tab).and_then(|id| capture(port, &id));
+            let shot = find_target(port, tab, &HashMap::new()).and_then(|id| capture(port, &id));
             println!("tab {tab} thumbnail: {:?}", shot.map(|s| (s.width(), s.height())));
         }
     }

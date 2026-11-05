@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <title>New Tab</title>
+<link rel="dns-prefetch" href="https://search.brave.com">
+<link rel="preconnect" href="https://search.brave.com" crossorigin>
 <style>
   :root {
     --bg: #1d1e22; --fg: #ececf0; --dim: #8d909a; --faint: #5d606a;
@@ -46,6 +48,10 @@
   .top-pill { display: inline-flex; align-items: center; gap: 7px; height: 34px; padding: 0 13px; border-radius: 17px;
     border: 1px solid var(--border); background: var(--field); color: var(--dim);
     font: 12.5px "Segoe UI Variable Text", "Segoe UI", system-ui; cursor: pointer; user-select: none;
+      radial-gradient(35% 30% at 75% 75%, rgba(120, 90, 255, .18), transparent 70%); }
+  #theme-btn { position: fixed; top: 18px; right: 20px; z-index: 2; display: inline-flex; align-items: center; gap: 8px;
+    height: 34px; padding: 0 14px; border-radius: 17px; border: 1px solid var(--border); background: var(--field);
+    color: var(--dim); font: 12.5px "Segoe UI Variable Text", "Segoe UI", system-ui; cursor: pointer;
     transition: border-color .2s, color .2s, transform .2s var(--ease); }
   .top-pill:hover { border-color: var(--accent); color: var(--fg); transform: translateY(-1px); }
   .top-pill svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
@@ -638,6 +644,7 @@
     box.textContent = '';
     const frag = document.createDocumentFragment();
     for (const b of (s.bookmarks || [])) {
+      if (window.__cedericPreconnect) window.__cedericPreconnect(b.url);
       const el = document.createElement('div');
       el.className = 'bm';
       el.title = b.url;

@@ -101,45 +101,34 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
-- **`gemini/picture-in-picture`** — Comprehensive performance tuning, memory optimization, and UI polish:
-  - **Files changed:** `src/main.rs`, `src/gfx.rs`, `src/popups.rs`, `src/favicons.rs`, `src/suggest.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
-  - **Key optimizations:**
-    - GPU & engine performance flags added to `BROWSER_ARGS` (`--enable-quic`, `--enable-accelerated-video-decode`, `--enable-smooth-scrolling`, `--enable-fast-unload`, `--ignore-gpu-blocklist`, `--enable-native-gpu-memory-buffers`).
-    - Fixed-point integer text blending in `gfx::blend` replacing floating-point operations; row offset pre-calculation and inner loop boundary hoisting in `Canvas::text`.
-    - Softbuffer surface resize deduplication in `Browser::redraw` and `Popups::redraw` to eliminate redundant Win32 GDI DIB section reallocations during 120fps animations.
-    - Cached application logo data URI via `std::sync::LazyLock<String>` and zero-copy string slice in `NewTabState`, eliminating large heap allocations on tab syncs.
-    - Added in-memory caching to `favicons` and `suggest` background worker threads for instantaneous 0ms responses on repeated queries.
-    - Title deduplication in `sync_ui` preventing unnecessary `SetWindowTextW` OS calls.
-    - Hardware-accelerated GPU layer promotion (`will-change: transform`, `transform: translateZ(0)`) for New Tab gradient drift and background transitions, plus `DocumentFragment` bookmark rendering.
+- **`agy/anonymous-history`** — Anonymous session search history & automatic clearing:
+  - **Files changed:** `src/main.rs`, `src/history.rs`, `src/crypto.rs`, `INSTRUCTIONS.md`.
+  - **Key changes:**
+    - Removed OS username (`USERNAME`), machine hostname (`COMPUTERNAME`), and process ID (`std::process::id()`) from `crypto::derive_vault_key` and `crypto::random_bytes_32`.
+    - Updated `HistoryStore::clear()` to rotate `history.key` with a fresh random seed and reset `next_id` before overwriting `history.enc`.
+    - Auto-clears search history on startup and on browser close (`browser.quit`), and clears browsing data across all open tabs on `ChromeCmd::ClearHistory` and on exit.
+    - Updated `Browser::history_menu` to show newest session searches first with an `"Anonymous session (Auto-clears)"` header and top `"Clear search history"` action, and added `<meta name="referrer" content="no-referrer">` + `rel="noreferrer noopener"` on search results in `BRAND_SCRIPT`.
 
-- **`gemini/picture-in-picture`** — Implemented independent per-persona custom background images:
-  - **Files changed:** `src/main.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
-  - **Key additions:**
-    - Per-persona background storage (`background_cederic.txt`, `background_strip_cederic.png`, `background_uzaki.txt`, `background_strip_uzaki.png`) with automatic migration from legacy single-background files.
-    - `Prefs::background_for(brand)` and `Prefs::bg_strip_for(brand)` to separate wallpaper and blurred toolbar strip per persona (`Cederic` vs `Uzaki`).
-    - Switching persona instantly switches both the active newtab background wallpaper and the native toolbar background strip.
-    - Updated Palette theme dropdown menu and New Tab page button/tooltip labels to dynamically indicate and control the active persona's background (`Cederic Background` vs `Uzaki Background`).
-    - Added unit test `prefs_per_persona_custom_background` verifying independent storage, retrieval, persistence, and persona-switching isolation.
-
-- **`gemini/picture-in-picture`** — Implemented borderless Full Screen mode (F11, Escape, right-click menu, and HTML5 video / YouTube fullscreen):
+- **`agy/newtab-autotype`** — Instant auto-typing in the address bar on New Tab open and focus lock:
   - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `INSTRUCTIONS.md`.
-  - **Key additions:**
-    - F11 shortcut support both in web views (`SHORTCUT_SCRIPT`) and toolbar (`Toolbar::key`), mapped to `ChromeCmd::ToggleFullscreen`.
-    - Escape shortcut support (`Shortcut::Escape`) to exit fullscreen mode.
-    - Right-click page context menu entry: "Full Screen" / "Exit Full Screen" with "F11" shortcut hint (`MenuAction::ToggleFullscreen`).
-    - Full HTML5 Fullscreen API support (`fullscreenchange` and `webkitfullscreenchange` event listeners over IPC with `UserEvent::FullscreenState`).
-    - Seamless borderless fullscreen toggle via `tao::window::Fullscreen::Borderless(None)`.
-    - `top_bar_height(&self)` and `devtools_width(&self)` set to 0.0 in fullscreen, giving the active webview 100% display area without visible native chrome.
+  - **Key changes:**
+    - Stopped calling `tab.view.focus()` when `tab.is_newtab` is true in `Browser::show_active()` (which was queuing an async WebView2 `MoveFocus` that stole Win32 keyboard focus back from the parent window right after `focus_address()`).
+    - Added `Browser::ensure_chrome_focus()` and called it on `focus_address`, `ChromeCmd::FocusChrome`, `UserEvent::Prewarm`, `NewTabCmd::Ready`, `UserEvent::Load` (for active newtab), and `WindowEvent::Focused(true)`.
+    - Added `NewTabCmd::AutoKey { key }` in `SHORTCUT_SCRIPT` and `Toolbar::auto_key(&mut self, key: &str)` so any printable key, `Backspace`, or `Enter` pressed on a New Tab (when not inside an `<input>`) is immediately fed into the address bar and transfers Win32 focus.
 
-- **`gemini/picture-in-picture`** — Fixed Google Account sign-in ("This browser or app may not be secure") and YouTube 0:59 playback disconnection:
-  - **Files changed:** `src/main.rs`, `src/thumbs.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
-  - **Key fixes:**
-    - Removed `--remote-debugging-port=0` from `BROWSER_ARGS` (which forced Blink into automation mode, setting `navigator.webdriver = true` and tripping Google's botguard / account sign-in block).
-    - Added `--disable-blink-features=AutomationControlled` to `BROWSER_ARGS`.
-    - Added clean standard desktop Chrome `USER_AGENT` (`Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36`) via `with_user_agent` on `WebViewBuilder` to strip `Edg/...` and embedded WebView2 tokens.
-    - Added `STEALTH_SCRIPT` deleting `Object.getPrototypeOf(navigator).webdriver` and hiding `window.chrome.webview` from web page detection while maintaining secure internal IPC routing via `window.__cedericSendIpc`.
-    - Fixed YouTube 0:59 SABR playback interruption by avoiding CDP evaluation attachment on YouTube tabs, removing `__cederic*` globals from subframes, and preventing tab suspension.
-
+- **`agy/perf-improvements`** — Browser-wide UI, rendering, and site-loading performance overhaul (also integrated `f4194fe` from `gemini/picture-in-picture`):
+  - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `src/gfx.rs`, `src/popups.rs`, `src/thumbs.rs`, `src/input.rs`, `src/history.rs`, `src/ui/newtab.html`, `INSTRUCTIONS.md`.
+  - **Key improvements & changes:**
+    - **Site-loading & network acceleration (`BROWSER_ARGS`, `SHORTCUT_SCRIPT`, `BRAND_SCRIPT`, `newtab.html`, `input.rs`, `history.rs`):**
+      - Removed `--disable-background-networking` (which disabled Chromium's `LoadingPredictor` and `PreconnectManager`), broken `DnsOverHttps<DoHTrial` fieldtrial params, `--dns-prefetch-disable`, `PostQuantumKyber`, and `StrictOriginIsolation`.
+      - Enabled `NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,BackForwardCache,ParallelDownloading,CanvasOopRasterization,UseEcoQoSForBackgroundProcess` plus `--enable-quic --enable-gpu-rasterization --enable-zero-copy`.
+      - Added `window.__cedericPreconnect` and Chromium `<script type="speculationrules">` (`prefetch` on moderate hover + `prerender` on conservative pointerdown) in `SHORTCUT_SCRIPT`, plus live address-bar preconnect while typing (`Browser::query`), New Tab preconnect for `search.brave.com` and bookmarks, and automatic preconnect for top search results on `search.brave.com`.
+      - Prioritized `tab.view.load_url` before history disk I/O in `navigate_active`, eliminated redundant disk writes on deduplicated history records, and added zero-allocation fast-paths to `input::upgrade_to_https` and `input::is_allowed_navigation`.
+    - **UI & rendering optimizations (`gfx.rs`, `toolbar.rs`, `popups.rs`, `thumbs.rs`, `main.rs`):**
+      - Cached `fontdb::Database` and all 21 vector `Icon` paths in `OnceLock`s; cached search badge `Buffer` on `Toolbar`; replaced `hover_fade: HashMap` with `[f32; 16]`.
+      - Cached `can_back`/`can_forward`, `window_title`, and `surface_size`; restricted `Browser::layout()` to only resize the active tab (plus open DevTools and any background PiP tab); coalesced thumbnail requests in `thumbs.rs`.
+      - Integrated `f4194fe` (address bar Win32 focus transfer on `Hit::Omni` / `Ctrl+L`, `focusin` dismiss listener, incremental `MutationObserver` in `BRAND_SCRIPT`).
+  - **What to preserve when merging:** Keep identical `BROWSER_ARGS` across all WebViews, keep `window.__cedericPreconnect` in `SHORTCUT_SCRIPT`, and keep lazy background-tab resizing in `Browser::layout` / `Browser::show_active`.
 
 - **`gemini/picture-in-picture`** — Merged `origin/main` (native Rust toolbar/popups via `tiny-skia` + `cosmic-text` + `softbuffer`) and combined with Picture-in-Picture mode, Saved Bookmarks, and Theme/Persona switching (`Cederic` Orange default / `Uzaki` Slate Blue):
   - **Files changed:** `src/main.rs`, `src/toolbar.rs`, `src/gfx.rs`, `src/popups.rs`, `src/thumbs.rs`, `src/ui/newtab.html`, `README.md`, `INSTRUCTIONS.md`.

@@ -102,12 +102,9 @@ const BROWSER_ARGS: &str = "\
     --autoplay-policy=no-user-gesture-required \
     --enable-gpu-rasterization \
     --enable-zero-copy \
-    --enable-quic \
     --enable-accelerated-video-decode \
     --enable-smooth-scrolling \
     --enable-fast-unload \
-    --ignore-gpu-blocklist \
-    --enable-native-gpu-memory-buffers \
     --no-pings \
     --disable-domain-reliability \
     --disable-client-side-phishing-detection \
@@ -115,9 +112,9 @@ const BROWSER_ARGS: &str = "\
     --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
     --enforce-webrtc-ip-permission-check";
 
-/// Keyboard shortcuts, the context menu, and Wi-Fi form/beacon encryption guard for content pages.
-/// Untrusted web content can only trigger the fixed `Shortcut` whitelist and a validated
-/// `ContextRequest` over IPC.
+/// Keyboard shortcuts, the context menu, speculative link preconnect/prefetch, and Wi-Fi form
+/// encryption guard for content pages. Untrusted web content can only trigger the fixed `Shortcut`
+/// whitelist and a validated `ContextRequest` over IPC.
 const SHORTCUT_SCRIPT: &str = r#"
 (() => {
   if (window !== window.top) return;
@@ -128,9 +125,61 @@ const SHORTCUT_SCRIPT: &str = r#"
       window.ipc.postMessage(msg);
     }
   };
+  const preconnected = new Set();
+  const preconnect = (raw) => {
+    if (!raw || preconnected.size >= 48) return;
+    try {
+      const u = new URL(raw, location.href);
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return;
+      if (u.protocol === 'http:' && u.hostname !== 'localhost' && !u.hostname.endsWith('.localhost') && u.hostname !== '127.0.0.1') {
+        u.protocol = 'https:';
+      }
+      const origin = u.origin;
+      if (!origin || origin === 'null' || origin === location.origin || preconnected.has(origin)) return;
+      const root = document.head || document.documentElement;
+      if (!root) return;
+      preconnected.add(origin);
+      const dns = document.createElement('link');
+      dns.rel = 'dns-prefetch';
+      dns.href = origin;
+      const pc = document.createElement('link');
+      pc.rel = 'preconnect';
+      pc.href = origin;
+      pc.crossOrigin = 'anonymous';
+      root.append(dns, pc);
+    } catch (_) {}
+  };
+  window.__cedericPreconnect = preconnect;
+
+  const injectSpeculation = () => {
+    if (location.protocol !== 'https:' && location.protocol !== 'http:') return;
+    const h = (location.hostname || '').toLowerCase();
+    if (h.includes('youtube.com') || h.includes('youtu.be') || h.includes('googlevideo.com')) return;
+    const root = document.head || document.documentElement;
+    if (!root || document.getElementById('__cederic_spec')) return;
+    const s = document.createElement('script');
+    s.id = '__cederic_spec';
+    s.type = 'speculationrules';
+    s.textContent = '{"prefetch":[{"where":{"href_matches":"https://*"},"eagerness":"moderate"}],"prerender":[{"where":{"href_matches":"https://*"},"eagerness":"conservative"}]}';
+    root.appendChild(s);
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', injectSpeculation, { once: true });
+  } else {
+    injectSpeculation();
+  }
+
+  window.addEventListener('pointerover', (e) => {
+    const h = (location.hostname || '').toLowerCase();
+    if (h.includes('youtube.com') || h.includes('youtu.be')) return;
+    const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
+    if (a && a.href) preconnect(a.href);
+  }, { capture: true, passive: true });
+
   let ctxVideo = null;
   const videos = (root = document, out = []) => {
     for (const v of root.querySelectorAll('video')) out.push(v);
+    if (out.length) return out;
     for (const el of root.querySelectorAll('*')) {
       if (el.shadowRoot) videos(el.shadowRoot, out);
     }
@@ -140,12 +189,18 @@ const SHORTCUT_SCRIPT: &str = r#"
   const videoAt = (x, y) => {
     for (const el of document.elementsFromPoint(x, y)) {
       if (usable(el)) return el;
+      if (el.shadowRoot) {
+        for (const v of el.shadowRoot.querySelectorAll('video')) {
+          if (usable(v)) return v;
+        }
+      }
     }
-    return videos().find((v) => {
-      if (!usable(v)) return false;
+    for (const v of document.querySelectorAll('video')) {
+      if (!usable(v)) continue;
       const r = v.getBoundingClientRect();
-      return r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
-    }) || null;
+      if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return v;
+    }
+    return null;
   };
   const bestVideo = (preferCtx) => {
     if (preferCtx && usable(ctxVideo)) return ctxVideo;
@@ -222,6 +277,22 @@ const SHORTCUT_SCRIPT: &str = r#"
   // Popups never take focus, so a click or focus inside the page is what closes an open menu / address bar edit.
   window.addEventListener('pointerdown', () => post('dismiss'), true);
   window.addEventListener('focusin', () => post('dismiss'), true);
+    if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); return; }
+    if (!e.ctrlKey && !e.altKey && !e.metaKey && (location.protocol === 'about:' || location.protocol === 'data:')) {
+      const a = document.activeElement;
+      const inField = a && a.closest && a.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])');
+      if (!inField && (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Enter')) {
+        e.preventDefault(); e.stopPropagation();
+        window.ipc.postMessage(JSON.stringify({ nt: 'auto_key', key: e.key }));
+      }
+    }
+  }, true);
+  // Popups never take focus, so a click in the page is what closes an open menu.
+  window.addEventListener('pointerdown', (e) => {
+    const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
+    if (a && a.href) preconnect(a.href);
+    window.ipc.postMessage('dismiss');
+  }, true);
 
   // Bubble phase: pages with their own context menu call preventDefault first and keep it.
   // Editable fields keep the engine's menu so cut/paste/spellcheck work.
@@ -233,6 +304,8 @@ const SHORTCUT_SCRIPT: &str = r#"
     const a = t && t.closest('a[href]'), img = t && t.closest('img');
     ctxVideo = videoAt(e.clientX, e.clientY) || bestVideo(false);
     post(JSON.stringify({
+    ctxVideo = videoAt(e.clientX, e.clientY) || (document.querySelector('video') && bestVideo(false)) || null;
+    window.ipc.postMessage(JSON.stringify({
       x: e.clientX, y: e.clientY, dpr: window.devicePixelRatio,
       link: a ? a.href : '', image: img ? (img.currentSrc || img.src) : '',
       selection: String(getSelection()).slice(0, 20000),
@@ -325,32 +398,48 @@ const SHORTCUT_SCRIPT: &str = r#"
 
   if (location.hostname === 'www.youtube.com' || location.hostname === 'm.youtube.com') {
     let lastPos = 0, lastRecover = 0;
-    setInterval(() => {
-      const v = document.querySelector('video');
-      if (v && v.currentTime > 1 && !v.paused) lastPos = v.currentTime;
-      const err = document.querySelector('.ytp-error');
-      if (err && err.offsetParent !== null && lastPos > 1 && Date.now() - lastRecover > 8000) {
-        lastRecover = Date.now();
-        const p = document.getElementById('movie_player');
-        if (p && typeof p.loadVideoById === 'function' && typeof p.getVideoData === 'function') {
-          const vd = p.getVideoData();
-          if (vd && vd.video_id) {
-            p.loadVideoById(vd.video_id, Math.max(0, lastPos - 0.5));
-            return;
-          }
-        }
-        const u = new URL(location.href);
-        if (u.pathname === '/watch' && u.searchParams.get('v')) {
-          u.searchParams.set('t', Math.floor(lastPos) + 's');
-          location.replace(u.toString());
+    const recover = () => {
+      if (lastPos < 0.5 || Date.now() - lastRecover < 4000) return;
+      lastRecover = Date.now();
+      const p = document.getElementById('movie_player');
+      if (p && typeof p.loadVideoById === 'function' && typeof p.getVideoData === 'function') {
+        const vd = p.getVideoData();
+        if (vd && vd.video_id) {
+          p.loadVideoById(vd.video_id, Math.max(0, lastPos - 0.5));
+          if (typeof p.playVideo === 'function') setTimeout(() => p.playVideo(), 300);
+          return;
         }
       }
-    }, 1000);
+      const u = new URL(location.href);
+      if (u.pathname === '/watch' && u.searchParams.get('v')) {
+        u.searchParams.set('t', Math.floor(Math.max(0, lastPos - 0.5)) + 's');
+        location.replace(u.toString());
+      }
+    };
+    setInterval(() => {
+      const v = document.querySelector('video');
+      if (v && v.currentTime > lastPos) lastPos = v.currentTime;
+      const err = document.querySelector('.ytp-error, .ytp-error-content, [class*="ytp-error"]');
+      const isVisible = err && (
+        (typeof err.checkVisibility === 'function' && err.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) ||
+        err.offsetParent !== null ||
+        (err.getBoundingClientRect && err.getBoundingClientRect().height > 20)
+      );
+      if (isVisible) {
+        recover();
+      }
+    }, 800);
+    document.addEventListener('error', (e) => {
+      if (e.target && e.target.tagName === 'VIDEO') {
+        recover();
+      }
+    }, true);
   }
 })();
 "#;
 
-/// Shows Cederic's (or Uzaki's) name and wordmark in place of Brave's on Brave Search.
+/// Shows Cederic's (or Uzaki's) name and wordmark in place of Brave's on Brave Search, and
+/// preconnects top search result origins so clicking any result loads without DNS/TLS delay.
 const BRAND_SCRIPT: &str = r#"
 (() => {
   if (location.hostname !== 'search.brave.com') return;
@@ -359,24 +448,51 @@ const BRAND_SCRIPT: &str = r#"
   const fix = (s) => s.replace(/\b(Brave|Cederic|Uzaki)\b/g, brandName);
   const fixText = (n) => {
     const p = n.parentElement;
-    if (p && !/^(SCRIPT|STYLE|TEXTAREA)$/.test(p.tagName) && n.data) {
+    if (p && !/^(SCRIPT|STYLE|TEXTAREA|SVG|NOSCRIPT|CODE|PRE)$/i.test(p.tagName) && re.test(n.data)) {
       const next = fix(n.data);
       if (next !== n.data) n.data = next;
     }
   };
   const scrub = (root) => {
     if (!root) return;
-    const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    for (let n; (n = walk.nextNode());) fixText(n);
+    if (root.nodeType === Node.TEXT_NODE) {
+      fixText(root);
+      return;
+    }
+    const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => {
+        const p = n.parentElement;
+        return (p && /^(SCRIPT|STYLE|TEXTAREA|SVG|NOSCRIPT|CODE|PRE)$/i.test(p.tagName))
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    for (let n; (n = walk.nextNode());) {
+      if (re.test(n.data)) {
+        const next = fix(n.data);
+        if (next !== n.data) n.data = next;
+      }
+    }
     if (root.querySelectorAll) {
       for (const el of root.querySelectorAll('[placeholder], [title], [aria-label], [alt]')) {
         for (const a of ['placeholder', 'title', 'aria-label', 'alt']) {
           const v = el.getAttribute(a);
-          if (v) {
+          if (v && re.test(v)) {
             const next = fix(v);
             if (next !== v) el.setAttribute(a, next);
           }
         }
+      }
+    }
+  };
+  const prewarmResults = () => {
+    if (!window.__cedericPreconnect || !document.body) return;
+    let count = 0;
+    for (const a of document.body.querySelectorAll('a[href^="https://"]')) {
+      if (!a.href.includes('brave.com')) {
+        a.rel = 'noreferrer noopener';
+        window.__cedericPreconnect(a.href);
+        if (++count >= 6) break;
       }
     }
   };
@@ -407,22 +523,42 @@ const BRAND_SCRIPT: &str = r#"
     }
   };
   window.__cedericSetBrand(window.__cedericBrand || 'cederic');
+  const meta = document.createElement('meta');
+  meta.name = 'referrer';
+  meta.content = 'no-referrer';
   const attach = () => {
     const root = document.head || document.documentElement;
     if (root && !style.isConnected) root.appendChild(style);
+    if (root && !meta.isConnected) root.appendChild(meta);
   };
   attach();
-  new MutationObserver((muts) => {
+  const pending = new Set();
+  let queued = false;
+  new MutationObserver((mutations) => {
     attach();
-    for (const m of muts) {
-      if (m.type === 'characterData') fixText(m.target);
-      else for (const n of m.addedNodes) {
-        if (n.nodeType === 3) fixText(n);
-        else if (n.nodeType === 1) scrub(n);
+    for (const m of mutations) {
+      for (const n of m.addedNodes) {
+        if (n !== style) pending.add(n);
       }
     }
-  }).observe(document, { childList: true, subtree: true, characterData: true });
-  document.addEventListener('DOMContentLoaded', () => scrub(document.body));
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      for (const n of pending) {
+        if (n.isConnected) scrub(n);
+      }
+      pending.clear();
+      if (document.title && re.test(document.title)) {
+        const next = fix(document.title);
+        if (next !== document.title) document.title = next;
+      }
+    });
+  }).observe(document, { childList: true, subtree: true });
+  document.addEventListener('DOMContentLoaded', () => {
+    scrub(document.body);
+    prewarmResults();
+  });
 })();
 "#;
 
@@ -541,6 +677,7 @@ enum NewTabCmd {
         #[serde(default)]
         strip: String,
     },
+    AutoKey { key: String },
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -1128,6 +1265,8 @@ struct Tab {
     url: String,
     favicon: String,
     loading: bool,
+    can_back: bool,
+    can_forward: bool,
     pip: bool,
     is_newtab: bool,
     /// Still painted in the new-tab page color; switches to white once a real page loads.
@@ -1183,6 +1322,7 @@ struct Browser {
     toolbar: Toolbar,
     /// Paints the toolbar strip of the main window (pages are separate child windows on top).
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+    surface_size: (u32, u32),
     frame: Pixmap,
     /// When the toolbar next needs a frame (animation or timer); `None` when idle.
     next_frame: Option<Instant>,
@@ -1219,7 +1359,6 @@ struct Browser {
     clipboard: Option<arboard::Clipboard>,
     fullscreen: bool,
     html_fullscreen: bool,
-    surface_size: (u32, u32),
     last_title: String,
 }
 
@@ -1356,6 +1495,8 @@ impl Browser {
             url: url.unwrap_or_default().to_owned(),
             favicon: String::new(),
             loading: url.is_some(),
+            can_back: false,
+            can_forward: false,
             pip: false,
             is_newtab: url.is_none(),
             newtab_bg: url.is_none(),
@@ -1494,15 +1635,28 @@ impl Browser {
 
     fn show_active(&mut self) {
         let bounds = self.content_bounds();
-        if let Some(tab) = self.tabs.get(self.active) {
+        let is_newtab = if let Some(tab) = self.tabs.get(self.active) {
             let _ = tab.view.set_memory_usage_level(MemoryUsageLevel::Normal);
             let _ = tab.view.set_bounds(bounds);
             let _ = tab.view.set_visible(true);
-            let _ = tab.view.focus();
+            if tab.is_newtab {
+                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+            } else {
+                let _ = tab.view.focus();
+            }
             let _ = self.thumbs_tx.send(thumbs::Request::Active(Some(tab.id)));
-        }
+            tab.is_newtab
+        } else {
+            false
+        };
         self.hide_preview();
+        if !is_newtab {
+            self.toolbar.blur_address();
+        }
         self.sync_ui();
+        if is_newtab {
+            self.focus_address();
+        }
         if self.devtools.open {
             self.attach_devtools();
         }
@@ -1518,9 +1672,22 @@ impl Browser {
 
     fn focus_address(&mut self) {
         self.toolbar.focus_address();
-        self.with_active(|v| v.focus_parent());
-        self.window.set_focus();
+        self.ensure_chrome_focus();
         self.window.request_redraw();
+    }
+
+    /// Moves Win32 keyboard focus from any child WebView back to the main browser window while
+    /// the address bar is being edited.
+    fn ensure_chrome_focus(&self) {
+        if self.toolbar.is_editing() {
+            for t in &self.tabs {
+                let _ = t.view.focus_parent();
+            }
+            if let Some(spare) = &self.spare {
+                let _ = spare.view.focus_parent();
+            }
+            self.window.set_focus();
+        }
     }
 
     fn push_newtab_state(view: &WebView, prefs: &Prefs, history: &HistoryStore) {
@@ -1579,8 +1746,8 @@ impl Browser {
                 .collect(),
             active: tab.id,
             url: display_url(&tab.url, &active_name),
-            can_back: tab.view.can_go_back().unwrap_or(false),
-            can_forward: tab.view.can_go_forward().unwrap_or(false),
+            can_back: tab.can_back,
+            can_forward: tab.can_forward,
             loading: tab.loading,
             maximized: self.window.is_maximized(),
             devtools: self.devtools.open,
@@ -1593,10 +1760,11 @@ impl Browser {
         if tab.is_newtab {
             Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
         }
-        let title = if tab.title.is_empty() { "Persona" } else { &tab.title };
-        if title != self.last_title {
-            self.window.set_title(&format!("{title} - Persona"));
-            self.last_title = title.to_owned();
+        let title = if tab.title.is_empty() { &active_name } else { &tab.title };
+        let full_title = format!("{title} - {active_name}");
+        if self.last_title != full_title {
+            self.window.set_title(&full_title);
+            self.last_title = full_title;
         }
         self.toolbar.set_model(model);
         for url in self.toolbar.take_icon_requests() {
@@ -1610,14 +1778,18 @@ impl Browser {
         self.toolbar.set_size(scale, self.logical_size().width as f32);
         self.window.request_redraw();
         let bounds = self.content_bounds();
+        // Only resize the visible active tab (and keep any background PiP tab at its 1x1 offscreen slot);
+        // hidden/suspended background tabs are resized lazily in `show_active` when switched to.
         for (i, tab) in self.tabs.iter().enumerate() {
-            let b = if i != self.active && tab.pip { rect(-10.0, -10.0, 1.0, 1.0) } else { bounds };
-            let _ = tab.view.set_bounds(b);
+            if i == self.active {
+                let _ = tab.view.set_bounds(bounds);
+            } else if tab.pip {
+                let _ = tab.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
+            }
         }
-        if let Some(spare) = &self.spare {
-            let _ = spare.view.set_bounds(bounds);
-        }
-        if let Some(v) = &self.devtools.view {
+        if let Some(v) = &self.devtools.view
+            && self.devtools.open
+        {
             let _ = v.set_bounds(self.devtools_bounds());
         }
     }
@@ -1627,12 +1799,12 @@ impl Browser {
         let Some(resolved) = input::resolve_with_info(&unmask(raw_input)) else {
             return;
         };
-        self.history.record(&resolved.query, &resolved.url, resolved.engine, resolved.is_search);
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.is_newtab = false;
             let _ = tab.view.load_url(&resolved.url);
             let _ = tab.view.focus();
         }
+        self.history.record(&resolved.query, &resolved.url, resolved.engine, resolved.is_search);
         self.sync_ui();
     }
 
@@ -1725,25 +1897,29 @@ impl Browser {
         self.show_menu(items, x, y);
     }
 
-    /// Recent searches, newest first, as a dropdown under the history button.
+    /// Recent anonymous session searches, newest first, as a dropdown under the history button.
     fn history_menu(&mut self, right: f64, y: f64) {
-        const MAX: usize = 12;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
-        let mut items: Vec<MenuItem> = self
-            .history
-            .entries()
-            .iter()
-            .rev()
-            .take(MAX)
-            .map(|e| MenuItem::new(e.query.clone(), MenuAction::OpenUrl(e.url.clone())).hint(ago(now, e.timestamp_ms)))
-            .collect();
-        if items.is_empty() {
-            items.push(MenuItem::new("No searches yet", MenuAction::ClearHistory).enabled(false));
+        const MAX: usize = 10;
+        let entries = self.history.entries();
+        let has_entries = !entries.is_empty();
+        let mut items = vec![
+            MenuItem::new("Anonymous session", MenuAction::ClearHistory)
+                .hint("Auto-clears")
+                .enabled(false),
+            MenuItem::new("Clear search history", MenuAction::ClearHistory)
+                .hint("Ctrl+H")
+                .enabled(has_entries),
+            MenuItem::sep(),
+        ];
+        if !has_entries {
+            items.push(MenuItem::new("No searches in session", MenuAction::ClearHistory).enabled(false));
         } else {
-            items.push(MenuItem::sep());
-            items.push(MenuItem::new("Clear history", MenuAction::ClearHistory));
+            items.extend(
+                entries
+                    .iter()
+                    .take(MAX)
+                    .map(|e| MenuItem::new(e.query.clone(), MenuAction::OpenUrl(e.url.clone())).hint("Anonymous")),
+            );
         }
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
@@ -2069,6 +2245,13 @@ impl Browser {
             self.popups.hide(PopupKind::Suggest);
             return;
         }
+        // Preconnect to the target host (or search engine) while the user is still typing.
+        if let Some(target_url) = input::resolve(&unmask(&text))
+            && let Some(host) = host_of(&target_url)
+            && let Ok(origin_js) = serde_json::to_string(&format!("https://{host}"))
+        {
+            self.with_active(|v| v.evaluate_script(&format!("window.__cedericPreconnect && window.__cedericPreconnect({origin_js})")));
+        }
         // Show the typed row instantly, then fill in suggestions when they arrive.
         self.suggest_query = text.clone();
         self.set_suggestions(Vec::new());
@@ -2271,8 +2454,7 @@ impl Browser {
             ChromeCmd::NextTab => self.handle_shortcut(Shortcut::NextTab),
             ChromeCmd::PrevTab => self.handle_shortcut(Shortcut::PrevTab),
             ChromeCmd::FocusChrome => {
-                self.with_active(|v| v.focus_parent());
-                self.window.set_focus();
+                self.ensure_chrome_focus();
             }
             ChromeCmd::FocusPage => self.with_active(|v| v.focus()),
             ChromeCmd::MoveTab { id, to } => self.move_tab(id, to),
@@ -2304,7 +2486,7 @@ impl Browser {
             }
             ChromeCmd::ClearHistory => {
                 self.history.clear();
-                if let Some(t) = self.active_tab() {
+                for t in &self.tabs {
                     let _ = t.view.clear_all_browsing_data();
                 }
                 self.sync_ui();
@@ -2362,9 +2544,13 @@ impl Browser {
             }
             Shortcut::Dismiss => {
                 // A click or focus in the page: close menus and stop editing the address bar.
+                // A click or Escape in the page: close menus and stop editing the address bar.
+                let active = self.popups.is_open(PopupKind::Menu) || self.toolbar.is_editing();
                 self.close_menu();
                 self.toolbar.blur_address();
-                self.window.request_redraw();
+                if active {
+                    self.window.request_redraw();
+                }
             }
             Shortcut::Pip => self.toggle_pip(None, false),
             Shortcut::Bookmark => self.toggle_bookmark(),
@@ -2395,7 +2581,18 @@ impl Browser {
             return;
         }
         match cmd {
-            NewTabCmd::Ready => Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history),
+            NewTabCmd::Ready => {
+                Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history);
+                self.ensure_chrome_focus();
+            }
+            NewTabCmd::AutoKey { key } => {
+                if i != self.active {
+                    self.switch_to(i);
+                }
+                self.toolbar.auto_key(&key);
+                self.ensure_chrome_focus();
+                self.window.request_redraw();
+            }
             NewTabCmd::Search { input } => {
                 if i != self.active {
                     self.switch_to(i);
@@ -2531,8 +2728,12 @@ impl Browser {
             }
             UserEvent::Frame => self.window.request_redraw(),
             UserEvent::Prewarm => {
-                if self.spare.is_none() {
-                    self.spare = self.build_tab(None).ok();
+                if self.spare.is_none()
+                    && let Ok(spare) = self.build_tab(None)
+                {
+                    let _ = spare.view.set_memory_usage_level(MemoryUsageLevel::Low);
+                    self.spare = Some(spare);
+                    self.ensure_chrome_focus();
                 }
             }
             UserEvent::Suggestions(res) => {
@@ -2575,6 +2776,8 @@ impl Browser {
                 }
                 let tab = &mut self.tabs[i];
                 tab.loading = started;
+                tab.can_back = tab.view.can_go_back().unwrap_or(false);
+                tab.can_forward = tab.view.can_go_forward().unwrap_or(false);
                 if !url.is_empty() && !url.starts_with("about:") && !url.starts_with("data:") {
                     tab.is_newtab = false;
                 }
@@ -2593,6 +2796,8 @@ impl Browser {
                 if tab.title.is_empty() || tab.title == "New Tab" {
                     tab.title = host_of(&tab.url).unwrap_or("New Tab").to_owned();
                 }
+                let is_newtab = tab.is_newtab;
+                let view_ref = &tab.view;
                 if !started {
                     if !tab.url.contains("youtube.com") && !tab.url.contains("youtu.be") {
                         let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
@@ -2603,6 +2808,20 @@ impl Browser {
                             let _ = proxy.send_event(UserEvent::Favicon(id, icon));
                         }
                     });
+                    if !is_newtab {
+                        let proxy = self.proxy.clone();
+                        let _ = view_ref.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
+                            if let Some(icon) = parse_favicon(&res) {
+                                let _ = proxy.send_event(UserEvent::Favicon(id, icon));
+                            }
+                        });
+                    }
+                    if !is_newtab && self.tabs.len() > 1 {
+                        let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
+                    }
+                }
+                if is_newtab && i == self.active {
+                    self.ensure_chrome_focus();
                 }
                 self.sync_ui();
             }
@@ -2637,6 +2856,9 @@ impl Browser {
                 self.close_suggest();
                 self.close_menu();
                 self.hide_preview();
+            }
+            WindowEvent::Focused(true) => {
+                self.ensure_chrome_focus();
             }
             WindowEvent::Focused(false) => {
                 // Popups never take focus, so losing it means the user switched away.
@@ -2758,10 +2980,9 @@ impl Browser {
         }
         let Ok(mut buf) = self.surface.buffer_mut() else { return };
         let width = w.get() as usize;
-        for (dst, src) in buf.chunks_exact_mut(width).zip(self.frame.data().chunks_exact(width * 4)) {
-            for (d, p) in dst.iter_mut().zip(src.chunks_exact(4)) {
-                *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
-            }
+        let bar_px = width * bar_h as usize;
+        for (d, p) in buf[..bar_px].iter_mut().zip(self.frame.data().chunks_exact(4)) {
+            *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
         }
         let mut damage = vec![softbuffer::Rect { x: 0, y: 0, width: w, height: NonZeroU32::new(bar_h).unwrap_or(h) }];
         if dt > 0.0 {
@@ -2778,17 +2999,6 @@ impl Browser {
             }
         }
         let _ = buf.present_with_damage(&damage);
-    }
-}
-
-/// "now", "5m", "3h", "2d": how long ago `then_ms` was.
-fn ago(now_ms: u64, then_ms: u64) -> String {
-    let s = now_ms.saturating_sub(then_ms) / 1000;
-    match s {
-        0..60 => "now".into(),
-        60..3600 => format!("{}m", s / 60),
-        3600..86400 => format!("{}h", s / 3600),
-        _ => format!("{}d", s / 86400),
     }
 }
 
@@ -2913,7 +3123,8 @@ fn main() -> wry::Result<()> {
     // of it is invalidated, and since the window does not clip its children that paints over the
     // pages and makes them flash. Everything that is not a page is drawn by `Browser::redraw`.
 
-    let history = HistoryStore::open(&dir);
+    let mut history = HistoryStore::open(&dir);
+    history.clear();
     let context = WebContext::new(Some(dir.clone()));
 
     let scale = window.scale_factor();
@@ -2953,6 +3164,7 @@ fn main() -> wry::Result<()> {
         window,
         toolbar,
         surface,
+        surface_size: (0, 0),
         frame: Pixmap::new(1, 1).expect("1x1 pixmap"),
         next_frame: None,
         pacer,
@@ -2985,7 +3197,6 @@ fn main() -> wry::Result<()> {
         clipboard: None,
         fullscreen: false,
         html_fullscreen: false,
-        surface_size: (0, 0),
         last_title: String::new(),
     };
     let start = std::env::args().nth(1).and_then(|a| {
@@ -3026,6 +3237,10 @@ fn main() -> wry::Result<()> {
             _ => ControlFlow::Wait,
         };
         if browser.quit {
+            browser.history.clear();
+            for t in &browser.tabs {
+                let _ = t.view.clear_all_browsing_data();
+            }
             *control_flow = ControlFlow::Exit;
         }
     });

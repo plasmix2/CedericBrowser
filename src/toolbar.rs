@@ -135,7 +135,7 @@ pub struct Toolbar {
     mouse: (f32, f32),
     hover: Hit,
     pressed: Option<Hit>,
-    hover_fade: HashMap<u8, f32>,
+    hover_fade: [f32; 16],
     drag: Option<Drag>,
     last_click: (Instant, f32, f32, u32),
     progress: f32,
@@ -155,6 +155,7 @@ pub struct Toolbar {
     sidx: usize,
     blink_from: Instant,
     pretty: Option<(String, Buffer)>,
+    badge: Option<(String, Buffer, f32)>,
     placeholder: Buffer,
     clipboard: Option<arboard::Clipboard>,
     // hover cards
@@ -190,7 +191,7 @@ fn approach01(v: &mut f32, target: f32, k: f32) -> bool {
     }
 }
 
-fn hit_key(h: Hit) -> u8 {
+fn hit_key(h: Hit) -> usize {
     match h {
         Hit::NewTab => 1,
         Hit::Min => 2,
@@ -235,7 +236,7 @@ impl Toolbar {
             mouse: (-1.0, -1.0),
             hover: Hit::None,
             pressed: None,
-            hover_fade: HashMap::new(),
+            hover_fade: [0.0; 16],
             drag: None,
             last_click: (now, 0.0, 0.0, 0),
             progress: 0.0,
@@ -254,6 +255,7 @@ impl Toolbar {
             sidx: 0,
             blink_from: now,
             pretty: None,
+            badge: None,
             placeholder,
             clipboard: None,
             hover_tab: None,
@@ -295,6 +297,7 @@ impl Toolbar {
                 v.title = None;
             }
             self.pretty = None;
+            self.badge = None;
             self.placeholder = self.fonts.line("Search or type a URL", URL_FONT, Weight::NORMAL, scale);
             let text = self.text();
             self.editor = Editor::new(self.fonts.line("", URL_FONT, Weight::NORMAL, scale));
@@ -403,13 +406,45 @@ impl Toolbar {
     }
 
     pub fn focus_address(&mut self) {
+        self.editing = true;
+        let url = self.model.url.clone();
+        self.set_text(&url, true);
+        self.typed = url;
+        self.sugg.clear();
+        self.blink_from = Instant::now();
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.editing
+    }
+
+    /// Feeds a keystroke forwarded from a New Tab (or while the address bar is active) straight
+    /// into the address bar editor so typing works immediately even before Win32 focus transfers.
+    pub fn auto_key(&mut self, key: &str) {
         if !self.editing {
-            self.editing = true;
-            let url = self.model.url.clone();
-            self.set_text(&url, true);
-            self.typed = url;
-            self.sugg.clear();
-            self.blink_from = Instant::now();
+            self.focus_address();
+        }
+        self.blink_from = Instant::now();
+        match key {
+            "Backspace" => {
+                if self.editor.selection_bounds().is_some() {
+                    self.editor.delete_selection();
+                } else {
+                    self.editor.action(&mut self.fonts.system, Action::Backspace);
+                }
+                self.query();
+            }
+            "Enter" => {
+                let input = self.text();
+                if !input.trim().is_empty() {
+                    self.blur_address();
+                    self.cmds.push(ChromeCmd::Navigate { input });
+                }
+            }
+            s if s.chars().count() == 1 => {
+                self.insert(s);
+            }
+            _ => {}
         }
     }
 
@@ -999,8 +1034,7 @@ impl Toolbar {
             Hit::Omni, Hit::Star, Hit::Bookmarks, Hit::Pip, Hit::History, Hit::Theme, Hit::Devtools,
         ] {
             let target = if self.hover == h { 1.0 } else { 0.0 };
-            let f = self.hover_fade.entry(hit_key(h)).or_insert(0.0);
-            busy |= approach01(f, target, kf);
+            busy |= approach01(&mut self.hover_fade[hit_key(h)], target, kf);
         }
 
         busy |= approach01(&mut self.load_morph, if self.model.loading { 1.0 } else { 0.0 }, kf);
@@ -1128,7 +1162,7 @@ impl Toolbar {
     }
 
     fn fade(&self, h: Hit) -> f32 {
-        self.hover_fade.get(&hit_key(h)).copied().unwrap_or(0.0)
+        self.hover_fade[hit_key(h)]
     }
 
     fn button_bg(&self, c: &mut Canvas, r: R, h: Hit, radius: f32, th: &Theme) {
@@ -1217,9 +1251,14 @@ impl Toolbar {
             } else {
                 self.model.brand.badge_letter()
             };
-            let mut b = self.fonts.line(letter, 11.0, Weight::BOLD, self.s);
-            let bw = text_width(&b, self.s);
-            c.text(&mut self.fonts, &mut b, icon_x + (16.0 - bw) / 2.0, cy - 7.5, Rgba(255, 255, 255, 255).with_alpha(alpha), f32::MAX, 0.0);
+            if self.badge.as_ref().is_none_or(|(l, _, _)| l.as_str() != letter) {
+                let buf = self.fonts.line(letter, 11.0, Weight::BOLD, self.s);
+                let bw = text_width(&buf, self.s);
+                self.badge = Some((letter.to_string(), buf, bw));
+            }
+            if let Some((_, buf, bw)) = &mut self.badge {
+                c.text(&mut self.fonts, buf, icon_x + (16.0 - *bw) / 2.0, cy - 7.5, Rgba(255, 255, 255, 255).with_alpha(alpha), f32::MAX, 0.0);
+            }
         } else if let Some(Some(img)) = self.icons.get(&favicon) {
             c.image(img, icon_x, cy - 8.0, 16.0, 16.0, alpha);
         } else {
