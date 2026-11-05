@@ -74,8 +74,8 @@ fn margins(kind: Kind) -> Margins {
         return NO_MARGIN;
     }
     match kind {
-        Kind::Tip => Margins { l: 8.0, t: 3.0, r: 8.0, b: 11.0 },
-        _ => Margins { l: 14.0, t: 6.0, r: 14.0, b: 20.0 },
+        Kind::Tip => Margins { l: 14.0, t: 4.0, r: 14.0, b: 22.0 },
+        _ => Margins { l: 30.0, t: 12.0, r: 30.0, b: 44.0 },
     }
 }
 
@@ -435,7 +435,7 @@ impl Popups {
             p.card = pm;
         }
         draw(&mut p.v, &mut p.card, engine, &th, s);
-        compose(&p.card, &mut p.pm, &mut p.frame, margins(kind), corner_radius(kind), s, &th);
+        compose(&p.card, &mut p.pm, &mut p.frame, engine.as_mut(), margins(kind), corner_radius(kind), s, &th);
         let (w_u32, h_u32) = (w.get(), h.get());
         if p.surface_size != (w_u32, h_u32) {
             if p.surface.resize(w, h).is_err() {
@@ -720,7 +720,7 @@ fn window_bg(card: Rgba) -> (u8, u8, u8, u8) {
 /// rectangle, and a 1px border. Everything outside the card and its shadow stays transparent.
 /// The shadow and clip mask are cached in `frame` and only rebuilt when the size changes, so an
 /// animation frame is a copy, a masked blit and a border stroke.
-fn compose(card: &Pixmap, out: &mut Pixmap, frame: &mut Option<Frame>, m: Margins, radius: f32, s: f32, th: &Theme) {
+fn compose(card: &Pixmap, out: &mut Pixmap, frame: &mut Option<Frame>, engine: Option<&mut Engine>, m: Margins, radius: f32, s: f32, th: &Theme) {
     let (x, y) = ((m.l * s).round(), (m.t * s).round());
     let (w, h) = (card.width() as f32, card.height() as f32);
     let r = radius * s;
@@ -730,8 +730,15 @@ fn compose(card: &Pixmap, out: &mut Pixmap, frame: &mut Option<Frame>, m: Margin
         let (Some(mut shadow), Some(mut mask)) = (Pixmap::new(out.width(), out.height()), Mask::new(out.width(), out.height())) else {
             return;
         };
-        if m != NO_MARGIN {
-            // No blur in tiny-skia: equal-alpha layers growing outward stack into a smooth falloff.
+        let soft = if m != NO_MARGIN {
+            engine.and_then(|e| e.shadow_pixmap(out.width(), out.height(), s, (x, y, w, h), r, if dark { 0.85 } else { 0.5 }))
+        } else {
+            None
+        };
+        if let Some(pm) = soft {
+            shadow = pm;
+        } else if m != NO_MARGIN {
+            // No GPU: tiny-skia has no blur: equal-alpha layers growing outward stack into a smooth falloff.
             // The shadow sits a little low, as if lit from above.
             let layers = 16;
             let spread = ((m.b - 2.0) * s).max(1.0);
@@ -819,7 +826,7 @@ mod tests {
             draw(&mut v, &mut pm, &mut engine, &th, s);
             let m = margins(Kind::Menu);
             let mut out = Pixmap::new(((w + m.l + m.r) * s) as u32, ((h + m.t + m.b) * s) as u32).unwrap();
-            compose(&pm, &mut out, &mut None, m, corner_radius(Kind::Menu), s, &th);
+            compose(&pm, &mut out, &mut None, engine.as_mut(), m, corner_radius(Kind::Menu), s, &th);
             out.save_png(dir.join(format!("{name}.png"))).unwrap();
         }
     }
@@ -880,7 +887,7 @@ mod tests {
         let start = Instant::now();
         for _ in 0..120 {
             draw(&mut v, &mut card, &mut engine, &th, s);
-            compose(&card, &mut out, &mut cache, m, corner_radius(Kind::Menu), s, &th);
+            compose(&card, &mut out, &mut cache, engine.as_mut(), m, corner_radius(Kind::Menu), s, &th);
         }
         println!("popup frame (draw + compose at 2x): {:?}", start.elapsed() / 120);
     }

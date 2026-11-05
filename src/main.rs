@@ -820,9 +820,6 @@ enum MenuAction {
     ClearSiteData,
     OpenTab(String),
     RestartToUpdate,
-    ToggleCamera,
-    ToggleNotifications,
-    ToggleMicrophone,
     OpenSettings,
 }
 
@@ -2277,48 +2274,26 @@ impl Browser {
                 items.push(MenuItem::new("Manage your Google Account", MenuAction::OpenTab(GOOGLE_ACCOUNT_URL.into())));
                 items.push(MenuItem::new("Sign out of Google", MenuAction::OpenTab(GOOGLE_SIGN_OUT_URL.into())));
             }
-            None => items.push(MenuItem::new("Sign in to Google", MenuAction::OpenTab(GOOGLE_SIGN_IN_URL.into())).hint("Persona")),
+            None => items.push(MenuItem::new("Sign in to Google", MenuAction::OpenTab(GOOGLE_SIGN_IN_URL.into()))),
         }
         items.push(MenuItem::sep());
         for p in &self.prefs.personas {
             let is_cur = p.id == active_id;
-            let mark = if is_cur { "✓  " } else { "   " };
+            let mark = if is_cur { "✓  " } else { "    " };
             let label = format!("{mark}{}", p.name);
-            let hint = p.parsed_color().label();
-            items.push(MenuItem::new(label, MenuAction::SelectPersona(p.id.clone())).hint(hint));
+            items.push(MenuItem::new(label, MenuAction::SelectPersona(p.id.clone())));
         }
         if self.prefs.personas.len() < 5 {
-            items.push(MenuItem::new("+ Create New Persona…", MenuAction::OpenNewPersona));
+            items.push(MenuItem::new("New persona…", MenuAction::OpenNewPersona));
         }
-        items.push(MenuItem::new("Manage Personas…", MenuAction::OpenManagePersonas));
+        items.push(MenuItem::new("Manage personas…", MenuAction::OpenManagePersonas));
         items.push(MenuItem::sep());
-        let cur_name = self.prefs.active_name().to_string();
         let has_bg = self.prefs.background().is_some();
-        let bg_label = if has_bg {
-            format!("Change {cur_name} background image…")
-        } else {
-            format!("Set {cur_name} background image…")
-        };
-        let rm_label = format!("Remove {cur_name} background image");
-        items.push(MenuItem::new(bg_label, MenuAction::ChooseBackground));
-        items.push(MenuItem::new(rm_label, MenuAction::ClearBackground).enabled(has_bg));
-        items.push(MenuItem::sep());
-        let cam_allowed = self.allow_camera.load(std::sync::atomic::Ordering::Relaxed);
-        let notif_allowed = self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed);
-        let mic_allowed = self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed);
-        items.push(MenuItem::new(
-            if cam_allowed { "✓ Camera Access" } else { "   Camera Access" },
-            MenuAction::ToggleCamera,
-        ).hint(if cam_allowed { "Allowed" } else { "Blocked" }));
-        items.push(MenuItem::new(
-            if notif_allowed { "✓ Notifications" } else { "   Notifications" },
-            MenuAction::ToggleNotifications,
-        ).hint(if notif_allowed { "Allowed" } else { "Blocked" }));
-        items.push(MenuItem::new(
-            if mic_allowed { "✓ Microphone Access" } else { "   Microphone Access" },
-            MenuAction::ToggleMicrophone,
-        ).hint(if mic_allowed { "Allowed" } else { "Blocked" }));
-        items.push(MenuItem::new("Permissions & Settings…", MenuAction::OpenSettings));
+        items.push(MenuItem::new(if has_bg { "Change background…" } else { "Set background…" }, MenuAction::ChooseBackground));
+        if has_bg {
+            items.push(MenuItem::new("Remove background", MenuAction::ClearBackground));
+        }
+        items.push(MenuItem::new("Site permissions…", MenuAction::OpenSettings));
         self.show_menu(items, (right - 260.0).max(0.0), y);
     }
 
@@ -2702,18 +2677,6 @@ impl Browser {
             }
             MenuAction::ClearBackground => self.apply_background(None, None),
             MenuAction::ToggleFullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
-            MenuAction::ToggleCamera => {
-                let cur = self.allow_camera.load(std::sync::atomic::Ordering::Relaxed);
-                self.set_permissions(!cur, self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed), self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed), self.allow_geolocation.load(std::sync::atomic::Ordering::Relaxed));
-            }
-            MenuAction::ToggleNotifications => {
-                let cur = self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed);
-                self.set_permissions(self.allow_camera.load(std::sync::atomic::Ordering::Relaxed), !cur, self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed), self.allow_geolocation.load(std::sync::atomic::Ordering::Relaxed));
-            }
-            MenuAction::ToggleMicrophone => {
-                let cur = self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed);
-                self.set_permissions(self.allow_camera.load(std::sync::atomic::Ordering::Relaxed), self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed), !cur, self.allow_geolocation.load(std::sync::atomic::Ordering::Relaxed));
-            }
             MenuAction::OpenSettings => self.open_settings(),
         }
     }

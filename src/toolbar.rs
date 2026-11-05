@@ -141,6 +141,8 @@ pub struct Toolbar {
     hover: Hit,
     pressed: Option<Hit>,
     hover_fade: [f32; 16],
+    /// 0..1 phase of the hover gradient's slow turn.
+    shimmer: f32,
     drag: Option<Drag>,
     last_click: (Instant, f32, f32, u32),
     progress: f32,
@@ -248,6 +250,7 @@ impl Toolbar {
             hover: Hit::None,
             pressed: None,
             hover_fade: [0.0; 16],
+            shimmer: 0.0,
             drag: None,
             last_click: (now, 0.0, 0.0, 0),
             progress: 0.0,
@@ -1138,6 +1141,11 @@ impl Toolbar {
             busy |= approach01(&mut self.hover_fade[hit_key(h)], target, kf);
         }
 
+        // The hover gradient turns slowly while any button is lit (the address bar has no gradient).
+        if self.hover_fade.iter().enumerate().any(|(i, f)| i != hit_key(Hit::Omni) && *f > 0.01) {
+            self.shimmer = (self.shimmer + dt * 0.45).fract();
+            busy = true;
+        }
         busy |= approach01(&mut self.load_morph, if self.model.loading { 1.0 } else { 0.0 }, kf);
         if self.model.loading {
             // Eases toward 90% over a few seconds, then waits for the load to finish.
@@ -1214,6 +1222,7 @@ impl Toolbar {
     fn paint(&mut self, c: &mut Painter) {
         let s = self.s;
         let th = self.theme;
+        c.backdrop = th.strip;
         c.rect(0.0, 0.0, self.width, TITLE_H, th.strip);
         c.rect(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar);
         if self.bg.is_some() && c.image("persona:bg", 0.0, 0.0, self.width, HEIGHT, 0.44) {
@@ -1244,7 +1253,8 @@ impl Toolbar {
             c.icon(icon, r.x + (r.w - 10.0) / 2.0, r.y + (r.h - 10.0) / 2.0, 10.0, fg);
         }
 
-        // Toolbar buttons.
+        // Toolbar buttons (translucent icons blend against the toolbar color).
+        c.backdrop = th.toolbar;
         let disabled = |on: bool| if on { 1.0 } else { 0.3 };
         for (r, h, icon, on) in [
             (g.back, Hit::Back, Icon::Back, self.model.can_back),
@@ -1305,9 +1315,26 @@ impl Toolbar {
 
     fn button_bg(&self, c: &mut Painter, r: R, h: Hit, radius: f32, th: &Theme) {
         let pressed = self.pressed == Some(h) && self.hover == h;
-        let col = if pressed { th.btn_press } else { th.btn_hover.with_alpha(self.fade(h)) };
-        if col.3 > 0 {
-            c.rrect(r.x, r.y, r.w, r.h, radius, col);
+        if pressed {
+            c.rrect(r.x, r.y, r.w, r.h, radius, th.btn_press);
+            return;
+        }
+        let f = self.fade(h);
+        if f > 0.01 {
+            c.rrect(r.x, r.y, r.w, r.h, radius, th.btn_hover.with_alpha(f));
+            // A soft accent gradient that slowly turns, with a thin accent rim, fades in on hover.
+            let angle = self.shimmer * std::f32::consts::TAU;
+            c.rrect_gradient(
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                radius,
+                th.accent.with_alpha(0.34 * f),
+                th.accent2.with_alpha(0.10 * f),
+                angle,
+                Some((th.accent.with_alpha(0.5 * f), 1.0)),
+            );
         }
     }
 
@@ -1366,6 +1393,7 @@ impl Toolbar {
     #[allow(clippy::too_many_arguments)]
     fn draw_tab_content(&mut self, c: &mut Painter, i: usize, x: f32, w: f32, alpha: f32, active: bool, th: &Theme) {
         let id = self.vis[i].id;
+        c.backdrop = if active { th.toolbar } else { th.strip };
         let Some(info) = self.model.tabs.iter().find(|t| t.id == id) else { return };
         let (title, favicon, loading, pip) = (info.title.clone(), info.favicon.clone(), info.loading, info.pip);
         let hovered = matches!(self.hover, Hit::Tab(h) | Hit::TabClose(h) if h == id);

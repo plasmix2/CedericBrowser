@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use anvil_ui::{
-    Color, Fit, Frame, IconAtlas, Input, Rect, RectStyle, Renderer, TextStyle, TextureId, Ui,
+    Color, Fit, Frame, Icon as AnvilIcon, IconAtlas, Input, Rect, RectStyle, Renderer, TextStyle, TextureId, Ui,
 };
 use glam::Vec2;
 use tiny_skia::Pixmap;
@@ -81,11 +81,26 @@ impl Engine {
         self.renderer.resize(w, h);
         self.begin(w, h, scale);
         {
-            let mut p = Painter { ui: &mut self.ui, textures: &self.textures, s: scale };
+            let mut p = Painter { ui: &mut self.ui, textures: &self.textures, s: scale, backdrop: clear };
             build(&mut p);
         }
         self.ui.end();
         self.renderer.render_to_frame(&self.ui.draw, &mut self.ui.text, color(clear))
+    }
+
+    /// A transparent `w` x `h` pixmap holding a soft two-layer drop shadow for the rounded card at
+    /// physical pixels (`x`, `y`, `cw`, `ch`): a wide faint ambient shadow and a tight contact one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn shadow_pixmap(&mut self, w: u32, h: u32, scale: f32, card: (f32, f32, f32, f32), radius: f32, strength: f32) -> Option<Pixmap> {
+        let (x, y, cw, ch) = (card.0 / scale, card.1 / scale, card.2 / scale, card.3 / scale);
+        let r = radius / scale;
+        let f = self.frame(w, h, scale, Rgba(0, 0, 0, 0), |p| {
+            p.shadow(x, y, cw, ch, r, 44.0, 14.0, strength * 0.7);
+            p.shadow(x, y, cw, ch, r, 12.0, 3.0, strength * 0.5);
+        });
+        let mut pm = Pixmap::new(w, h)?;
+        copy_to_pixmap(&f, &mut pm);
+        Some(pm)
     }
 
     fn begin(&mut self, w: u32, h: u32, scale: f32) {
@@ -136,6 +151,9 @@ pub struct Painter<'a> {
     ui: &'a mut Ui,
     textures: &'a HashMap<String, TextureId>,
     pub s: f32,
+    /// What translucent strokes are blended against. A stroke is drawn as one shape per segment, so
+    /// drawing it translucent would show every overlap; it is drawn opaque in the pre-blended color.
+    pub backdrop: Rgba,
 }
 
 impl Painter<'_> {
@@ -164,6 +182,27 @@ impl Painter<'_> {
         pts.extend(arc_points(x + w - r, y + r, r, deg(270.0), deg(90.0)));
         pts.push([x + w, y + h]);
         self.fill_polygon(&pts, c);
+    }
+
+    /// A rounded rectangle filled with a linear gradient from `c1` to `c2` at `angle` radians, with
+    /// an optional border.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rrect_gradient(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, c1: Rgba, c2: Rgba, angle: f32, border: Option<(Rgba, f32)>) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let mut st = RectStyle::fill(color(c1)).radius(radius.min(w / 2.0).min(h / 2.0) * self.s).linear(color(c2), angle);
+        if let Some((bc, bw)) = border {
+            st = st.border(color(bc), bw * self.s);
+        }
+        self.ui.rect(self.r(x, y, w, h), st);
+    }
+
+    /// A soft drop shadow for a rounded rectangle: `blur` px of falloff, shifted down by `dy`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn shadow(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, blur: f32, dy: f32, alpha: f32) {
+        let st = RectStyle::fill([0.0, 0.0, 0.0, alpha]).radius(radius * self.s).soft(blur * self.s);
+        self.ui.rect(self.r(x, y + dy, w, h), st);
     }
 
     pub fn circle(&mut self, cx: f32, cy: f32, r: f32, c: Rgba) {
@@ -227,10 +266,20 @@ impl Painter<'_> {
         self.stroke(&pts, 2.0, c);
     }
 
+    /// `c` blended onto the backdrop and made opaque (see `backdrop`).
+    fn solid(&self, c: Rgba) -> Rgba {
+        if c.3 == 255 || c.3 == 0 {
+            return c;
+        }
+        let b = self.backdrop;
+        Rgba(b.0, b.1, b.2, 255).mix(Rgba(c.0, c.1, c.2, 255), c.3 as f32 / 255.0)
+    }
+
     fn stroke(&mut self, pts: &[[f32; 2]], width: f32, c: Rgba) {
         if pts.len() < 2 || c.3 == 0 {
             return;
         }
+        let c = self.solid(c);
         let px: Vec<[f32; 2]> = pts.iter().map(|p| [p[0] * self.s, p[1] * self.s]).collect();
         self.ui.draw.stroke(&anvil_ui::path::Path::polyline(&px), width * self.s, color(c));
     }
@@ -241,11 +290,19 @@ impl Painter<'_> {
         let s = self.s;
         let (x, y) = ((x * s).round() / s, (y * s).round() / s);
         let size = ((size * s).round() / s).max(1.0 / s);
+        if let Some(a) = atlas_icon(icon) {
+            // ANVL's own Lucide icon: a texture, so translucency is exact.
+            if c.3 > 0 {
+                self.ui.icon(Rect::new(x * s, y * s, size * s, size * s), a, color(c));
+            }
+            return;
+        }
         let def = icon_def(icon);
         let k = size / def.grid;
+        let fill_c = self.solid(c);
         let map = |p: [f32; 2]| [x + p[0] * k, y + p[1] * k];
         for poly in &def.fills {
-            self.fill_polygon(&poly.iter().map(|&p| map(p)).collect::<Vec<_>>(), c);
+            self.fill_polygon(&poly.iter().map(|&p| map(p)).collect::<Vec<_>>(), fill_c);
         }
         let w = def.width * k * if def.grid > 20.0 { 1.2 } else { 1.0 };
         for line in &def.strokes {
@@ -321,6 +378,20 @@ impl Painter<'_> {
         self.ui.measure("Ag", style(size, weight, [1.0; 4])).1.y / self.s
     }
 
+}
+
+/// The chrome icons that ANVL's own atlas has an exact match for.
+fn atlas_icon(icon: Icon) -> Option<AnvilIcon> {
+    Some(match icon {
+        Icon::Back => AnvilIcon::ArrowLeft,
+        Icon::Forward => AnvilIcon::ArrowRight,
+        Icon::Plus => AnvilIcon::Plus,
+        Icon::Close | Icon::Stop => AnvilIcon::X,
+        Icon::Search => AnvilIcon::Search,
+        Icon::Info => AnvilIcon::Info,
+        Icon::Code => AnvilIcon::Code,
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
