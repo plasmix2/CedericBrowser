@@ -1080,13 +1080,18 @@ impl Prefs {
             clean_name.to_string()
         };
         let valid_color = PersonaColor::from_str_name(color).name().to_string();
-        let id = format!(
-            "p_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        // Two personas created within the same millisecond would otherwise share an id, and
+        // deleting or editing one would hit the other.
+        let mut id = format!("p_{stamp}");
+        let mut n = 1;
+        while self.personas.iter().any(|p| p.id == id) {
+            n += 1;
+            id = format!("p_{stamp}_{n}");
+        }
         let persona = PersonaProfile {
             id: id.clone(),
             name: final_name,
