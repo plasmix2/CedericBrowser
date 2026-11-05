@@ -18,7 +18,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::mpsc::Sender,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use gfx::{Brand, PersonaColor};
@@ -608,6 +608,8 @@ enum UserEvent {
     /// Frame tick from the pacer while the UI animates.
     Frame,
     FullscreenState(TabId, bool),
+    /// Time to check which Google account is signed in (scheduled, never run from a page event).
+    ProbeAccount,
     /// The hidden account probe finished loading Google's account list.
     AccountProbeLoaded,
     /// What the probe read, for the profile it ran in.
@@ -1455,6 +1457,8 @@ struct Browser {
     account_probe: Option<(Option<String>, WebView, Instant)>,
     /// A probe was asked for while one was running: run another when it ends.
     probe_again: bool,
+    /// A probe is already scheduled to run shortly.
+    probe_scheduled: bool,
 }
 
 impl Browser {
@@ -2187,7 +2191,7 @@ impl Browser {
     /// with a script callback, so the page itself gets no channel to the browser.
     fn probe_google_account(&mut self) {
         // A probe that never finished (offline, blocked) must not block every later one.
-        if self.account_probe.as_ref().is_some_and(|(_, _, t)| t.elapsed() < std::time::Duration::from_secs(20)) {
+        if self.account_probe.as_ref().is_some_and(|(_, _, t)| t.elapsed() < Duration::from_secs(20)) {
             self.probe_again = true;
             return;
         }
@@ -2217,6 +2221,20 @@ impl Browser {
         }
     }
 
+    /// Checks the Google account a moment from now. Never builds the probe WebView from inside a
+    /// page event: creating a WebView runs a nested message loop, and during sign-in Windows may be
+    /// showing its own modal dialog (Windows Hello for passkeys), which must not be re-entered.
+    fn schedule_account_probe(&mut self, delay: Duration) {
+        if std::mem::replace(&mut self.probe_scheduled, true) {
+            return;
+        }
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let _ = proxy.send_event(UserEvent::ProbeAccount);
+        });
+    }
+
     fn account_probe_loaded(&mut self) {
         let Some((profile, view, _)) = &self.account_probe else { return };
         let proxy = self.proxy.clone();
@@ -2243,7 +2261,7 @@ impl Browser {
             self.sync_ui();
         }
         if std::mem::take(&mut self.probe_again) {
-            self.probe_google_account();
+            self.schedule_account_probe(Duration::from_millis(500));
         }
     }
 
@@ -2320,7 +2338,7 @@ impl Browser {
         if self.prefs.active_persona().profile_name() != old_profile {
             self.google = None;
             self.reopen_tabs_in_profile();
-            self.probe_google_account();
+            self.schedule_account_probe(Duration::from_millis(800));
         }
         self.sync_all_newtabs();
         self.sync_ui();
@@ -3020,12 +3038,20 @@ impl Browser {
                     self.sync_ui();
                 }
             }
+            UserEvent::ProbeAccount => {
+                self.probe_scheduled = false;
+                self.probe_google_account();
+            }
             UserEvent::AccountProbeLoaded => self.account_probe_loaded(),
             UserEvent::GoogleAccount(profile, account) => self.set_google_account(profile, account),
             UserEvent::Load(id, ev, url) => {
-                // Signing in or out of Google always ends on an accounts.google.com page.
-                if matches!(ev, PageLoadEvent::Finished) && host_of(&url) == Some("accounts.google.com") {
-                    self.probe_google_account();
+                // Signing in or out of Google finishes on a Google page. Wait until the sign-in and
+                // challenge steps (passwords, passkeys, 2-step) are over before checking.
+                if matches!(ev, PageLoadEvent::Finished)
+                    && host_of(&url).is_some_and(|h| h == "google.com" || h.ends_with(".google.com"))
+                    && !["/signin", "/challenge", "/v3/", "/ServiceLogin", "/InteractiveLogin"].iter().any(|p| url.contains(p))
+                {
+                    self.schedule_account_probe(Duration::from_millis(1500));
                 }
                 let Some(i) = self.index_of(id) else { return };
                 let started = matches!(ev, PageLoadEvent::Started);
@@ -3360,6 +3386,16 @@ fn main() -> wry::Result<()> {
     let proxy = event_loop.create_proxy();
 
     let dir = data_dir();
+    // Release builds abort on panic with no message; keep the reason and location on disk so a
+    // crash can be traced. Appends to %LOCALAPPDATA%\Persona\crash.log (no page data in it).
+    let crash_log = dir.join("crash.log");
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&crash_log) {
+            let _ = writeln!(f, "[{secs}] {} {info}", env!("CARGO_PKG_VERSION"));
+        }
+    }));
     let prefs = Prefs::open(&dir);
     let brand = prefs.brand();
     let color = prefs.active_color();
@@ -3459,6 +3495,7 @@ fn main() -> wry::Result<()> {
         google: None,
         account_probe: None,
         probe_again: false,
+        probe_scheduled: false,
     };
     let start = std::env::args().nth(1).and_then(|a| {
         let resolved = input::resolve_with_info(&unmask(&a))?;
@@ -3467,7 +3504,7 @@ fn main() -> wry::Result<()> {
     });
     browser.open_tab(start, None, true)?;
     browser.layout();
-    browser.probe_google_account();
+    browser.schedule_account_probe(Duration::from_millis(1500));
 
     event_loop.run(move |event, _, control_flow| {
         match event {

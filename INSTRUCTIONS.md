@@ -101,6 +101,8 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`claude/kind-brown-esznx2` (passkey crash)**: the account probe is no longer built straight from a page-load event. `schedule_account_probe` sends `UserEvent::ProbeAccount` after a delay, and skips sign-in/challenge pages. Building a WebView runs a nested message loop that can collide with Windows' modal Windows Hello (passkey) dialog. Release builds now append panics (message + file:line) to `%LOCALAPPDATA%\Persona\crash.log` (hook in `main`). Ask users for that file when something crashes.
+
 - **`claude/kind-brown-esznx2` (Google accounts per persona)**:
   - Each persona has its own WebView2 profile (`PersonaProfile::profile_name`, wry `with_profile_name`), so its own cookies and Google sign-in. `cederic` keeps the default profile, so earlier sign-ins stay with it. All WebViews still share `BROWSER_ARGS`, scroll bar style and data folder. Switching persona reopens all tabs in the new profile (`Browser::reopen_tabs_in_profile`).
   - The signed-in Google account is read by a hidden, throwaway WebView (`probe_google_account`). It opens `accounts.google.com/robots.txt` and POSTs synchronously to `ListAccounts` (the endpoint Chrome's avatar uses; GET returns 400), reading the text back via `evaluate_script_with_callback`. The page gets no IPC, its navigation is pinned to that one URL, and `parse_google_accounts` keeps only validated fields and googleusercontent.com photos. It runs at startup, on persona switch, and after any accounts.google.com page finishes loading.
