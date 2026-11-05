@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gfx::{Brand, PersonaColor};
+use gfx::{Brand, Icon, PersonaColor};
 use history::{HistoryEntry, HistoryStore};
 use popups::{Card, Content, Kind as PopupKind, MenuEntry, Pick, Popups, SuggestEntry};
 use tiny_skia::Pixmap;
@@ -822,6 +822,7 @@ enum MenuAction {
     SetBackgroundUrl(String),
     ClearBackground,
     ToggleFullscreen,
+    Print,
     ClearSiteData,
     OpenTab(String),
     RestartToUpdate,
@@ -1445,17 +1446,34 @@ impl Prefs {
     }
 }
 
+#[derive(Clone)]
 struct MenuItem {
     label: String,
     hint: Option<String>,
     disabled: bool,
     sep: bool,
     action: Option<MenuAction>,
+    icon: Option<Icon>,
+    avatar: Option<popups::Avatar>,
+    /// Items of a submenu that opens beside this row.
+    sub: Option<Vec<MenuItem>>,
 }
 
 impl MenuItem {
     fn new(label: impl Into<String>, action: MenuAction) -> Self {
-        Self { label: label.into(), hint: None, disabled: false, sep: false, action: Some(action) }
+        Self { label: label.into(), hint: None, disabled: false, sep: false, action: Some(action), icon: None, avatar: None, sub: None }
+    }
+    fn icon(mut self, icon: Icon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+    fn avatar(mut self, a: popups::Avatar) -> Self {
+        self.avatar = Some(a);
+        self
+    }
+    /// A row that only opens `items` in a submenu.
+    fn submenu(label: impl Into<String>, items: Vec<MenuItem>) -> Self {
+        Self { label: label.into(), hint: None, disabled: false, sep: false, action: None, icon: None, avatar: None, sub: Some(items) }
     }
     fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
@@ -1466,7 +1484,7 @@ impl MenuItem {
         self
     }
     fn sep() -> Self {
-        Self { label: String::new(), hint: None, disabled: true, sep: true, action: None }
+        Self { label: String::new(), hint: None, disabled: true, sep: true, action: None, icon: None, avatar: None, sub: None }
     }
 }
 
@@ -1573,6 +1591,9 @@ struct Browser {
     dark: bool,
     popups: Popups,
     menu_actions: Vec<Option<MenuAction>>,
+    /// Submenus of the open menu's rows, and the actions of the open submenu's rows.
+    menu_subs: Vec<Option<Vec<MenuItem>>>,
+    sub_actions: Vec<Option<MenuAction>>,
     thumbs_tx: Sender<thumbs::Request>,
     suggest_tx: Sender<suggest::Request>,
     suggest_seq: u64,
@@ -2114,6 +2135,33 @@ impl Browser {
 
     fn close_menu(&mut self) {
         self.popups.hide(PopupKind::Menu);
+        self.popups.hide(PopupKind::Sub);
+    }
+
+    /// Opens the submenu of row `index` of the open menu, beside that row.
+    fn show_sub(&mut self, index: usize) {
+        const W: f64 = 250.0;
+        let Some(Some(items)) = self.menu_subs.get(index).cloned() else { return };
+        let Some((cx, ry, cw)) = self.popups.row_anchor(PopupKind::Menu, index) else { return };
+        let origin = self.to_screen(0.0, 0.0);
+        let size = self.logical_size();
+        let h = 10.0 + items.iter().map(|i| if i.sep { 9.0 } else { 30.0 }).sum::<f64>();
+        // To the right of the menu, or to its left when there is no room.
+        let mut x = cx - origin.x + cw as f64 - 4.0;
+        if x + W > size.width {
+            x = (cx - origin.x - W + 4.0).max(0.0);
+        }
+        let y = (ry - origin.y - 5.0).min((size.height - h).max(0.0)).max(0.0);
+        let mut entries = Vec::with_capacity(items.len());
+        self.sub_actions = items
+            .into_iter()
+            .map(|i| {
+                entries.push(MenuEntry { label: i.label, hint: i.hint, disabled: i.disabled, sep: i.sep, icon: i.icon, avatar: i.avatar, sub: false });
+                i.action
+            })
+            .collect();
+        let pos = self.to_screen(x, y);
+        self.popups.show(PopupKind::Sub, Content::Menu(entries), pos, W as f32);
     }
 
     /// Shows a menu at a point in the main window's client area.
@@ -2124,10 +2172,12 @@ impl Browser {
         let x = if x + W > size.width { (x - W).max(0.0) } else { x };
         let y = if y + h > size.height { (size.height - h).max(0.0) } else { y };
         let mut entries = Vec::with_capacity(items.len());
+        self.menu_subs = items.iter().map(|i| i.sub.clone()).collect();
+        self.popups.hide(PopupKind::Sub);
         self.menu_actions = items
             .into_iter()
             .map(|i| {
-                entries.push(MenuEntry { label: i.label, hint: i.hint, disabled: i.disabled, sep: i.sep });
+                entries.push(MenuEntry { label: i.label, hint: i.hint, disabled: i.disabled, sep: i.sep, icon: i.icon, avatar: i.avatar, sub: i.sub.is_some() });
                 i.action
             })
             .collect();
@@ -2304,35 +2354,67 @@ impl Browser {
             items.push(MenuItem::new(format!("Restart to update to Persona {v}"), MenuAction::RestartToUpdate).hint("Update"));
             items.push(MenuItem::sep());
         }
-        match &self.google {
+        // The linked Google account comes first, with its photo: it is the default identity.
+        match self.google.clone() {
             Some(g) => {
-                items.push(MenuItem::new(g.name.clone(), MenuAction::OpenTab(GOOGLE_ACCOUNT_URL.into())).hint("Google").enabled(false));
-                if g.email != g.name {
-                    items.push(MenuItem::new(g.email.clone(), MenuAction::OpenTab(GOOGLE_ACCOUNT_URL.into())).enabled(false));
+                let photo = (!g.photo.is_empty()).then(|| g.photo.clone());
+                if let Some(u) = &photo
+                    && !self.popups.has_image(u)
+                {
+                    let _ = self.icons_tx.send(u.clone());
                 }
-                items.push(MenuItem::new("Manage your Google Account", MenuAction::OpenTab(GOOGLE_ACCOUNT_URL.into())));
-                items.push(MenuItem::new("Sign out of Google", MenuAction::OpenTab(GOOGLE_SIGN_OUT_URL.into())));
+                let color = self.prefs.active_color().accents(self.dark).0;
+                let av = popups::Avatar { url: photo, letter: g.name.chars().next().map_or("G".into(), |c| c.to_uppercase().to_string()), color };
+                let mut row = MenuItem::submenu(
+                    g.name.clone(),
+                    vec![
+                        MenuItem::new("Manage your Google Account", MenuAction::OpenTab(GOOGLE_ACCOUNT_URL.into())).icon(Icon::UserCircle),
+                        MenuItem::new("Sign out of Google", MenuAction::OpenTab(GOOGLE_SIGN_OUT_URL.into())).icon(Icon::Logout),
+                    ],
+                )
+                .avatar(av);
+                if g.email != g.name {
+                    row.hint = Some(g.email.clone());
+                }
+                items.push(row);
             }
-            None => items.push(MenuItem::new("Sign in to Google", MenuAction::OpenTab(GOOGLE_SIGN_IN_URL.into()))),
+            None => items.push(MenuItem::new("Sign in to Google", MenuAction::OpenTab(GOOGLE_SIGN_IN_URL.into())).icon(Icon::UserCircle)),
         }
         items.push(MenuItem::sep());
-        for p in &self.prefs.personas {
+        // Personas live in a submenu.
+        let mut persona_items = Vec::new();
+        let photo = self.google.as_ref().map(|g| g.photo.clone()).filter(|u| !u.is_empty());
+        let personas = self.prefs.personas.clone();
+        for p in &personas {
             let is_cur = p.id == active_id;
-            let mark = if is_cur { "✓  " } else { "    " };
-            let label = format!("{mark}{}", p.name);
-            items.push(MenuItem::new(label, MenuAction::SelectPersona(p.id.clone())));
+            let url = p.pfp.clone().or_else(|| if is_cur { photo.clone() } else { None });
+            if let Some(u) = &url
+                && !self.popups.has_image(u)
+            {
+                let _ = self.icons_tx.send(u.clone());
+            }
+            let av = popups::Avatar { url, letter: p.badge_letter(), color: p.parsed_color().accents(self.dark).0 };
+            let mut it = MenuItem::new(p.name.clone(), MenuAction::SelectPersona(p.id.clone())).avatar(av);
+            if is_cur {
+                it.hint = Some("Active".into());
+            }
+            persona_items.push(it);
         }
+        persona_items.push(MenuItem::sep());
         if self.prefs.personas.len() < 5 {
-            items.push(MenuItem::new("New persona…", MenuAction::OpenNewPersona));
+            persona_items.push(MenuItem::new("New persona…", MenuAction::OpenNewPersona).icon(Icon::Plus));
         }
-        items.push(MenuItem::new("Manage personas…", MenuAction::OpenManagePersonas));
+        persona_items.push(MenuItem::new("Manage personas…", MenuAction::OpenManagePersonas).icon(Icon::Settings));
+        let mut row = MenuItem::submenu("Personas", persona_items).icon(Icon::Users);
+        row.hint = Some(self.prefs.active_name().to_string());
+        items.push(row);
         items.push(MenuItem::sep());
         let has_bg = self.prefs.background().is_some();
-        items.push(MenuItem::new(if has_bg { "Change background…" } else { "Set background…" }, MenuAction::ChooseBackground));
+        items.push(MenuItem::new(if has_bg { "Change background…" } else { "Set background…" }, MenuAction::ChooseBackground).icon(Icon::Photo));
         if has_bg {
-            items.push(MenuItem::new("Remove background", MenuAction::ClearBackground));
+            items.push(MenuItem::new("Remove background", MenuAction::ClearBackground).icon(Icon::Trash));
         }
-        items.push(MenuItem::new("Site permissions…", MenuAction::OpenSettings));
+        items.push(MenuItem::new("Site permissions…", MenuAction::OpenSettings).icon(Icon::ShieldLock));
         self.show_menu(items, (right - 260.0).max(0.0), y);
     }
 
@@ -2495,6 +2577,15 @@ impl Browser {
         // Ignore a result for a persona that is no longer active.
         if profile == self.prefs.active_persona().profile_name() {
             self.prefs.google_hint = account.as_ref().map(|a| (a.name.clone(), a.email.clone()));
+            // The linked Google account is the persona's default picture, until it gets its own.
+            if let Some(a) = &account
+                && !a.photo.is_empty()
+            {
+                let cur = self.prefs.active_persona().clone();
+                if cur.pfp.is_none() {
+                    self.prefs.update_persona(&cur.id, &cur.name, &cur.color, Some(Some(a.photo.clone())));
+                }
+            }
             self.google = account;
             self.sync_all_newtabs();
             self.sync_ui();
@@ -2604,41 +2695,44 @@ impl Browser {
         let Some(tab) = self.active_tab().filter(|t| t.id == id) else { return };
         let mut items = Vec::new();
         if !r.link.is_empty() {
-            items.push(MenuItem::new("Open link in new tab", MenuAction::OpenBackground(r.link.clone())));
-            items.push(MenuItem::new("Copy link address", MenuAction::Copy(r.link)));
+            items.push(MenuItem::new("Open link in new tab", MenuAction::OpenBackground(r.link.clone())).icon(Icon::ExternalLink));
+            items.push(MenuItem::new("Copy link address", MenuAction::Copy(r.link)).icon(Icon::Link));
             items.push(MenuItem::sep());
         }
         if !r.image.is_empty() {
-            items.push(MenuItem::new("Open image in new tab", MenuAction::OpenBackground(r.image.clone())));
-            items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image.clone())));
-            items.push(MenuItem::new("Set image as background", MenuAction::SetBackgroundUrl(r.image)));
+            items.push(MenuItem::new("Open image in new tab", MenuAction::OpenBackground(r.image.clone())).icon(Icon::Photo));
+            items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image.clone())).icon(Icon::Copy));
+            items.push(MenuItem::new("Set image as background", MenuAction::SetBackgroundUrl(r.image)).icon(Icon::Photo));
             items.push(MenuItem::sep());
         }
         if r.video || r.pip || tab.pip {
             let label = if r.pip || tab.pip { "Exit Picture in Picture" } else { "Picture in Picture" };
-            items.push(MenuItem::new(label, MenuAction::TogglePip(id, true)).hint("Alt+P"));
+            items.push(MenuItem::new(label, MenuAction::TogglePip(id, true)).hint("Alt+P").icon(Icon::Pip));
             items.push(MenuItem::sep());
         }
         let sel = r.selection.trim();
         if !sel.is_empty() {
             let short: String = sel.chars().take(24).collect();
             let ell = if sel.chars().count() > 24 { "…" } else { "" };
-            items.push(MenuItem::new("Copy", MenuAction::Copy(sel.to_owned())).hint("Ctrl+C"));
-            items.push(MenuItem::new(format!("Search for “{short}{ell}”"), MenuAction::SearchFor(sel.to_owned())));
+            items.push(MenuItem::new("Copy", MenuAction::Copy(sel.to_owned())).hint("Ctrl+C").icon(Icon::Copy));
+            items.push(MenuItem::new(format!("Search for “{short}{ell}”"), MenuAction::SearchFor(sel.to_owned())).icon(Icon::Search));
             items.push(MenuItem::sep());
         }
         let (back, fwd) = (tab.view.can_go_back().unwrap_or(false), tab.view.can_go_forward().unwrap_or(false));
         let web = tab.url.starts_with("http");
         let bm_label = if self.prefs.is_bookmarked(&tab.url) { "Remove bookmark" } else { "Bookmark this page" };
-        items.push(MenuItem::new("Back", MenuAction::Back).hint("Alt+←").enabled(back));
-        items.push(MenuItem::new("Forward", MenuAction::Forward).hint("Alt+→").enabled(fwd));
-        items.push(MenuItem::new("Reload", MenuAction::Reload).hint("Ctrl+R"));
-        items.push(MenuItem::new(bm_label, MenuAction::ToggleBookmark).hint("Ctrl+D").enabled(web));
+        items.push(MenuItem::new("Back", MenuAction::Back).hint("Alt+←").enabled(back).icon(Icon::Back));
+        items.push(MenuItem::new("Forward", MenuAction::Forward).hint("Alt+→").enabled(fwd).icon(Icon::Forward));
+        items.push(MenuItem::new("Reload", MenuAction::Reload).hint("Ctrl+R").icon(Icon::Reload));
+        items.push(MenuItem::new(bm_label, MenuAction::ToggleBookmark).hint("Ctrl+D").enabled(web).icon(Icon::Bookmarks));
         items.push(MenuItem::sep());
-        items.push(MenuItem::new("View page source", MenuAction::ViewSource).enabled(web));
-        items.push(MenuItem::new("Inspect", MenuAction::Inspect).hint("F12"));
+        items.push(MenuItem::new("Copy page address", MenuAction::Copy(tab.url.clone())).enabled(web).icon(Icon::Link));
+        items.push(MenuItem::new("Print…", MenuAction::Print).hint("Ctrl+P").enabled(web).icon(Icon::Printer));
+        items.push(MenuItem::sep());
+        items.push(MenuItem::new("View page source", MenuAction::ViewSource).enabled(web).icon(Icon::Code));
+        items.push(MenuItem::new("Inspect", MenuAction::Inspect).hint("F12").icon(Icon::Code));
         let fs_label = if self.fullscreen { "Exit Full Screen" } else { "Full Screen" };
-        items.push(MenuItem::new(fs_label, MenuAction::ToggleFullscreen).hint("F11"));
+        items.push(MenuItem::new(fs_label, MenuAction::ToggleFullscreen).hint("F11").icon(Icon::Maximize));
 
         // Page coordinates are CSS pixels of the (possibly zoomed) page.
         let zoom = r.dpr / self.window.scale_factor();
@@ -2741,6 +2835,7 @@ impl Browser {
             MenuAction::ClearBackground => self.apply_background(None, None),
             MenuAction::ToggleFullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
             MenuAction::OpenSettings => self.open_settings(),
+            MenuAction::Print => self.with_active(|v| v.evaluate_script("window.print()")),
         }
     }
 
@@ -3019,6 +3114,21 @@ impl Browser {
 
     fn handle_pick(&mut self, pick: Pick) {
         match pick {
+            Pick::Hover(index) => {
+                if self.menu_subs.get(index).is_some_and(|s| s.is_some()) {
+                    self.show_sub(index);
+                } else {
+                    self.popups.hide(PopupKind::Sub);
+                }
+            }
+            Pick::Sub(index) => {
+                self.close_menu();
+                self.refocus_page();
+                if let Some(Some(action)) = self.sub_actions.get(index).cloned() {
+                    self.run_menu_action(action);
+                }
+            }
+            Pick::Menu(index) if self.menu_subs.get(index).is_some_and(|s| s.is_some()) => self.show_sub(index),
             Pick::Menu(index) => {
                 self.close_menu();
                 self.refocus_page();
@@ -3208,6 +3318,7 @@ impl Browser {
             UserEvent::NewTab(id, cmd) => self.handle_newtab(id, cmd),
             UserEvent::PageMenu(id, r) => self.page_menu(id, r),
             UserEvent::IconLoaded(url, img) => {
+                self.popups.image_loaded(url.clone(), img.clone());
                 self.toolbar.icon_loaded(url, img);
                 self.window.request_redraw();
             }
@@ -3782,6 +3893,8 @@ fn main() -> wry::Result<()> {
         dark,
         popups,
         menu_actions: Vec::new(),
+        menu_subs: Vec::new(),
+        sub_actions: Vec::new(),
         thumbs_tx,
         suggest_tx,
         suggest_seq: 0,

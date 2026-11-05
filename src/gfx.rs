@@ -383,6 +383,20 @@ pub enum Icon {
     WinMax,
     WinRestore,
     WinClose,
+    ExternalLink,
+    Copy,
+    Link,
+    Photo,
+    Printer,
+    Maximize,
+    UserCircle,
+    Users,
+    Settings,
+    ChevronRight,
+    Check,
+    Logout,
+    ShieldLock,
+    Trash,
 }
 
 pub fn rrect_path(x: f32, y: f32, w: f32, h: f32, r: [f32; 4]) -> Option<Path> {

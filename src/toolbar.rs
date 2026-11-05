@@ -115,6 +115,8 @@ struct TabVis {
     w: f32,
     alpha: f32,
     hover: f32,
+    /// 0..1: how "selected" the tab looks; eases when the active tab changes.
+    act: f32,
     leaving: bool,
 }
 
@@ -155,6 +157,9 @@ pub struct Toolbar {
     focus_f: f32,
     /// 1 -> 0 after a page is bookmarked: drives the star's little pop.
     star_pop: f32,
+    /// 0..1 lift of the tab being dragged (and of the one just dropped, while it settles).
+    lift: f32,
+    lift_id: Option<TabId>,
     spin: f32,
     icons: HashMap<String, Option<Pixmap>>,
     icon_requests: Vec<String>,
@@ -265,6 +270,8 @@ impl Toolbar {
             load_morph: 0.0,
             focus_f: 0.0,
             star_pop: 0.0,
+            lift: 0.0,
+            lift_id: None,
             spin: 0.0,
             icons: HashMap::new(),
             icon_requests: Vec::new(),
@@ -354,7 +361,8 @@ impl Toolbar {
             if !self.vis.iter().any(|v| v.id == *id) {
                 // New tabs start collapsed at their slot and grow in place.
                 let x = self.slot_x(i);
-                self.vis.push(TabVis { id: *id, x, w: 0.0, alpha: 0.0, hover: 0.0, leaving: false });
+                // New tabs start part-open (not from nothing) so opening one feels immediate.
+                self.vis.push(TabVis { id: *id, x, w: self.tab_w * 0.45, alpha: 0.5, hover: 0.0, act: 0.0, leaving: false });
                 fresh = true;
             }
         }
@@ -519,7 +527,7 @@ impl Toolbar {
             hist,
             theme,
             dev,
-            new_tab: R { x: self.tabs_end() + 4.0, y: 5.0, w: 30.0, h: 30.0 },
+            new_tab: R { x: self.tabs_end() + 6.0, y: TAB_Y + 2.0, w: 30.0, h: 30.0 },
             min: R { x: w - 3.0 * WIN_BTN_W, y: 0.0, w: WIN_BTN_W, h: TITLE_H },
             max: R { x: w - 2.0 * WIN_BTN_W, y: 0.0, w: WIN_BTN_W, h: TITLE_H },
             close: R { x: w - WIN_BTN_W, y: 0.0, w: WIN_BTN_W, h: TITLE_H },
@@ -741,6 +749,8 @@ impl Toolbar {
                     self.blink_from = Instant::now();
                 }
             }
+            // The plus acts on press, so a new tab does not wait for the button to come back up.
+            (MouseButton::Left, Hit::NewTab) => self.cmds.push(ChromeCmd::NewTab),
             (MouseButton::Left, h) if h != Hit::None => self.pressed = Some(h),
             _ => {}
         }
@@ -1123,7 +1133,7 @@ impl Toolbar {
         self.update_hover_card(now);
         self.update_tip(now);
         // Rates tuned so motion settles in ~0.2s and hover fades in ~0.12s.
-        let k = 1.0 - (-dt * 26.0).exp();
+        let k = 1.0 - (-dt * if self.drag.as_ref().is_some_and(|d| d.active) { 36.0 } else { 32.0 }).exp();
         let kf = 1.0 - (-dt * 30.0).exp();
         let mut busy = false;
 
@@ -1133,7 +1143,18 @@ impl Toolbar {
         let tab_w = self.tab_w;
         let targets: Vec<(TabId, f32)> = slots.iter().enumerate().map(|(i, id)| (*id, self.slot_x(i))).collect();
         let (hover, active) = (self.hover, self.model.active);
+        // The dragged tab lifts off the strip, and settles back after the drop.
+        if let Some(id) = drag_id {
+            self.lift_id = Some(id);
+            busy |= approach01(&mut self.lift, 1.0, kf);
+        } else {
+            busy |= approach01(&mut self.lift, 0.0, kf);
+            if self.lift < 0.01 {
+                self.lift_id = None;
+            }
+        }
         for v in &mut self.vis {
+            busy |= approach01(&mut v.act, if v.id == active && !v.leaving { 1.0 } else { 0.0 }, kf);
             let hovered = matches!(hover, Hit::Tab(id) | Hit::TabClose(id) if id == v.id);
             busy |= approach01(&mut v.hover, if hovered && v.id != active { 1.0 } else { 0.0 }, kf);
             if v.leaving {
@@ -1258,11 +1279,13 @@ impl Toolbar {
         let g = self.geo();
 
         // New tab button.
-        self.button_bg(c, g.new_tab, Hit::NewTab, 8.0, &th);
+        // A faint round chip is always there, so the plus never floats loose in the strip.
+        c.rrect(g.new_tab.x, g.new_tab.y, g.new_tab.w, g.new_tab.h, 15.0, th.fg.with_alpha(0.07));
+        self.button_bg(c, g.new_tab, Hit::NewTab, 15.0, &th);
         // The plus turns a quarter as the pointer arrives.
         let k = self.press_scale(Hit::NewTab);
         let sz = 16.0 * k;
-        c.icon_rot(Icon::Plus, g.new_tab.x + 7.0 + (16.0 - sz) / 2.0, g.new_tab.y + 7.0 + (16.0 - sz) / 2.0, sz, th.dim.mix(th.fg, self.fade(Hit::NewTab)), self.fade(Hit::NewTab) * std::f32::consts::FRAC_PI_2);
+        c.icon_rot(Icon::Plus, g.new_tab.x + 7.0 + (16.0 - sz) / 2.0, g.new_tab.y + 7.0 + (16.0 - sz) / 2.0, sz, th.fg.with_alpha(0.72 + 0.28 * self.fade(Hit::NewTab)), self.fade(Hit::NewTab) * std::f32::consts::FRAC_PI_2);
 
         // Window controls.
         for (r, h, icon) in [
@@ -1377,7 +1400,6 @@ impl Toolbar {
     fn draw_tabs(&mut self, c: &mut Painter, th: &Theme) {
         let slots = self.slots();
         let active = self.model.active;
-        let drag_id = self.drag.as_ref().filter(|d| d.active).map(|d| d.id);
         let active_at = slots.iter().position(|id| *id == active);
         let hover_at = match self.hover {
             Hit::Tab(id) | Hit::TabClose(id) => slots.iter().position(|t| *t == id),
@@ -1385,33 +1407,42 @@ impl Toolbar {
         };
         // Leaving tabs underneath, then normal ones, then the active tab, then the dragged one on top.
         let mut idx: Vec<usize> = (0..self.vis.len()).collect();
+        let lift_id = self.lift_id.filter(|_| self.lift > 0.01);
         idx.sort_by_key(|&i| {
             let v = &self.vis[i];
-            (v.leaving as u8 == 0, v.id == active, Some(v.id) == drag_id)
+            (v.leaving as u8 == 0, v.id == active, Some(v.id) == lift_id)
         });
         for i in idx {
-            let (id, x, w, alpha, hover, leaving) = {
+            let (id, x, w, alpha, hover, leaving, act) = {
                 let v = &self.vis[i];
-                (v.id, self.snap(v.x), self.snap(v.x + v.w) - self.snap(v.x), v.alpha, v.hover, v.leaving)
+                (v.id, self.snap(v.x), self.snap(v.x + v.w) - self.snap(v.x), v.alpha, v.hover, v.leaving, v.act)
             };
             if w < 1.0 || alpha <= 0.01 {
                 continue;
             }
-            let is_active = id == active && !leaving;
-            let dragging = Some(id) == drag_id;
+            let lift = if Some(id) == lift_id { self.lift } else { 0.0 };
+            let dragging = lift > 0.01;
             let slot = slots.iter().position(|t| *t == id);
+            // A lifted tab grows a little and floats on a soft shadow.
+            let (x, w) = (x - 2.0 * lift, w + 4.0 * lift);
             if dragging {
-                for (spread, a) in [(6.0, 0.06), (3.0, 0.1), (1.0, 0.14)] {
-                    c.rrect(x - spread, TAB_Y - spread * 0.3, w + spread * 2.0, TAB_H + spread, 10.0 + spread, Rgba(0, 0, 0, 255).with_alpha(a));
+                for (spread, a) in [(10.0, 0.05), (6.0, 0.08), (3.0, 0.11), (1.0, 0.14)] {
+                    c.rrect(x - spread, TAB_Y - spread * 0.2 + 2.0 * lift, w + spread * 2.0, TAB_H + spread, 10.0 + spread, Rgba(0, 0, 0, 255).with_alpha(a * lift));
                 }
-                c.rrect(x, TAB_Y, w, TAB_H, 10.0, th.toolbar);
-            } else if is_active {
-                c.rrect_top(x, TAB_Y, w, TAB_H, 10.0, th.toolbar);
-                c.foot(x - 10.0, TITLE_H, 10.0, false, th.toolbar);
-                c.foot(x + w, TITLE_H, 10.0, true, th.toolbar);
-            } else if hover > 0.0 {
-                c.rrect_top(x, TAB_Y, w, TAB_H, 10.0, th.tab_hover.with_alpha(hover * alpha));
+                c.rrect(x, TAB_Y, w, TAB_H, 10.0, th.toolbar.mix(Rgba(255, 255, 255, 255), 0.05 * lift));
+            } else {
+                // The selected look fades in and out as the active tab changes.
+                if act > 0.01 {
+                    let col = th.toolbar.with_alpha(act);
+                    c.rrect_top(x, TAB_Y, w, TAB_H, 10.0, col);
+                    c.foot(x - 10.0, TITLE_H, 10.0, false, col);
+                    c.foot(x + w, TITLE_H, 10.0, true, col);
+                }
+                if hover > 0.0 && act < 0.99 {
+                    c.rrect_top(x, TAB_Y, w, TAB_H, 10.0, th.tab_hover.with_alpha(hover * alpha * (1.0 - act)));
+                }
             }
+            let is_active = act > 0.5;
             // Separator after inactive tabs, except next to the active or hovered tab and after the last.
             if let Some(i) = slot
                 && !dragging

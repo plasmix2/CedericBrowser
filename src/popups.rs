@@ -102,15 +102,30 @@ pub enum Kind {
     Tip,
     /// A centred dialog with switches (site permissions). Stays until its Done button is clicked.
     Modal,
+    /// A submenu next to a menu row.
+    Sub,
     /// The blurred, dimmed page behind a modal. Swallows clicks so the page cannot be used meanwhile.
     Scrim,
 }
 
+/// A round picture for a menu row: the photo at `url` once it has loaded, otherwise `letter` on `color`.
+#[derive(Clone)]
+pub struct Avatar {
+    pub url: Option<String>,
+    pub letter: String,
+    pub color: Rgba,
+}
+
+#[derive(Default)]
 pub struct MenuEntry {
     pub label: String,
     pub hint: Option<String>,
     pub disabled: bool,
     pub sep: bool,
+    pub icon: Option<Icon>,
+    pub avatar: Option<Avatar>,
+    /// Opens a submenu (drawn with a chevron).
+    pub sub: bool,
 }
 
 pub struct SuggestEntry {
@@ -149,6 +164,9 @@ struct Row {
     y: f32,
     h: f32,
     label: Option<String>,
+    icon: Option<Icon>,
+    avatar: Option<Avatar>,
+    sub: bool,
     /// Text drawn right after `label` in a heavier weight (the part of a suggestion that was not typed).
     tail: String,
     hint: Option<String>,
@@ -183,6 +201,8 @@ pub struct Popup {
     open: bool,
     /// Where to move the window once it has been repainted at its new size.
     pending_pos: Option<LogicalPosition<f64>>,
+    /// Where the card is on screen (logical), for placing a submenu beside a row.
+    card_pos: (f64, f64),
     v: View,
 }
 
@@ -192,6 +212,10 @@ pub enum Pick {
     Suggest(usize),
     /// A row of the modal: a switch (0..n) or, last, the Done button.
     Modal(usize),
+    /// A row of a submenu.
+    Sub(usize),
+    /// The pointer moved onto row `i` of the main menu (to open or close its submenu).
+    Hover(usize),
 }
 
 pub struct Popups {
@@ -204,6 +228,9 @@ pub struct Popups {
     pub tip: Popup,
     pub modal: Popup,
     pub scrim: Popup,
+    pub sub: Popup,
+    /// Photos for menu avatars, by URL.
+    images: std::collections::HashMap<String, Pixmap>,
     last_frame: Instant,
 }
 
@@ -221,6 +248,8 @@ impl Popups {
             preview: make(Kind::Preview),
             tip: make(Kind::Tip),
             modal: make(Kind::Modal),
+            sub: make(Kind::Sub),
+            images: std::collections::HashMap::new(),
             theme,
             last_frame: Instant::now(),
         }
@@ -234,7 +263,7 @@ impl Popups {
     pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor) {
         self.theme = Theme::for_persona(dark, color);
         let c = self.theme.card;
-        for p in [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal, &self.scrim] {
+        for p in [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal, &self.scrim, &self.sub] {
             p.window.set_background_color(Some(window_bg(c)));
             if p.open {
                 p.window.request_redraw();
@@ -250,7 +279,31 @@ impl Popups {
             Kind::Tip => &mut self.tip,
             Kind::Modal => &mut self.modal,
             Kind::Scrim => &mut self.scrim,
+            Kind::Sub => &mut self.sub,
         }
+    }
+
+    /// A photo for a menu avatar arrived.
+    pub fn image_loaded(&mut self, url: String, img: Option<Pixmap>) {
+        if let Some(img) = img {
+            self.images.insert(url, img);
+            for kind in [Kind::Menu, Kind::Sub] {
+                if self.get(kind).open {
+                    self.redraw(kind);
+                }
+            }
+        }
+    }
+
+    pub fn has_image(&self, url: &str) -> bool {
+        self.images.contains_key(url)
+    }
+
+    /// Where row `i` of an open popup is on screen: (card left, row top, card width), logical px.
+    pub fn row_anchor(&mut self, kind: Kind, i: usize) -> Option<(f64, f64, f32)> {
+        let p = self.get(kind);
+        let r = p.v.rows.get(i)?;
+        Some((p.card_pos.0, p.card_pos.1 + r.y as f64, p.v.size.0))
     }
 
     /// Window width that fits a tooltip showing `text`, measured with the real font.
@@ -271,6 +324,7 @@ impl Popups {
             Kind::Tip => self.tip.open,
             Kind::Modal => self.modal.open,
             Kind::Scrim => self.scrim.open,
+            Kind::Sub => self.sub.open,
         }
     }
 
@@ -298,6 +352,7 @@ impl Popups {
         p.v.content = content;
         p.v.size = (w, h);
         p.open = true;
+        p.card_pos = (pos.x, pos.y);
         // `pos` and `w`/`h` are the card's; the window adds room for the shadow around it.
         let m = margins(kind);
         let pos = LogicalPosition::new(pos.x - m.l as f64, pos.y - m.t as f64);
@@ -335,7 +390,7 @@ impl Popups {
     }
 
     pub fn owns(&self, id: WindowId) -> Option<Kind> {
-        [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal, &self.scrim].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
+        [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal, &self.scrim, &self.sub].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
     }
 
     /// Mouse input on a popup window. Returns a pick when a row was clicked.
@@ -363,6 +418,9 @@ impl Popups {
                         p.v.selected = i;
                     }
                     p.window.request_redraw();
+                    if kind == Kind::Menu {
+                        return hover.map(Pick::Hover);
+                    }
                 }
                 None
             }
@@ -375,14 +433,18 @@ impl Popups {
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match (kind, state) {
                 // Suggestions act on press: the address bar may lose focus before release.
                 (Kind::Suggest, ElementState::Pressed) => p.v.hover.map(Pick::Suggest),
-                (Kind::Menu | Kind::Modal, ElementState::Pressed) => {
+                (Kind::Menu | Kind::Modal | Kind::Sub, ElementState::Pressed) => {
                     p.v.pressed = p.v.hover;
                     p.window.request_redraw();
                     None
                 }
-                (Kind::Menu | Kind::Modal, ElementState::Released) => {
+                (Kind::Menu | Kind::Modal | Kind::Sub, ElementState::Released) => {
                     let picked = p.v.pressed.take().filter(|i| Some(*i) == p.v.hover);
-                    picked.map(if kind == Kind::Modal { Pick::Modal } else { Pick::Menu })
+                    picked.map(match kind {
+                        Kind::Modal => Pick::Modal,
+                        Kind::Sub => Pick::Sub,
+                        _ => Pick::Menu,
+                    })
                 }
                 _ => None,
             },
@@ -397,7 +459,7 @@ impl Popups {
         let k = 1.0 - (-dt * 30.0).exp();
         let mut busy = false;
         let mut dirty = Vec::new();
-        for p in [&mut self.menu, &mut self.suggest, &mut self.preview, &mut self.tip, &mut self.modal, &mut self.scrim] {
+        for p in [&mut self.menu, &mut self.suggest, &mut self.preview, &mut self.tip, &mut self.modal, &mut self.scrim, &mut self.sub] {
             if !p.open {
                 continue;
             }
@@ -431,6 +493,7 @@ impl Popups {
     pub fn redraw(&mut self, kind: Kind) {
         let th = self.theme;
         let engine = &mut self.engine;
+        let images = &self.images;
         let p = match kind {
             Kind::Menu => &mut self.menu,
             Kind::Suggest => &mut self.suggest,
@@ -438,6 +501,7 @@ impl Popups {
             Kind::Tip => &mut self.tip,
             Kind::Modal => &mut self.modal,
             Kind::Scrim => &mut self.scrim,
+            Kind::Sub => &mut self.sub,
         };
         if !p.open {
             return;
@@ -454,7 +518,7 @@ impl Popups {
             let Some(pm) = Pixmap::new(cw, ch) else { return };
             p.card = pm;
         }
-        draw(&mut p.v, &mut p.card, engine, &th, s);
+        draw(&mut p.v, &mut p.card, engine, images, &th, s);
         compose(&p.card, &mut p.pm, &mut p.frame, engine.as_mut(), margins(kind), corner_radius(kind), kind != Kind::Scrim, s, &th);
         let (w_u32, h_u32) = (w.get(), h.get());
         if p.surface_size != (w_u32, h_u32) {
@@ -516,6 +580,7 @@ impl Popup {
             frame: None,
             open: false,
             pending_pos: None,
+            card_pos: (0.0, 0.0),
             v: View {
                 content: Content::Empty,
                 rows: Vec::new(),
@@ -535,7 +600,7 @@ impl Popup {
 fn layout(content: &Content) -> (Vec<Row>, f32) {
     let mut rows = Vec::new();
     let mut y = PAD;
-    let row = |y: f32, h: f32, label: Option<String>, hint: Option<String>, enabled: bool| Row { y, h, label, tail: String::new(), hint, enabled };
+    let row = |y: f32, h: f32, label: Option<String>, hint: Option<String>, enabled: bool| Row { y, h, label, icon: None, avatar: None, sub: false, tail: String::new(), hint, enabled };
     match content {
         Content::Empty => return (rows, 1.0),
         Content::Menu(items) => {
@@ -545,7 +610,11 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
                     y += MENU_SEP;
                     continue;
                 }
-                rows.push(row(y, MENU_ROW, Some(it.label.clone()), it.hint.clone(), !it.disabled));
+                let mut r = row(y, MENU_ROW, Some(it.label.clone()), it.hint.clone(), !it.disabled);
+                r.icon = it.icon;
+                r.avatar = it.avatar.clone();
+                r.sub = it.sub;
+                rows.push(r);
                 y += MENU_ROW;
             }
         }
@@ -586,7 +655,7 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
     (rows, y + PAD)
 }
 
-fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, th: &Theme, s: f32) {
+fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std::collections::HashMap<String, Pixmap>, th: &Theme, s: f32) {
     let bg = th.card;
     let Some(engine) = engine.as_mut() else {
         pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
@@ -606,6 +675,14 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, th: &Theme, 
                 p.shot_ready = true;
             }
             _ => {}
+        }
+    }
+    // Menu avatars: their photos go to the GPU once.
+    for r in &p.rows {
+        if let Some(Avatar { url: Some(u), .. }) = &r.avatar
+            && let Some(img) = images.get(u)
+        {
+            engine.ensure_texture(&format!("av:{u}"), img);
         }
     }
     let dark = th.fg.0 > 128;
@@ -635,12 +712,31 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, th: &Theme, 
                         c.rrect(PAD, y, w - 2.0 * PAD, r.h, 7.0, bg.with_alpha(a));
                     }
                     let fg = if r.enabled { th.fg } else { th.dim.with_alpha(0.55) }.with_alpha(a);
+                    // Rows with an icon or avatar get a leading column; the rest of the labels line up.
+                    let lead = p.rows.iter().any(|r| r.icon.is_some() || r.avatar.is_some());
+                    let tx = PAD + 10.0 + if lead { 26.0 } else { 0.0 };
+                    let cy = y + r.h / 2.0;
+                    if let Some(av) = &r.avatar {
+                        let key = av.url.as_ref().map(|u| format!("av:{u}")).unwrap_or_default();
+                        if !c.image_cover(&key, PAD + 10.0, cy - 9.0, 18.0, 18.0, 9.0) {
+                            c.circle(PAD + 19.0, cy, 9.0, av.color.with_alpha(a));
+                            let lw = c.text_width(&av.letter, 10.5, Weight::SemiBold);
+                            let lh = c.line_height(10.5, Weight::SemiBold);
+                            c.text(&av.letter, PAD + 19.0 - lw / 2.0, cy - lh / 2.0, 10.5, Weight::SemiBold, Rgba(255, 255, 255, 255).with_alpha(a), w);
+                        }
+                    } else if let Some(ic) = r.icon {
+                        c.icon(ic, PAD + 10.0, cy - 8.0, 16.0, if r.enabled { th.dim } else { th.dim.with_alpha(0.5) }.with_alpha(a));
+                    }
+                    let chev = if r.sub { 18.0 } else { 0.0 };
                     let hint_w = r.hint.as_deref().map_or(0.0, |h| c.text_width(h, 11.5, Weight::Regular));
                     let ty = y + (r.h - c.line_height(13.0, Weight::Regular)) / 2.0;
-                    c.text(label, PAD + 10.0, ty, 13.0, Weight::Regular, fg, w - PAD - 16.0 - hint_w);
+                    c.text(label, tx, ty, 13.0, Weight::Regular, fg, w - PAD - 16.0 - hint_w - chev);
                     if let Some(hint) = &r.hint {
                         let hy = y + (r.h - c.line_height(11.5, Weight::Regular)) / 2.0;
-                        c.text(hint, w - PAD - 10.0 - hint_w, hy, 11.5, Weight::Regular, th.dim.with_alpha(a), w);
+                        c.text(hint, w - PAD - 10.0 - hint_w - chev, hy, 11.5, Weight::Regular, th.dim.with_alpha(a), w);
+                    }
+                    if r.sub {
+                        c.icon(Icon::ChevronRight, w - PAD - 8.0 - 14.0, cy - 7.0, 14.0, th.dim.with_alpha(a));
                     }
                 }
             }
@@ -829,8 +925,8 @@ mod tests {
         let mut engine = Engine::new();
         let th = Theme::new(true);
         let s = 2.0;
-        let entry = |label: &str, hint: Option<&str>, disabled| MenuEntry { label: label.into(), hint: hint.map(Into::into), disabled, sep: false };
-        let sep = || MenuEntry { label: String::new(), hint: None, disabled: true, sep: true };
+        let entry = |label: &str, hint: Option<&str>, disabled| MenuEntry { label: label.into(), hint: hint.map(Into::into), disabled, sep: false, ..Default::default() };
+        let sep = || MenuEntry { sep: true, disabled: true, ..Default::default() };
         let mut thumb = Pixmap::new(320, 180).unwrap();
         thumb.fill(tiny_skia::Color::from_rgba8(40, 120, 90, 255));
         let cases = [
@@ -867,7 +963,7 @@ mod tests {
                 shot_ready: false,
             };
             let mut pm = Pixmap::new((w * s) as u32, (h * s) as u32).unwrap();
-            draw(&mut v, &mut pm, &mut engine, &th, s);
+            draw(&mut v, &mut pm, &mut engine, &Default::default(), &th, s);
             let m = margins(Kind::Menu);
             let mut out = Pixmap::new(((w + m.l + m.r) * s) as u32, ((h + m.t + m.b) * s) as u32).unwrap();
             compose(&pm, &mut out, &mut None, engine.as_mut(), m, corner_radius(Kind::Menu), true, s, &th);
@@ -888,7 +984,7 @@ mod tests {
         let mut el = EventLoopBuilder::new().with_any_thread(true).build();
         let main = WindowBuilder::new().with_decorations(false).with_inner_size(LogicalSize::new(900.0, 500.0)).with_position(LogicalPosition::new(0.0, 0.0)).build(&el).unwrap();
         let mut popups = Popups::new(&el, &main, true, Brand::Cederic);
-        let entry = |label: &str, hint: Option<&str>| MenuEntry { label: label.into(), hint: hint.map(Into::into), disabled: false, sep: false };
+        let entry = |label: &str, hint: Option<&str>| MenuEntry { label: label.into(), hint: hint.map(Into::into), disabled: false, sep: false, ..Default::default() };
         popups.show(Kind::Menu, Content::Menu(vec![entry("Bookmark this page", Some("Ctrl+D")), entry("No saved bookmarks yet", None)]), LogicalPosition::new(150.0, 100.0), 248.0);
         popups.show(Kind::Suggest, Content::Suggest { query: "dsda".into(), items: (0..4).map(|i| SuggestEntry { text: format!("suggestion {i}"), url: false }).collect() }, LogicalPosition::new(150.0, 260.0), 500.0);
         let tw = popups.tip_width("Developer tools (F12)");
@@ -919,7 +1015,7 @@ mod tests {
         let mut engine = Engine::new();
         let th = Theme::new(true);
         let s = 2.0;
-        let items = (0..8).map(|i| MenuEntry { label: format!("Menu entry {i}"), hint: Some("Ctrl+X".into()), disabled: false, sep: false }).collect();
+        let items = (0..8).map(|i| MenuEntry { label: format!("Menu entry {i}"), hint: Some("Ctrl+X".into()), ..Default::default() }).collect();
         let content = Content::Menu(items);
         let (rows, h) = layout(&content);
         let w = 248.0;
@@ -930,7 +1026,7 @@ mod tests {
         let mut cache = None;
         let start = Instant::now();
         for _ in 0..120 {
-            draw(&mut v, &mut card, &mut engine, &th, s);
+            draw(&mut v, &mut card, &mut engine, &Default::default(), &th, s);
             compose(&card, &mut out, &mut cache, engine.as_mut(), m, corner_radius(Kind::Menu), true, s, &th);
         }
         println!("popup frame (draw + compose at 2x): {:?}", start.elapsed() / 120);
