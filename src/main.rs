@@ -1695,6 +1695,8 @@ struct Browser {
     /// Submenus of the open menu's rows, and the actions of the open submenu's rows.
     menu_subs: Vec<Option<Vec<MenuItem>>>,
     sub_actions: Vec<Option<MenuAction>>,
+    /// Which row of the open menu its submenu is showing for.
+    sub_for: Option<usize>,
     thumbs_tx: Sender<thumbs::Request>,
     suggest_tx: Sender<suggest::Request>,
     suggest_seq: u64,
@@ -2258,6 +2260,7 @@ impl Browser {
     }
 
     fn close_menu(&mut self) {
+        self.sub_for = None;
         self.popups.hide(PopupKind::Menu);
         self.popups.hide(PopupKind::Sub);
     }
@@ -2270,10 +2273,11 @@ impl Browser {
         let origin = self.to_screen(0.0, 0.0);
         let size = self.logical_size();
         let h = 10.0 + items.iter().map(|i| if i.sep { 9.0 } else { 30.0 }).sum::<f64>();
-        // To the right of the menu, or to its left when there is no room.
-        let mut x = cx - origin.x + cw as f64 - 4.0;
-        if x + W > size.width {
-            x = (cx - origin.x - W + 4.0).max(0.0);
+        // To the right of the menu (its window starts at the menu's right edge), or to its left when
+        // there is no room (the window's 20px shadow margin on the right then ends at the menu).
+        let mut x = cx - origin.x + cw as f64 - 2.0;
+        if x + W + 20.0 > size.width {
+            x = (cx - origin.x - W - 20.0 + 2.0).max(0.0);
         }
         let y = (ry - origin.y - 5.0).min((size.height - h).max(0.0)).max(0.0);
         let mut entries = Vec::with_capacity(items.len());
@@ -2285,6 +2289,7 @@ impl Browser {
             })
             .collect();
         let pos = self.to_screen(x, y);
+        self.sub_for = Some(index);
         self.popups.show(PopupKind::Sub, Content::Menu(entries), pos, W as f32);
     }
 
@@ -2297,6 +2302,7 @@ impl Browser {
         let y = if y + h > size.height { (size.height - h).max(0.0) } else { y };
         let mut entries = Vec::with_capacity(items.len());
         self.menu_subs = items.iter().map(|i| i.sub.clone()).collect();
+        self.sub_for = None;
         self.popups.hide(PopupKind::Sub);
         self.menu_actions = items
             .into_iter()
@@ -3416,8 +3422,13 @@ impl Browser {
             }
             Pick::Hover(index) => {
                 if self.menu_subs.get(index).is_some_and(|s| s.is_some()) {
-                    self.show_sub(index);
+                    // Already showing this row's submenu: nothing to do (re-showing it every time
+                    // would repaint and move its window for no reason).
+                    if self.sub_for != Some(index) || !self.popups.is_open(PopupKind::Sub) {
+                        self.show_sub(index);
+                    }
                 } else {
+                    self.sub_for = None;
                     self.popups.hide(PopupKind::Sub);
                 }
             }
@@ -4263,6 +4274,7 @@ fn main() -> wry::Result<()> {
         closed_tabs: Vec::new(),
         menu_subs: Vec::new(),
         sub_actions: Vec::new(),
+        sub_for: None,
         thumbs_tx,
         suggest_tx,
         suggest_seq: 0,

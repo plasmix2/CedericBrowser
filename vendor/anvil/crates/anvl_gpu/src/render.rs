@@ -106,8 +106,10 @@ pub struct Renderer {
     timings: RenderTimings,
     /// Persona patch: the off-screen target and read-back buffer of `render_to_frame` are kept
     /// between frames instead of being created and freed every time.
-    offscreen: Option<(u32, u32, wgpu::Texture)>,
-    readback: Option<(u64, wgpu::Buffer)>,
+    // Persona patch: one entry per size, because the toolbar and each popup alternate sizes every
+    // frame (a single slot would be re-created each time).
+    offscreen: Vec<(u32, u32, wgpu::Texture)>,
+    readback: Vec<(u64, wgpu::Buffer)>,
 }
 
 /// Where one [`Renderer::render`] spent its time, in seconds.
@@ -528,8 +530,8 @@ impl Renderer {
             blur_scratch: Vec::new(),
             blur_targets: None,
             timings: RenderTimings::default(),
-            offscreen: None,
-            readback: None,
+            offscreen: Vec::new(),
+            readback: Vec::new(),
         })
     }
 
@@ -748,7 +750,7 @@ impl Renderer {
     pub fn render_to_frame(&mut self, draw: &DrawList, text: &mut TextSystem, clear: Color) -> Frame {
         let (w, h) = (self.config.width.max(1), self.config.height.max(1));
         let prepared = self.prepare(draw, text);
-        if self.offscreen.as_ref().is_none_or(|(ow, oh, _)| (*ow, *oh) != (w, h)) {
+        if !self.offscreen.iter().any(|(ow, oh, _)| (*ow, *oh) == (w, h)) {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("anvil-offscreen"),
                 size: wgpu::Extent3d {
@@ -763,9 +765,12 @@ impl Renderer {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
-            self.offscreen = Some((w, h, texture));
+            if self.offscreen.len() >= 8 {
+                self.offscreen.remove(0);
+            }
+            self.offscreen.push((w, h, texture));
         }
-        let target = match &self.offscreen {
+        let target = match self.offscreen.iter().find(|(ow, oh, _)| (*ow, *oh) == (w, h)) {
             Some((_, _, t)) => t.clone(),
             None => return Frame { width: w, height: h, rgba: vec![0; (w * h * 4) as usize] },
         };
@@ -778,16 +783,19 @@ impl Renderer {
         let row = w * 4;
         let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let size = (padded * h) as u64;
-        if self.readback.as_ref().is_none_or(|(sz, _)| *sz != size) {
+        if !self.readback.iter().any(|(sz, _)| *sz == size) {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("anvil-readback"),
                 size,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            self.readback = Some((size, buffer));
+            if self.readback.len() >= 8 {
+                self.readback.remove(0);
+            }
+            self.readback.push((size, buffer));
         }
-        let readback = match &self.readback {
+        let readback = match self.readback.iter().find(|(sz, _)| *sz == size) {
             Some((_, b)) => b.clone(),
             None => return Frame { width: w, height: h, rgba: vec![0; (w * h * 4) as usize] },
         };

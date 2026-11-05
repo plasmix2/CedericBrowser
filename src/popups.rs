@@ -84,6 +84,9 @@ fn margins(kind: Kind) -> Margins {
     }
     match kind {
         Kind::Scrim => NO_MARGIN,
+        // A submenu sits flush against its parent menu: no transparent margin on that side, or the
+        // window would cover the parent's rows and take their clicks.
+        Kind::Sub => Margins { l: 0.0, t: 6.0, r: 20.0, b: 32.0 },
         // Small margins: the transparent margin is still part of the window and takes clicks away
         // from whatever is under it, so it only reaches as far as the shadow needs to.
         Kind::Tip => Margins { l: 12.0, t: 3.0, r: 12.0, b: 18.0 },
