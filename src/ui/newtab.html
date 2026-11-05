@@ -191,6 +191,12 @@
   .setup-who .input-group { flex: 1; min-width: 0; }
   .setup-tips { display: grid; grid-template-columns: auto 1fr; gap: 10px 14px; align-items: center; font-size: 13px; color: var(--dim); }
   .setup-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 4px; }
+  .setup-google { display: flex; flex-direction: column; gap: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 14px; background: var(--field); }
+  .setup-google .g-status { font-size: 13.5px; color: var(--dim); }
+  .setup-google .g-status.ok { color: #34c759; font-weight: 600; }
+  .setup-google .g-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .setup-foot .skip-note { color: var(--dim); font-size: 12px; }
+  .setup-foot .btn-primary[disabled] { opacity: .4; cursor: not-allowed; transform: none; }
   .setup-foot .skip { border: 0; background: none; color: var(--dim); font: inherit; font-size: 12.5px; cursor: pointer; padding: 6px 4px; }
   .setup-foot .skip:hover { color: var(--fg); }
   .setup-foot .right { display: flex; gap: 8px; margin-left: auto; }
@@ -355,18 +361,18 @@
 <!-- First-run setup -->
 <div id="setup" role="dialog" aria-modal="true" aria-labelledby="setup-title">
   <div class="setup-card">
-    <div class="setup-dots"><i></i><i></i><i></i></div>
+    <div class="setup-dots"><i></i><i></i><i></i><i></i></div>
 
     <section class="setup-step" data-step="0">
       <div>
         <h2 id="setup-title">Welcome to Persona</h2>
-        <p class="lead">Each persona keeps its own sign-ins, bookmarks and look. Start by naming yours and picking a color. You can change both later.</p>
+        <p class="lead">Let's set up your first persona. Each persona keeps its own Google sign-in, bookmarks and look. Give it a name and a color; you can change both later.</p>
       </div>
       <div class="setup-who">
         <div id="setup-avatar" class="avatar-lg"></div>
         <div class="input-group">
           <label class="input-label" for="setup-name">Persona name</label>
-          <input id="setup-name" class="text-input" type="text" maxlength="24" placeholder="e.g. Personal, Work" autocomplete="off">
+          <input id="setup-name" class="text-input" type="text" maxlength="24" placeholder="e.g. Personal, Work (required)" autocomplete="off">
         </div>
       </div>
       <div class="input-group">
@@ -376,6 +382,21 @@
     </section>
 
     <section class="setup-step" data-step="1">
+      <div>
+        <h2>Link your Google account</h2>
+        <p class="lead">This is required. Sign in with Google to link this persona to your account. Persona keeps the sign-in inside this persona only.</p>
+      </div>
+      <div class="setup-google">
+        <div id="setup-google-status" class="g-status">Not linked yet</div>
+        <div class="g-actions">
+          <button id="setup-google-link" class="btn-primary" type="button">Link Google account</button>
+          <button id="setup-google-check" class="btn-subtle" type="button">I've signed in</button>
+        </div>
+      </div>
+      <p class="lead" style="font-size:12px">Signing in opens a new tab. When you are done, come back to this tab. It updates by itself, or press "I've signed in".</p>
+    </section>
+
+    <section class="setup-step" data-step="2">
       <div>
         <h2>Site permissions</h2>
         <p class="lead">When a switch is on, websites can use that feature without a further prompt; when it is off, the request is blocked. You can change these any time from Settings on the New Tab page.</p>
@@ -404,7 +425,7 @@
       </div>
     </section>
 
-    <section class="setup-step" data-step="2">
+    <section class="setup-step" data-step="3">
       <div>
         <h2 id="setup-done-title">You're all set</h2>
         <p class="lead">Search history lasts only for the session. Cookies are kept so you stay signed in. A few shortcuts to get going:</p>
@@ -418,7 +439,7 @@
     </section>
 
     <div class="setup-foot">
-      <button id="setup-skip" class="skip" type="button">Skip setup</button>
+      <span class="skip-note" id="setup-gate-note"></span>
       <div class="right">
         <button id="setup-back" class="btn-subtle" type="button">Back</button>
         <button id="setup-next" class="btn-primary" type="button">Continue</button>
@@ -768,7 +789,7 @@
 
   // ----- First-run setup -----
   const setupEl = document.getElementById('setup');
-  const SETUP_STEPS = 3;
+  const SETUP_STEPS = 4;
   let setupStep = 0;
   let setupColor = 'orange';
   let setupSeeded = false;
@@ -802,8 +823,26 @@
     setupEl.querySelectorAll('.setup-step').forEach((el) => el.classList.toggle('on', Number(el.dataset.step) === setupStep));
     setupEl.querySelectorAll('.setup-dots i').forEach((el, i) => el.classList.toggle('on', i <= setupStep));
     document.getElementById('setup-back').style.visibility = setupStep === 0 ? 'hidden' : 'visible';
-    document.getElementById('setup-skip').style.visibility = setupStep === SETUP_STEPS - 1 ? 'hidden' : 'visible';
     document.getElementById('setup-next').textContent = setupStep === SETUP_STEPS - 1 ? 'Start browsing' : 'Continue';
+    setupGate();
+  };
+
+  // Setup cannot be skipped: each step says what it still needs before Continue works.
+  const setupGate = () => {
+    let need = '';
+    if (setupStep === 0 && !document.getElementById('setup-name').value.trim()) need = 'Enter a name to continue';
+    if (setupStep === 1 && !(curState && curState.google)) need = 'Link your Google account to continue';
+    const btn = document.getElementById('setup-next');
+    btn.disabled = !!need;
+    document.getElementById('setup-gate-note').textContent = need;
+    const g = document.getElementById('setup-google-status');
+    if (curState && curState.google) {
+      g.textContent = `Linked: ${curState.google[0]}${curState.google[1] && curState.google[1] !== curState.google[0] ? ' (' + curState.google[1] + ')' : ''}`;
+      g.classList.add('ok');
+    } else {
+      g.textContent = 'Not linked yet';
+      g.classList.remove('ok');
+    }
   };
 
   const setupFinish = () => {
@@ -811,10 +850,12 @@
     send({ nt: 'finish_setup' });
   };
 
-  document.getElementById('setup-name').addEventListener('input', setupPreview);
+  document.getElementById('setup-name').addEventListener('input', () => { setupPreview(); setupGate(); });
+  document.getElementById('setup-google-link').onclick = () => send({ nt: 'link_google' });
+  document.getElementById('setup-google-check').onclick = () => send({ nt: 'check_google' });
   document.getElementById('setup-back').onclick = () => setupShow(setupStep - 1);
-  document.getElementById('setup-skip').onclick = setupFinish;
   document.getElementById('setup-next').onclick = () => {
+    if (document.getElementById('setup-next').disabled) return;
     if (setupStep === 0 && curState && curState.active_persona_id) {
       const name = document.getElementById('setup-name').value.trim() || 'Persona';
       send({ nt: 'update_persona', id: curState.active_persona_id, name, color: setupColor, pfp: curState.persona_pfp || null });
@@ -839,7 +880,8 @@
     if (!setupSeeded) {
       setupSeeded = true;
       setupColor = s.persona_color || 'orange';
-      document.getElementById('setup-name').value = s.persona_name || '';
+      // The placeholder names and the old test personas are not a real name: ask for one.
+      document.getElementById('setup-name').value = ['Persona', 'Cederic', 'Uzaki', 'Default'].includes(s.persona_name) ? '' : (s.persona_name || '');
       setupSwatches();
       setupShow(0);
       setTimeout(() => document.getElementById('setup-name').focus(), 50);
@@ -848,6 +890,7 @@
       if (typeof s['allow_' + k] === 'boolean') document.getElementById('setup-perm-' + k).checked = s['allow_' + k];
     });
     setupPreview();
+    setupGate();
     setupEl.classList.add('open');
   };
 

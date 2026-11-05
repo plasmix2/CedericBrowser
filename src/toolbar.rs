@@ -34,6 +34,8 @@ const TAB_Y: f32 = 6.0;
 const TAB_H: f32 = 34.0;
 const WIN_BTN_W: f32 = 46.0;
 const BTN: f32 = 34.0;
+/// Space between the groups of buttons on the right of the toolbar (the usual gap is 2).
+const GROUP_GAP: f32 = 12.0;
 const ROW_Y: f32 = TITLE_H + 5.0;
 const FONT: f32 = 12.5;
 const URL_FONT: f32 = 13.5;
@@ -498,12 +500,13 @@ impl Toolbar {
 
     fn geo(&self) -> Geo {
         let w = self.width;
-        let dev = R { x: w - 8.0 - BTN, y: ROW_Y, w: BTN, h: BTN };
-        let theme = R { x: dev.x - 2.0 - BTN, ..dev };
-        let hist = R { x: theme.x - 2.0 - BTN, ..dev };
-        let pip = R { x: hist.x - 2.0 - BTN, ..dev };
-        let bookmarks = R { x: pip.x - 2.0 - BTN, ..dev };
-        let star = R { x: bookmarks.x - 2.0 - BTN, ..dev };
+        // Right side, in groups: [star bookmarks history] | [picture-in-picture dev tools] | persona.
+        let theme = R { x: w - 8.0 - BTN, y: ROW_Y, w: BTN, h: BTN };
+        let dev = R { x: theme.x - GROUP_GAP - BTN, ..theme };
+        let pip = R { x: dev.x - 2.0 - BTN, ..theme };
+        let hist = R { x: pip.x - GROUP_GAP - BTN, ..theme };
+        let bookmarks = R { x: hist.x - 2.0 - BTN, ..theme };
+        let star = R { x: bookmarks.x - 2.0 - BTN, ..theme };
         let ox = 8.0 + 3.0 * (BTN + 2.0) + 6.0;
         Geo {
             back: R { x: 8.0, y: ROW_Y, w: BTN, h: BTN },
@@ -1329,6 +1332,12 @@ impl Toolbar {
             }
             let sz = 20.0 * self.press_scale(h);
             c.icon(icon, r.x + 7.0 + (20.0 - sz) / 2.0, r.y + 7.0 + (20.0 - sz) / 2.0, sz, if active { th.accent } else { th.fg });
+        }
+
+        // Thin dividers between the button groups.
+        for left in [g.pip, g.theme] {
+            let x = left.x - GROUP_GAP / 2.0 + 1.0;
+            c.hairline_v(x, ROW_Y + 8.0, BTN - 16.0, th.border);
         }
 
         self.draw_omni(c, g.omni, &th);

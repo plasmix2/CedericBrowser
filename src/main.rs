@@ -709,6 +709,10 @@ enum NewTabCmd {
     FinishSetup,
     /// The Settings button: open the native site-permissions dialog.
     OpenSettings,
+    /// Setup: open Google's sign-in page for the active persona.
+    LinkGoogle,
+    /// Setup: look for the signed-in Google account again.
+    CheckGoogle,
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -901,6 +905,7 @@ pub struct PersonaProfile {
 }
 
 impl PersonaProfile {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new_cederic() -> Self {
         Self {
             id: "cederic".into(),
@@ -911,6 +916,13 @@ impl PersonaProfile {
         }
     }
 
+    /// The single persona a fresh profile starts with. Its name is a placeholder: setup makes the user
+    /// name it.
+    pub fn new_main() -> Self {
+        Self { id: "main".into(), name: "Persona".into(), color: "orange".into(), pfp: None, bookmarks: Vec::new() }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new_uzaki() -> Self {
         Self {
             id: "uzaki".into(),
@@ -942,6 +954,16 @@ impl PersonaProfile {
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_else(|| "P".into())
     }
+}
+
+/// Drops the "Uzaki" and "Cederic" personas that used to be created for testing, when the user never
+/// changed them. Returns true when the only persona left is an untouched "Cederic": the user has not
+/// really set Persona up yet, so setup should run.
+fn migrate_test_personas(personas: &mut Vec<PersonaProfile>) -> bool {
+    if personas.len() > 1 {
+        personas.retain(|p| !(p.id == "uzaki" && p.name == "Uzaki" && p.pfp.is_none() && p.bookmarks.is_empty()));
+    }
+    personas.len() == 1 && personas[0].id == "cederic" && personas[0].name == "Cederic" && personas[0].pfp.is_none()
 }
 
 fn default_true() -> bool {
@@ -996,6 +1018,8 @@ struct Prefs {
     personas: Vec<PersonaProfile>,
     permissions: SitePermissions,
     setup_done: bool,
+    /// The linked Google account's (name, email) for the setup screen; not saved.
+    google_hint: Option<(String, String)>,
     bg_cache: HashMap<String, Option<String>>,
     strip_cache: HashMap<String, Option<Pixmap>>,
 }
@@ -1020,15 +1044,26 @@ impl Prefs {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
-        let setup_done = data.setup_done.unwrap_or(!data.personas.is_empty());
+        let mut setup_done = data.setup_done.unwrap_or(!data.personas.is_empty());
         let mut personas = data.personas;
         if personas.is_empty() {
-            let mut cederic = PersonaProfile::new_cederic();
-            if let Some(bms) = data.bookmarks {
-                cederic.bookmarks = bms;
-            }
-            let uzaki = PersonaProfile::new_uzaki();
-            personas = vec![cederic, uzaki];
+            // The unit tests exercise persona switching and isolation, which needs two personas.
+            personas = if cfg!(test) {
+                let mut cederic = PersonaProfile::new_cederic();
+                if let Some(bms) = data.bookmarks {
+                    cederic.bookmarks = bms;
+                }
+                vec![cederic, PersonaProfile::new_uzaki()]
+            } else {
+                let mut main = PersonaProfile::new_main();
+                if let Some(bms) = data.bookmarks {
+                    main.bookmarks = bms;
+                }
+                vec![main]
+            };
+        }
+        if !cfg!(test) && migrate_test_personas(&mut personas) {
+            setup_done = false;
         }
 
         personas.truncate(5);
@@ -1071,6 +1106,7 @@ impl Prefs {
             personas,
             permissions,
             setup_done,
+            google_hint: None,
             bg_cache,
             strip_cache,
         }
@@ -1492,6 +1528,7 @@ struct NewTabState<'a> {
     allow_microphone: bool,
     allow_geolocation: bool,
     setup_done: bool,
+    google: Option<(&'a str, &'a str)>,
 }
 
 struct Devtools {
@@ -1960,6 +1997,7 @@ impl Browser {
             allow_microphone: prefs.permissions.microphone,
             allow_geolocation: prefs.permissions.geolocation,
             setup_done: prefs.setup_done,
+            google: prefs.google_hint.as_ref().map(|(n, e)| (n.as_str(), e.as_str())),
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -2456,7 +2494,9 @@ impl Browser {
         self.account_probe = None;
         // Ignore a result for a persona that is no longer active.
         if profile == self.prefs.active_persona().profile_name() {
+            self.prefs.google_hint = account.as_ref().map(|a| (a.name.clone(), a.email.clone()));
             self.google = account;
+            self.sync_all_newtabs();
             self.sync_ui();
         }
         if std::mem::take(&mut self.probe_again) {
@@ -3141,7 +3181,15 @@ impl Browser {
             NewTabCmd::SetBrand { brand } => self.set_brand(brand),
             NewTabCmd::SetBackground { .. } => {}
             NewTabCmd::OpenSettings => self.show_settings(),
+            NewTabCmd::LinkGoogle => {
+                let _ = self.open_tab(Some(GOOGLE_SIGN_IN_URL.into()), None, true);
+            }
+            NewTabCmd::CheckGoogle => self.schedule_account_probe(Duration::from_millis(100)),
             NewTabCmd::FinishSetup => {
+                // Setup is mandatory: it only finishes once a Google account is linked.
+                if self.google.is_none() {
+                    return;
+                }
                 self.prefs.finish_setup();
                 self.sync_all_newtabs();
             }
@@ -3756,7 +3804,8 @@ fn main() -> wry::Result<()> {
         allow_microphone,
         allow_geolocation,
     };
-    let start = std::env::args().nth(1).and_then(|a| {
+    // Until setup is finished the browser only opens the New Tab page, where setup runs.
+    let start = std::env::args().nth(1).filter(|_| browser.prefs.setup_done).and_then(|a| {
         let resolved = input::resolve_with_info(&unmask(&a))?;
         browser.history.record(&resolved.query, &resolved.url, resolved.engine, resolved.is_search);
         Some(resolved.url)
@@ -3849,6 +3898,30 @@ mod tests {
         std::fs::write(dir.join("prefs.json"), v.to_string()).unwrap();
         assert!(Prefs::open(&dir).setup_done);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_personas_are_removed_and_fresh_profiles_start_with_one() {
+        // Untouched Uzaki goes; an untouched lone Cederic means setup still has to run.
+        let mut p = vec![PersonaProfile::new_cederic(), PersonaProfile::new_uzaki()];
+        assert!(migrate_test_personas(&mut p));
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].id, "cederic");
+        // A renamed persona is the user's: nothing is removed and setup is not forced.
+        let mut mine = PersonaProfile::new_cederic();
+        mine.name = "Work".into();
+        let mut p = vec![mine, PersonaProfile::new_uzaki()];
+        assert!(!migrate_test_personas(&mut p));
+        assert_eq!(p.len(), 1, "an untouched Uzaki still goes");
+        // A used Uzaki stays.
+        let mut used = PersonaProfile::new_uzaki();
+        used.bookmarks.push(Bookmark { title: "x".into(), url: "https://example.com/".into() });
+        let mut p = vec![PersonaProfile::new_cederic(), used];
+        migrate_test_personas(&mut p);
+        assert_eq!(p.len(), 2);
+        // A fresh profile gets exactly one persona, on its own WebView2 profile.
+        let fresh = PersonaProfile::new_main();
+        assert_eq!(fresh.profile_name().as_deref(), Some("persona_main"));
     }
 
     #[test]
