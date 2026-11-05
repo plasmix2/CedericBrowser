@@ -95,8 +95,8 @@ impl Engine {
         let (x, y, cw, ch) = (card.0 / scale, card.1 / scale, card.2 / scale, card.3 / scale);
         let r = radius / scale;
         let f = self.frame(w, h, scale, Rgba(0, 0, 0, 0), |p| {
-            p.shadow(x, y, cw, ch, r, 44.0, 14.0, strength * 0.7);
-            p.shadow(x, y, cw, ch, r, 12.0, 3.0, strength * 0.5);
+            p.shadow(x, y, cw, ch, r, 30.0, 10.0, strength * 0.75);
+            p.shadow(x, y, cw, ch, r, 10.0, 2.5, strength * 0.5);
         });
         let mut pm = Pixmap::new(w, h)?;
         copy_to_pixmap(&f, &mut pm);
@@ -646,9 +646,64 @@ fn arc_to(x0: f32, y0: f32, rx: f32, ry: f32, rot_deg: f32, large: bool, sweep: 
         .collect()
 }
 
+/// A box-blurred copy of `src` (three passes approximate a Gaussian). `radius` is in pixels of `src`.
+pub fn blur_pixmap(src: &Pixmap, radius: usize) -> Pixmap {
+    let (w, h) = (src.width() as usize, src.height() as usize);
+    let mut a: Vec<u8> = src.data().to_vec();
+    let mut b = a.clone();
+    let r = radius.max(1);
+    for _ in 0..3 {
+        for horizontal in [true, false] {
+            let (len, lines) = if horizontal { (w, h) } else { (h, w) };
+            for line in 0..lines {
+                let idx = |i: usize| if horizontal { (line * w + i) * 4 } else { (i * w + line) * 4 };
+                let mut acc = [0u32; 4];
+                let win = |i: isize| i.clamp(0, len as isize - 1) as usize;
+                for k in -(r as isize)..=(r as isize) {
+                    let p = idx(win(k));
+                    for c in 0..4 {
+                        acc[c] += a[p + c] as u32;
+                    }
+                }
+                let n = (2 * r + 1) as u32;
+                for i in 0..len {
+                    let o = idx(i);
+                    for c in 0..4 {
+                        b[o + c] = (acc[c] / n) as u8;
+                    }
+                    let (add, sub) = (idx(win(i as isize + r as isize + 1)), idx(win(i as isize - r as isize)));
+                    for c in 0..4 {
+                        acc[c] = acc[c] + a[add + c] as u32 - a[sub + c] as u32;
+                    }
+                }
+            }
+            std::mem::swap(&mut a, &mut b);
+        }
+    }
+    let mut out = Pixmap::new(src.width(), src.height()).unwrap_or_else(|| src.clone());
+    out.data_mut().copy_from_slice(&a);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blur_softens_an_edge_and_keeps_size() {
+        let mut pm = Pixmap::new(20, 4).unwrap();
+        for y in 0..4 {
+            for x in 10..20 {
+                let i = ((y * 20 + x) * 4) as usize;
+                pm.data_mut()[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        let out = blur_pixmap(&pm, 3);
+        assert_eq!((out.width(), out.height()), (20, 4));
+        let px = |x: usize| out.data()[(x) * 4];
+        assert!(px(0) < 10 && px(19) > 245, "far pixels stay put");
+        assert!(px(9) > 20 && px(9) < 235, "the edge is smoothed");
+    }
 
     /// Draws a frame and checks the pixels. Skipped on machines with no GPU adapter.
     #[test]

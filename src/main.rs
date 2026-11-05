@@ -2325,11 +2325,33 @@ impl Browser {
         self.close_menu();
         self.hide_preview();
         self.hide_tip();
+        let first_open = !self.popups.is_open(PopupKind::Scrim);
+        self.show_scrim(first_open);
         // Centred over the window, a little above the middle.
         let size = self.logical_size();
         let h = 74.0 + 4.0 * 56.0 + 62.0;
         let pos = self.to_screen(((size.width - W as f64) / 2.0).max(0.0), ((size.height - h as f64) / 2.0 - 20.0).max(0.0));
         self.popups.show(PopupKind::Modal, content, pos, W);
+    }
+
+    /// Covers the page with a blurred, dimmed snapshot of it while a dialog is open. The snapshot
+    /// is the active tab's last thumbnail (and a fresh one is requested); until one exists the page
+    /// is only dimmed.
+    fn show_scrim(&mut self, request_fresh: bool) {
+        let size = self.logical_size();
+        let top = self.top_bar_height();
+        let img = self.tabs.get(self.active).and_then(|t| t.thumb.as_ref()).map(|t| anvil::blur_pixmap(t, 6));
+        if request_fresh && let Some(t) = self.tabs.get(self.active) {
+            let _ = self.thumbs_tx.send(thumbs::Request::Capture(t.id));
+        }
+        let pos = self.to_screen(0.0, top);
+        let h = (size.height - top).max(1.0) as f32;
+        self.popups.show(PopupKind::Scrim, Content::Scrim { img, h }, pos, size.width as f32);
+    }
+
+    fn hide_modal(&mut self) {
+        self.popups.hide(PopupKind::Modal);
+        self.popups.hide(PopupKind::Scrim);
     }
 
     fn open_settings(&mut self) {
@@ -2973,7 +2995,7 @@ impl Browser {
                     2 => notif = !notif,
                     3 => geo = !geo,
                     _ => {
-                        self.popups.hide(PopupKind::Modal);
+                        self.hide_modal();
                         self.refocus_page();
                         return;
                     }
@@ -3144,6 +3166,10 @@ impl Browser {
             UserEvent::Thumb(id, img) => {
                 if let Some(i) = self.index_of(id) {
                     self.tabs[i].thumb = Some(img);
+                    // A dialog is open: swap in the fresh snapshot behind it.
+                    if i == self.active && self.popups.is_open(PopupKind::Scrim) {
+                        self.show_scrim(false);
+                    }
                 }
             }
             UserEvent::PipState(id, on) => {

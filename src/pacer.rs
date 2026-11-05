@@ -12,8 +12,9 @@ use std::{
     time::Duration,
 };
 
-/// ~120 frames per second: smooth on high-refresh screens, and drawing a frame takes far less.
-pub const FRAME: Duration = Duration::from_micros(8_333);
+/// ~60 frames per second. Each chrome frame is drawn on the GPU and read back, so more than this
+/// only starves the event loop (clicks and hover feel laggy).
+pub const FRAME: Duration = Duration::from_micros(16_667);
 
 pub struct Pacer {
     running: Arc<AtomicBool>,

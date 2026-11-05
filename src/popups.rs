@@ -74,8 +74,11 @@ fn margins(kind: Kind) -> Margins {
         return NO_MARGIN;
     }
     match kind {
-        Kind::Tip => Margins { l: 14.0, t: 4.0, r: 14.0, b: 22.0 },
-        _ => Margins { l: 30.0, t: 12.0, r: 30.0, b: 44.0 },
+        Kind::Scrim => NO_MARGIN,
+        // Small margins: the transparent margin is still part of the window and takes clicks away
+        // from whatever is under it, so it only reaches as far as the shadow needs to.
+        Kind::Tip => Margins { l: 12.0, t: 3.0, r: 12.0, b: 18.0 },
+        _ => Margins { l: 20.0, t: 6.0, r: 20.0, b: 32.0 },
     }
 }
 
@@ -84,6 +87,7 @@ fn corner_radius(kind: Kind) -> f32 {
         return 0.0;
     }
     match kind {
+        Kind::Scrim => 0.0,
         Kind::Tip => 6.0,
         _ => 10.0,
     }
@@ -98,6 +102,8 @@ pub enum Kind {
     Tip,
     /// A centred dialog with switches (site permissions). Stays until its Done button is clicked.
     Modal,
+    /// The blurred, dimmed page behind a modal. Swallows clicks so the page cannot be used meanwhile.
+    Scrim,
 }
 
 pub struct MenuEntry {
@@ -134,6 +140,8 @@ pub enum Content {
     Tip(String),
     /// A dialog: title, a line of explanation, one switch row per entry, then a Done button.
     Modal { title: String, note: String, items: Vec<ToggleEntry> },
+    /// A blurred picture of the page (if there is one yet) and the height to cover, in logical px.
+    Scrim { img: Option<Pixmap>, h: f32 },
 }
 
 /// A row laid out for drawing and hit-testing.
@@ -195,6 +203,7 @@ pub struct Popups {
     pub preview: Popup,
     pub tip: Popup,
     pub modal: Popup,
+    pub scrim: Popup,
     last_frame: Instant,
 }
 
@@ -202,8 +211,11 @@ impl Popups {
     pub fn new<T>(target: &EventLoopWindowTarget<T>, owner: &Window, dark: bool, brand: Brand) -> Self {
         let theme = Theme::for_brand(dark, brand);
         let make = |kind| Popup::new(target, owner, kind, theme.card);
+        // The scrim is created first so the modal's window ends up above it.
+        let scrim = make(Kind::Scrim);
         Self {
             engine: Engine::new(),
+            scrim,
             menu: make(Kind::Menu),
             suggest: make(Kind::Suggest),
             preview: make(Kind::Preview),
@@ -222,7 +234,7 @@ impl Popups {
     pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor) {
         self.theme = Theme::for_persona(dark, color);
         let c = self.theme.card;
-        for p in [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal] {
+        for p in [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal, &self.scrim] {
             p.window.set_background_color(Some(window_bg(c)));
             if p.open {
                 p.window.request_redraw();
@@ -237,6 +249,7 @@ impl Popups {
             Kind::Preview => &mut self.preview,
             Kind::Tip => &mut self.tip,
             Kind::Modal => &mut self.modal,
+            Kind::Scrim => &mut self.scrim,
         }
     }
 
@@ -257,6 +270,7 @@ impl Popups {
             Kind::Preview => self.preview.open,
             Kind::Tip => self.tip.open,
             Kind::Modal => self.modal.open,
+            Kind::Scrim => self.scrim.open,
         }
     }
 
@@ -316,7 +330,7 @@ impl Popups {
     }
 
     pub fn owns(&self, id: WindowId) -> Option<Kind> {
-        [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
+        [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal, &self.scrim].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
     }
 
     /// Mouse input on a popup window. Returns a pick when a row was clicked.
@@ -378,13 +392,13 @@ impl Popups {
         let k = 1.0 - (-dt * 30.0).exp();
         let mut busy = false;
         let mut dirty = Vec::new();
-        for p in [&mut self.menu, &mut self.suggest, &mut self.preview, &mut self.tip, &mut self.modal] {
+        for p in [&mut self.menu, &mut self.suggest, &mut self.preview, &mut self.tip, &mut self.modal, &mut self.scrim] {
             if !p.open {
                 continue;
             }
             let mut moved = false;
             if p.v.enter < 1.0 {
-                p.v.enter = (p.v.enter + dt / 0.14).min(1.0);
+                p.v.enter = (p.v.enter + dt / 0.12).min(1.0);
                 moved = true;
             }
             for (i, f) in p.v.hover_fade.iter_mut().enumerate() {
@@ -418,6 +432,7 @@ impl Popups {
             Kind::Preview => &mut self.preview,
             Kind::Tip => &mut self.tip,
             Kind::Modal => &mut self.modal,
+            Kind::Scrim => &mut self.scrim,
         };
         if !p.open {
             return;
@@ -435,7 +450,7 @@ impl Popups {
             p.card = pm;
         }
         draw(&mut p.v, &mut p.card, engine, &th, s);
-        compose(&p.card, &mut p.pm, &mut p.frame, engine.as_mut(), margins(kind), corner_radius(kind), s, &th);
+        compose(&p.card, &mut p.pm, &mut p.frame, engine.as_mut(), margins(kind), corner_radius(kind), kind != Kind::Scrim, s, &th);
         let (w_u32, h_u32) = (w.get(), h.get());
         if p.surface_size != (w_u32, h_u32) {
             if p.surface.resize(w, h).is_err() {
@@ -478,6 +493,10 @@ impl Popup {
                 .build(target)
                 .expect("failed to create popup window"),
         );
+        // Tooltips and hover cards are never clicked: let clicks fall through to what is under them.
+        if matches!(kind, Kind::Tip | Kind::Preview) {
+            let _ = window.set_ignore_cursor_events(true);
+        }
         // The creation-time position gets clamped on-screen; move it away explicitly.
         window.set_outer_position(PARKED);
         let ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
@@ -548,6 +567,7 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
             rows.push(row(0.0, TIP_H, Some(text.clone()), None, false));
             return (rows, TIP_H);
         }
+        Content::Scrim { h, .. } => return (rows, *h),
         Content::Modal { items, .. } => {
             y = MODAL_HEAD;
             for it in items {
@@ -568,20 +588,28 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, th: &Theme, 
         return;
     };
     // The page snapshot goes to the GPU once per time the card is shown.
-    if let Content::Preview(card) = &p.content
-        && let Some(img) = &card.img
-        && !p.shot_ready
-    {
-        engine.forget_texture("popup:shot");
-        engine.ensure_texture("popup:shot", img);
-        p.shot_ready = true;
+    if !p.shot_ready {
+        match &p.content {
+            Content::Preview(Card { img: Some(img), .. }) => {
+                engine.forget_texture("popup:shot");
+                engine.ensure_texture("popup:shot", img);
+                p.shot_ready = true;
+            }
+            Content::Scrim { img: Some(img), .. } => {
+                engine.forget_texture("popup:scrim");
+                engine.ensure_texture("popup:scrim", img);
+                p.shot_ready = true;
+            }
+            _ => {}
+        }
     }
     let dark = th.fg.0 > 128;
     let hover_bg = if dark { Rgba(255, 255, 255, 20) } else { Rgba(0, 0, 0, 14) };
     let (w, h) = p.size;
     // Entrance: content eases in from slightly above while fading in over the card.
     let t = 1.0 - (1.0 - p.enter).powi(3);
-    let dy = -3.0 * (1.0 - t);
+    // No vertical slide: moving content a few pixels per frame made dropdowns look jittery.
+    let dy = 0.0;
     let a = t;
     // Paint the whole buffer: the window can briefly be larger than `p.size` while it resizes.
     let (pw, ph) = (pm.width(), pm.height());
@@ -639,6 +667,14 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, th: &Theme, 
                         c.text(hint, w - PAD - 12.0 - hint_w, hy, 11.5, Weight::Regular, th.dim.with_alpha(a), w);
                     }
                 }
+            }
+            Content::Scrim { img, .. } => {
+                c.rect(0.0, 0.0, w, h, Rgba(20, 22, 28, 255));
+                if img.is_some() {
+                    c.image("popup:scrim", 0.0, 0.0, w, h, 1.0);
+                }
+                // Dim what is behind the dialog; fades in with the popup.
+                c.rect(0.0, 0.0, w, h, Rgba(0, 0, 0, 255).with_alpha(if dark { 0.42 * a } else { 0.30 * a }));
             }
             Content::Modal { title, note, items } => {
                 c.text(title, 22.0, 20.0, 17.0, Weight::SemiBold, th.fg.with_alpha(a), w - 22.0);
@@ -720,7 +756,7 @@ fn window_bg(card: Rgba) -> (u8, u8, u8, u8) {
 /// rectangle, and a 1px border. Everything outside the card and its shadow stays transparent.
 /// The shadow and clip mask are cached in `frame` and only rebuilt when the size changes, so an
 /// animation frame is a copy, a masked blit and a border stroke.
-fn compose(card: &Pixmap, out: &mut Pixmap, frame: &mut Option<Frame>, engine: Option<&mut Engine>, m: Margins, radius: f32, s: f32, th: &Theme) {
+fn compose(card: &Pixmap, out: &mut Pixmap, frame: &mut Option<Frame>, engine: Option<&mut Engine>, m: Margins, radius: f32, border: bool, s: f32, th: &Theme) {
     let (x, y) = ((m.l * s).round(), (m.t * s).round());
     let (w, h) = (card.width() as f32, card.height() as f32);
     let r = radius * s;
@@ -764,6 +800,9 @@ fn compose(card: &Pixmap, out: &mut Pixmap, frame: &mut Option<Frame>, engine: O
     out.data_mut().copy_from_slice(f.shadow.data());
     out.draw_pixmap(x as i32, y as i32, card.as_ref(), &PixmapPaint::default(), Transform::identity(), Some(&f.mask));
     // Border, inset half a pixel so the 1px line lands on whole pixels.
+    if !border {
+        return;
+    }
     if let Some(path) = rrect_path(x + 0.5, y + 0.5, w - 1.0, h - 1.0, [(r - 0.5).max(0.0); 4]) {
         let mut paint = Paint::default();
         let b = th.border;
@@ -826,7 +865,7 @@ mod tests {
             draw(&mut v, &mut pm, &mut engine, &th, s);
             let m = margins(Kind::Menu);
             let mut out = Pixmap::new(((w + m.l + m.r) * s) as u32, ((h + m.t + m.b) * s) as u32).unwrap();
-            compose(&pm, &mut out, &mut None, engine.as_mut(), m, corner_radius(Kind::Menu), s, &th);
+            compose(&pm, &mut out, &mut None, engine.as_mut(), m, corner_radius(Kind::Menu), true, s, &th);
             out.save_png(dir.join(format!("{name}.png"))).unwrap();
         }
     }
@@ -887,7 +926,7 @@ mod tests {
         let start = Instant::now();
         for _ in 0..120 {
             draw(&mut v, &mut card, &mut engine, &th, s);
-            compose(&card, &mut out, &mut cache, engine.as_mut(), m, corner_radius(Kind::Menu), s, &th);
+            compose(&card, &mut out, &mut cache, engine.as_mut(), m, corner_radius(Kind::Menu), true, s, &th);
         }
         println!("popup frame (draw + compose at 2x): {:?}", start.elapsed() / 120);
     }
