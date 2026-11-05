@@ -32,18 +32,6 @@ pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send
     std::thread::spawn(move || {
         let mut targets: HashMap<u32, String> = HashMap::new();
         let mut active: Option<u32> = None;
-        while let Ok(req) = rx.recv() {
-            let tab = match req {
-                Request::Active(t) => {
-                    active = t;
-                    continue;
-                }
-                Request::Forget(t) => {
-                    targets.remove(&t);
-                    continue;
-                }
-                Request::Capture(t) => t,
-            };
         while let Ok(first) = rx.recv() {
             let mut pending_capture: Option<u32> = None;
             for req in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
@@ -53,19 +41,6 @@ pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send
                         targets.remove(&t);
                         if pending_capture == Some(t) {
                             pending_capture = None;
-                        }
-                    }
-                    Request::EvalGesture(t, js) => {
-                        if let Some(port) = devtools::port(&data_dir) {
-                            let _ = targets
-                                .get(&t)
-                                .and_then(|id| eval_gesture(port, id, &js))
-                                .or_else(|| {
-                                    let id = find_target(port, t, &targets)?;
-                                    let res = eval_gesture(port, &id, &js);
-                                    targets.insert(t, id);
-                                    res
-                                });
                         }
                     }
                     Request::Capture(t) => pending_capture = Some(t),

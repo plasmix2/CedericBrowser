@@ -22,7 +22,7 @@ use tao::{
 };
 use tiny_skia::Pixmap;
 
-use crate::gfx::{Brand, Canvas, Fonts, Icon, Rgba, Theme, attrs, text_width};
+use crate::gfx::{Brand, Canvas, Fonts, Icon, PersonaColor, Rgba, Theme, attrs, text_width};
 
 /// Where hidden popups wait. Physical pixels: a logical position this far out would be scaled past
 /// what Windows accepts at high DPI, and the window would land at the screen's top-left instead.
@@ -97,6 +97,8 @@ pub struct Popup {
     surface_size: (u32, u32),
     pm: Pixmap,
     open: bool,
+    /// Where to move the window once it has been repainted at its new size.
+    pending_pos: Option<LogicalPosition<f64>>,
     v: View,
 }
 
@@ -129,8 +131,13 @@ impl Popups {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_theme(&mut self, dark: bool, brand: Brand) {
-        self.theme = Theme::for_brand(dark, brand);
+        self.set_persona_theme(dark, PersonaColor::from(brand));
+    }
+
+    pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor) {
+        self.theme = Theme::for_persona(dark, color);
         let c = self.theme.card;
         for p in [&self.menu, &self.suggest, &self.preview] {
             p.window.set_background_color(Some((c.0, c.1, c.2, 255)));
@@ -162,6 +169,7 @@ impl Popups {
         let s = self.get(kind).window.scale_factor() as f32;
         let (rows, h) = layout(&mut self.fonts, &content, s);
         let p = self.get(kind);
+        let fresh = !p.open || p.v.size != (w, h);
         // Moving between hover cards or refreshing suggestions only swaps the content, without replaying the entrance.
         if !p.open {
             p.v.enter = 0.0;
@@ -174,8 +182,15 @@ impl Popups {
         p.v.content = content;
         p.v.size = (w, h);
         p.open = true;
-        p.window.set_inner_size(LogicalSize::new(w as f64, h as f64));
-        p.window.set_outer_position(pos);
+        if fresh {
+            // Resizing exposes unpainted pixels (white slivers, stale content). Keep the window
+            // off-screen until `redraw` has painted it at the new size, then move it into place.
+            p.window.set_outer_position(PARKED);
+            p.window.set_inner_size(LogicalSize::new(w as f64, h as f64));
+            p.pending_pos = Some(pos);
+        } else {
+            p.window.set_outer_position(pos);
+        }
         p.window.request_redraw();
         h
     }
@@ -186,6 +201,7 @@ impl Popups {
             p.open = false;
             p.v.content = Content::Empty;
             p.v.rows.clear();
+            p.pending_pos = None;
             p.window.set_outer_position(PARKED);
         }
     }
@@ -205,6 +221,12 @@ impl Popups {
     pub fn window_event(&mut self, kind: Kind, event: &WindowEvent) -> Option<Pick> {
         let p = self.get(kind);
         match event {
+            // A popup is resized in place when its content changes; repaint at the new size so no
+            // stale or blank pixels show around it.
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                p.window.request_redraw();
+                None
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let y = position.to_logical::<f32>(p.window.scale_factor()).y;
                 let hover = p.v.rows.iter().position(|r| r.enabled && y >= r.y && y < r.y + r.h);
@@ -301,17 +323,15 @@ impl Popups {
                 return;
             }
             p.surface_size = (w_u32, h_u32);
-        if p.surface_size != (w.get(), h.get()) {
-            if p.surface.resize(w, h).is_err() {
-                return;
-            }
-            p.surface_size = (w.get(), h.get());
         }
         let Ok(mut buf) = p.surface.buffer_mut() else { return };
         for (d, px) in buf.iter_mut().zip(p.pm.data().chunks_exact(4)) {
             *d = (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
         }
         let _ = buf.present();
+        if let Some(pos) = p.pending_pos.take() {
+            p.window.set_outer_position(pos);
+        }
     }
 }
 
@@ -320,7 +340,6 @@ impl Popup {
         let window = Rc::new(
             WindowBuilder::new()
                 .with_decorations(false)
-                .with_undecorated_shadow(true)
                 .with_background_color((card.0, card.1, card.2, 255))
                 .with_resizable(false)
                 .with_visible(true)
@@ -344,6 +363,7 @@ impl Popup {
             surface_size: (0, 0),
             pm: Pixmap::new(1, 1).expect("1x1 pixmap"),
             open: false,
+            pending_pos: None,
             v: View {
                 content: Content::Empty,
                 rows: Vec::new(),
@@ -416,6 +436,8 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
     let t = 1.0 - (1.0 - p.enter).powi(3);
     let dy = -3.0 * (1.0 - t);
     let a = t;
+    // Paint the whole buffer: the window can briefly be larger than `p.size` while it resizes.
+    pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
     let mut c = Canvas { pm, s };
     c.rect(0.0, 0.0, w, h, bg);
     match &p.content {
@@ -453,7 +475,7 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
                     c.rrect(PAD, y, w - 2.0 * PAD, r.h, [9.0; 4], hover_bg.with_alpha(*f * a));
                 }
                 let icon = if items.get(i).is_some_and(|it| it.url) { Icon::Globe } else { Icon::Search };
-                c.icon(icon, PAD + 12.0, y + (r.h - 16.0) / 2.0, 16.0, if sel { th.accent } else { th.dim }.with_alpha(a));
+                c.icon(icon, PAD + 11.0, y + (r.h - 18.0) / 2.0, 18.0, if sel { th.accent } else { th.fg.with_alpha(0.8) }.with_alpha(a));
                 let hint_w = r.hint.as_ref().map_or(0.0, |b| text_width(b, s));
                 if let Some(b) = &mut r.label {
                     c.text(fonts, b, PAD + 40.0, y + (r.h - 13.5 * 1.35) / 2.0, th.fg.with_alpha(a), w - PAD - 20.0 - hint_w, 16.0);
@@ -488,6 +510,11 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
             }
         }
     }
+    // Own 1px border: the popups have no OS frame (the OS shadow frame left unpainted edges).
+    c.hairline_h(0.0, 0.0, w, th.border);
+    c.hairline_h(0.0, h - 1.0, w, th.border);
+    c.hairline_v(0.0, 0.0, h, th.border);
+    c.hairline_v(w - 1.0, 0.0, h, th.border);
 }
 
 #[cfg(test)]

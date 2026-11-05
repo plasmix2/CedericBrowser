@@ -101,6 +101,17 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`claude/kind-brown-esznx2` (tooltips)** — Toolbar tooltips are no longer popup windows. `Browser::show_tip` runs `window.__cedericTip(...)` (defined in `SHORTCUT_SCRIPT`) in the active page, which draws a click-through tooltip in a closed shadow root just under the toolbar. No popup window, nothing to resize or repaint. `ChromeCmd::Tip`/`TipEnd` and the toolbar hover timer are unchanged. Also restored the speed flags: `--enable-quic`, `EncryptedClientHello`, `UseEcoQoSForBackgroundProcess`, `--ssl-version-min=tls1.2`, `--disable-component-update`.
+
+- **`claude/kind-brown-esznx2` (merge)** — Merged `origin/gemini/picture-in-picture` (4adecac) into the tooltip/popup work. Version is now `0.2.0` for the `persona` crate.
+  - **`origin/main` (2dbe2b0) does not compile**: its merge left `BROWSER_ARGS` defined twice, duplicated blocks in `main.rs` (`sync_ui`, `redraw`), `gfx.rs` (glyph loop, `blend`), `popups.rs`, `thumbs.rs` (missing `EvalGesture`/`eval_gesture`), plus undefined `HistoryEntry`. `origin/gemini/picture-in-picture` does compile; use that as the base.
+  - That branch's `BROWSER_ARGS` had dropped `--remote-debugging-port=0`, which DevTools docking, tab thumbnails and PiP depend on (see AGENTS.md). I restored it. It also no longer has `--enable-quic`, `EncryptedClientHello`, `--ssl-version-min=tls1.2` or the other perf flags from `agy/perf-improvements`; I left that to the owners to decide.
+  - Popups no longer use `with_undecorated_shadow` (tao reserved unpainted insets, causing black/white edge artifacts); they draw their own 1px border and stay parked until repainted after a resize.
+
+- **`claude/kind-brown-esznx2`** — Native tooltips on toolbar and window buttons (not built or run: written in a Linux container without the Windows/WebView2 toolchain, so `cargo build`/`cargo test` are still to be run on Windows):
+  - **Files changed:** `src/toolbar.rs`, `src/popups.rs`, `src/main.rs`, `INSTRUCTIONS.md`.
+  - **Key changes:** `ChromeCmd::Tip { text, x, y }` / `TipEnd` (appended), `popups::Content::Tip(String)` + `TIP_H`, `Toolbar::{tip_text, tip_rect, update_tip, end_tip}` with a 450ms `TIP_DELAY`, `Browser::show_tip`. Tooltips reuse the `Kind::Preview` popup window, so no new popup window was added. `Toolbar::tick` wakes for the tooltip timer and stays idle otherwise.
+
 - **`agy/anonymous-history`** — Anonymous session search history & automatic clearing:
   - **Files changed:** `src/main.rs`, `src/history.rs`, `src/crypto.rs`, `INSTRUCTIONS.md`.
   - **Key changes:**

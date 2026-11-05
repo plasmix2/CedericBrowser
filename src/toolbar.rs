@@ -17,7 +17,7 @@ use tiny_skia::Pixmap;
 
 use crate::{
     ChromeCmd, TabId,
-    gfx::{Brand, Canvas, Fonts, Icon, Rgba, Theme, attrs, text_width},
+    gfx::{Brand, Canvas, Fonts, Icon, PersonaColor, Rgba, Theme, attrs, text_width},
 };
 
 /// Height of the tab strip (also the window's title bar).
@@ -61,6 +61,8 @@ pub struct Model {
     pub pip: bool,
     pub bookmarked: bool,
     pub brand: Brand,
+    pub color: PersonaColor,
+    pub badge_letter: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -153,13 +155,15 @@ pub struct Toolbar {
     sidx: usize,
     blink_from: Instant,
     pretty: Option<(String, Buffer)>,
-    badge: Option<(Brand, Buffer, f32)>,
+    badge: Option<(String, Buffer, f32)>,
     placeholder: Buffer,
     clipboard: Option<arboard::Clipboard>,
     // hover cards
     hover_tab: Option<(TabId, Instant, bool)>,
     card_shown: bool,
     card_leave: Option<Instant>,
+    /// Button under the pointer, when it started hovering, and whether its tooltip is up.
+    tip: Option<(Hit, Instant, bool)>,
     last_frame: Instant,
     bg: Option<Pixmap>,
     logo: Option<Pixmap>,
@@ -188,6 +192,8 @@ fn approach01(v: &mut f32, target: f32, k: f32) -> bool {
         true
     }
 }
+
+const TIP_DELAY: Duration = Duration::from_millis(450);
 
 fn hit_key(h: Hit) -> usize {
     match h {
@@ -259,6 +265,7 @@ impl Toolbar {
             hover_tab: None,
             card_shown: false,
             card_leave: None,
+            tip: None,
             last_frame: now,
             bg: None,
             logo: Pixmap::decode_png(include_bytes!("ui/logo_64.png")).ok(),
@@ -268,9 +275,19 @@ impl Toolbar {
 
     // ---------- outside updates ----------
 
+    #[allow(dead_code)]
     pub fn set_theme(&mut self, dark: bool, brand: Brand) {
-        self.theme = Theme::for_brand(dark, brand);
-        self.model.brand = brand;
+        self.set_persona_theme(dark, PersonaColor::from(brand), brand.badge_letter());
+    }
+
+    pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor, badge_letter: &str) {
+        self.theme = Theme::for_persona(dark, color);
+        self.model.brand = match color {
+            PersonaColor::Slate => Brand::Uzaki,
+            _ => Brand::Cederic,
+        };
+        self.model.color = color;
+        self.model.badge_letter = badge_letter.to_uppercase();
         self.pretty = None;
     }
 
@@ -603,6 +620,7 @@ impl Toolbar {
     }
 
     pub fn mouse_left(&mut self) {
+        self.end_tip();
         if !self.captures_mouse() {
             self.hover = Hit::None;
             self.mouse = (-1.0, -1.0);
@@ -630,6 +648,7 @@ impl Toolbar {
         let hit = self.hit(x, y);
         self.cmds.push(ChromeCmd::Dismiss);
         self.end_hover_card();
+        self.end_tip();
         if self.editing && hit != Hit::Omni {
             self.blur_address();
         }
@@ -782,6 +801,80 @@ impl Toolbar {
                 self.card_shown = false;
                 self.cmds.push(ChromeCmd::TabHoverEnd);
             }
+        }
+    }
+
+    // ---------- button tooltips ----------
+
+    /// Tooltip text for a toolbar or window button, with its shortcut.
+    fn tip_text(&self, h: Hit) -> Option<&'static str> {
+        Some(match h {
+            Hit::Back => "Back (Alt+Left)",
+            Hit::Forward => "Forward (Alt+Right)",
+            Hit::Reload if self.model.loading => "Stop loading",
+            Hit::Reload => "Reload (Ctrl+R)",
+            Hit::Star if self.model.url.is_empty() => return None,
+            Hit::Star if self.model.bookmarked => "Remove bookmark (Ctrl+D)",
+            Hit::Star => "Bookmark this page (Ctrl+D)",
+            Hit::Bookmarks => "Bookmarks (Ctrl+B)",
+            Hit::Pip => "Picture in picture (Alt+P)",
+            Hit::History => "Search history (Ctrl+H)",
+            Hit::Theme => "Theme and persona",
+            Hit::Devtools => "Developer tools (F12)",
+            Hit::NewTab => "New tab (Ctrl+T)",
+            Hit::Min => "Minimize",
+            Hit::Max if self.model.maximized => "Restore down",
+            Hit::Max => "Maximize",
+            Hit::Close => "Close window",
+            _ => return None,
+        })
+    }
+
+    fn tip_rect(&self, h: Hit) -> Option<R> {
+        let g = self.geo();
+        Some(match h {
+            Hit::Back => g.back,
+            Hit::Forward => g.fwd,
+            Hit::Reload => g.reload,
+            Hit::Star => g.star,
+            Hit::Bookmarks => g.bookmarks,
+            Hit::Pip => g.pip,
+            Hit::History => g.hist,
+            Hit::Theme => g.theme,
+            Hit::Devtools => g.dev,
+            Hit::NewTab => g.new_tab,
+            Hit::Min => g.min,
+            Hit::Max => g.max,
+            Hit::Close => g.close,
+            _ => return None,
+        })
+    }
+
+    fn end_tip(&mut self) {
+        if self.tip.take().is_some_and(|(_, _, shown)| shown) {
+            self.cmds.push(ChromeCmd::TipEnd);
+        }
+    }
+
+    fn update_tip(&mut self, now: Instant) {
+        let busy = self.drag.is_some() || self.selecting || self.pressed.is_some();
+        let over = if busy || self.tip_text(self.hover).is_none() { None } else { Some(self.hover) };
+        match (over, self.tip) {
+            (None, _) => self.end_tip(),
+            (Some(h), Some((cur, _, _))) if h == cur => {}
+            (Some(h), prev) => {
+                // Moving between neighbouring buttons while a tip is up swaps it at once.
+                let was_shown = prev.is_some_and(|(_, _, shown)| shown);
+                self.tip = Some((h, if was_shown { now - TIP_DELAY } else { now }, false));
+            }
+        }
+        if let Some((h, since, false)) = self.tip
+            && now >= since + TIP_DELAY
+            && let (Some(text), Some(r)) = (self.tip_text(h), self.tip_rect(h))
+        {
+            // The tab hover card and a tooltip never show together.
+            self.cmds.push(ChromeCmd::Tip { text: text.to_owned(), x: (r.x + r.w / 2.0) as f64, y: (r.y + r.h + 6.0) as f64 });
+            self.tip = Some((h, since, true));
         }
     }
 
@@ -987,6 +1080,7 @@ impl Toolbar {
         let dt = now.saturating_duration_since(self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         self.update_hover_card(now);
+        self.update_tip(now);
         // Rates tuned so motion settles in ~0.2s and hover fades in ~0.12s.
         let k = 1.0 - (-dt * 26.0).exp();
         let kf = 1.0 - (-dt * 30.0).exp();
@@ -1050,6 +1144,9 @@ impl Toolbar {
         if let Some(t) = self.card_leave {
             wake(t);
         }
+        if let Some((_, since, false)) = self.tip {
+            wake(since + TIP_DELAY);
+        }
         if self.editing {
             // Caret blink.
             let phase = now.saturating_duration_since(self.blink_from).as_millis() % 530;
@@ -1106,7 +1203,7 @@ impl Toolbar {
             if on {
                 self.button_bg(&mut c, r, h, 9.0, &th);
             }
-            c.icon(icon, r.x + 9.0, r.y + 9.0, 16.0, th.fg.with_alpha(disabled(on)));
+            c.icon(icon, r.x + 7.0, r.y + 7.0, 20.0, th.fg.with_alpha(disabled(on)));
         }
         // Star (bookmark current page) button.
         let can_star = !self.model.url.is_empty();
@@ -1117,18 +1214,18 @@ impl Toolbar {
         }
         c.icon(
             if self.model.bookmarked { Icon::StarFilled } else { Icon::Star },
-            g.star.x + 9.0,
-            g.star.y + 9.0,
-            16.0,
+            g.star.x + 7.0,
+            g.star.y + 7.0,
+            20.0,
             if self.model.bookmarked { th.accent } else { th.fg.with_alpha(disabled(can_star)) },
         );
         self.button_bg(&mut c, g.reload, Hit::Reload, 9.0, &th);
         let m = self.load_morph;
-        c.icon(Icon::Reload, g.reload.x + 9.0, g.reload.y + 9.0, 16.0, th.fg.with_alpha(1.0 - m));
-        c.icon(Icon::Stop, g.reload.x + 9.0, g.reload.y + 9.0, 16.0, th.fg.with_alpha(m));
+        c.icon(Icon::Reload, g.reload.x + 7.0, g.reload.y + 7.0, 20.0, th.fg.with_alpha(1.0 - m));
+        c.icon(Icon::Stop, g.reload.x + 7.0, g.reload.y + 7.0, 20.0, th.fg.with_alpha(m));
         for (r, h, icon, active) in [
             (g.pip, Hit::Pip, Icon::Pip, self.model.pip),
-            (g.theme, Hit::Theme, Icon::Palette, self.model.brand == Brand::Uzaki),
+            (g.theme, Hit::Theme, Icon::Palette, self.model.color != PersonaColor::Orange || self.model.brand == Brand::Uzaki),
             (g.dev, Hit::Devtools, Icon::Code, self.model.devtools),
         ] {
             if active {
@@ -1136,7 +1233,7 @@ impl Toolbar {
             } else {
                 self.button_bg(&mut c, r, h, 9.0, &th);
             }
-            c.icon(icon, r.x + 9.0, r.y + 9.0, 16.0, if active { th.accent } else { th.fg });
+            c.icon(icon, r.x + 7.0, r.y + 7.0, 20.0, if active { th.accent } else { th.fg });
         }
 
         self.draw_omni(&mut c, g.omni, &th);
@@ -1234,11 +1331,15 @@ impl Toolbar {
             c.image(logo, icon_x, cy - 8.0, 16.0, 16.0, alpha);
         } else if favicon == BRAND_ICON {
             c.rrect(icon_x, cy - 8.0, 16.0, 16.0, [4.0; 4], th.accent.mix(th.accent2, 0.3).with_alpha(alpha));
-            let brand = self.model.brand;
-            if self.badge.as_ref().is_none_or(|(b, _, _)| *b != brand) {
-                let buf = self.fonts.line(brand.badge_letter(), 11.0, Weight::BOLD, self.s);
+            let letter = if !self.model.badge_letter.is_empty() {
+                self.model.badge_letter.as_str()
+            } else {
+                self.model.brand.badge_letter()
+            };
+            if self.badge.as_ref().is_none_or(|(l, _, _)| l.as_str() != letter) {
+                let buf = self.fonts.line(letter, 11.0, Weight::BOLD, self.s);
                 let bw = text_width(&buf, self.s);
-                self.badge = Some((brand, buf, bw));
+                self.badge = Some((letter.to_string(), buf, bw));
             }
             if let Some((_, buf, bw)) = &mut self.badge {
                 c.text(&mut self.fonts, buf, icon_x + (16.0 - *bw) / 2.0, cy - 7.5, Rgba(255, 255, 255, 255).with_alpha(alpha), f32::MAX, 0.0);
