@@ -216,34 +216,6 @@ impl Painter<'_> {
         self.fill_polygon(&pts, c);
     }
 
-    /// A rounded rectangle filled with a linear gradient from `c1` to `c2` at `angle` radians, with
-    /// an optional border.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rrect_gradient(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, c1: Rgba, c2: Rgba, angle: f32, border: Option<(Rgba, f32)>) {
-        if w <= 0.0 || h <= 0.0 {
-            return;
-        }
-        let mut st = RectStyle::fill(color(c1)).radius(radius.min(w / 2.0).min(h / 2.0) * self.s).linear(color(c2), angle);
-        if let Some((bc, bw)) = border {
-            st = st.border(color(bc), bw * self.s);
-        }
-        self.ui.rect(self.r(x, y, w, h), st);
-    }
-
-    /// A faint, slowly turning "AI mode" glow: blue, violet and pink washes (the Gemini palette)
-    /// pulled toward the theme `accent`, with a thin rim. `f` (0..1) fades it in; `phase` (0..1) turns it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn ai_glow(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, f: f32, phase: f32, accent: Rgba, dark: bool) {
-        let k = if dark { 1.0 } else { 1.3 };
-        let tint = |c: Rgba| c.mix(accent, 0.35);
-        let blue = tint(Rgba(66, 133, 244, 255));
-        let violet = tint(Rgba(155, 114, 203, 255));
-        let pink = tint(Rgba(217, 101, 112, 255));
-        let a = phase * std::f32::consts::TAU;
-        self.rrect_gradient(x, y, w, h, radius, blue.with_alpha(0.30 * f * k), violet.with_alpha(0.16 * f * k), a, Some((violet.with_alpha(0.50 * f), 1.0)));
-        self.rrect_gradient(x, y, w, h, radius, pink.with_alpha(0.24 * f * k), pink.with_alpha(0.0), a + std::f32::consts::PI * 0.75, None);
-    }
-
     /// Switches the layer new shapes go to (0 = base, 1 = blurs and veils, 2 = on top of them).
     pub fn layer(&mut self, n: usize) {
         self.ui.set_layer(n);
@@ -269,6 +241,13 @@ impl Painter<'_> {
         self.ui.backdrop_blur(r, 0.0);
         self.ui.rect(r, RectStyle::fill(color(tint)));
         self.ui.set_layer(0);
+    }
+
+    /// A glowing animated orb (a custom shader) in `accent` over `base`, filling the box.
+    #[allow(clippy::too_many_arguments)]
+    pub fn orb(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, time: f32, energy: f32, accent: Rgba, base: Rgba) {
+        let st = RectStyle::fill(color(base)).radius(radius * self.s).orb(time, energy, color(accent));
+        self.ui.rect(self.r(x, y, w, h), st);
     }
 
     /// A soft drop shadow for a rounded rectangle: `blur` px of falloff, shifted down by `dy`.

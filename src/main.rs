@@ -32,10 +32,10 @@ use toolbar::{BRAND_ICON, Toolbar};
 use serde::{Deserialize, Serialize};
 use tao::{
     dpi::{LogicalPosition, LogicalSize},
-    event::{ElementState, Event, MouseButton, StartCause, WindowEvent},
+    event::{ElementState, Event, KeyEvent, MouseButton, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     platform::windows::WindowBuilderExtWindows,
-    keyboard::ModifiersState,
+    keyboard::{Key, ModifiersState},
     window::{CursorIcon, Fullscreen, Icon as WinIcon, Theme, Window, WindowBuilder, WindowId},
 };
 use wry::{
@@ -715,6 +715,13 @@ enum NewTabCmd {
     LinkGoogle,
     /// Setup: look for the signed-in Google account again.
     CheckGoogle,
+    /// The persona dropdown's New / Edit buttons: open the native persona editor.
+    EditPersona {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// The persona dropdown's Delete button: ask natively first.
+    AskDeletePersona { id: String },
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -1459,6 +1466,23 @@ impl Prefs {
     }
 }
 
+/// Which dialog the modal popup is showing.
+enum ModalKind {
+    Settings,
+    Persona,
+    ConfirmDelete(String),
+}
+
+/// The persona editor's state. The popup is not focusable, so the main window keeps the keyboard
+/// and forwards typing here (`Browser::modal_key`).
+struct PersonaFormState {
+    /// The persona being edited, or `None` for a new one.
+    editing: Option<String>,
+    name: String,
+    ed: anvil_ui::Editor,
+    color: usize,
+}
+
 #[derive(Clone)]
 struct MenuItem {
     label: String,
@@ -1604,6 +1628,8 @@ struct Browser {
     dark: bool,
     popups: Popups,
     menu_actions: Vec<Option<MenuAction>>,
+    modal_kind: Option<ModalKind>,
+    persona_form: Option<PersonaFormState>,
     /// URLs of recently closed tabs, newest last (Ctrl+Shift+T).
     closed_tabs: Vec<String>,
     /// Submenus of the open menu's rows, and the actions of the open submenu's rows.
@@ -2480,16 +2506,165 @@ impl Browser {
                 item("Location", "Websites may read your location", perms.geolocation),
             ],
         };
+        self.modal_kind = Some(ModalKind::Settings);
+        self.show_modal(content, W, 74.0 + 4.0 * 56.0 + 62.0);
+    }
+
+    /// Opens a dialog centred over the window, on top of the blurred page.
+    fn show_modal(&mut self, content: Content, w: f32, h: f32) {
         self.close_menu();
         self.hide_preview();
         self.hide_tip();
         let first_open = !self.popups.is_open(PopupKind::Scrim);
         self.show_scrim(first_open);
-        // Centred over the window, a little above the middle.
         let size = self.logical_size();
-        let h = 74.0 + 4.0 * 56.0 + 62.0;
-        let pos = self.to_screen(((size.width - W as f64) / 2.0).max(0.0), ((size.height - h as f64) / 2.0 - 20.0).max(0.0));
-        self.popups.show(PopupKind::Modal, content, pos, W);
+        let pos = self.to_screen(((size.width - w as f64) / 2.0).max(0.0), ((size.height - h as f64) / 2.0 - 20.0).max(0.0));
+        self.popups.show(PopupKind::Modal, content, pos, w);
+    }
+
+    /// The persona editor and the delete confirmation: native dialogs, no web page involved.
+    fn open_persona_editor(&mut self, id: Option<&str>) {
+        let (name, color) = match id.and_then(|i| self.prefs.personas.iter().find(|p| p.id == i)) {
+            Some(p) => (p.name.clone(), PersonaColor::ALL.iter().position(|c| *c == p.parsed_color()).unwrap_or(0)),
+            None => (String::new(), self.prefs.personas.len() % PersonaColor::ALL.len()),
+        };
+        let n = name.chars().count();
+        self.persona_form = Some(PersonaFormState { editing: id.map(str::to_owned), name, ed: anvil_ui::Editor::at_end(n), color });
+        self.modal_kind = Some(ModalKind::Persona);
+        self.focus_chrome_for_typing();
+        self.show_persona_form();
+    }
+
+    fn show_persona_form(&mut self) {
+        let Some(f) = &self.persona_form else { return };
+        let colors = PersonaColor::ALL
+            .iter()
+            .map(|c| gfx::Rgba::hex(u32::from_str_radix(c.hex_code().trim_start_matches('#'), 16).unwrap_or(0xff6a3d)))
+            .collect();
+        let form = popups::PersonaForm {
+            title: if f.editing.is_some() { "Edit persona".into() } else { "New persona".into() },
+            name: f.name.clone(),
+            caret: f.ed.caret,
+            selected: f.color,
+            colors,
+            color_names: PersonaColor::ALL.iter().map(|c| c.label().to_string()).collect(),
+            avatar_url: self.persona_form_avatar(f),
+            can_delete: f.editing.is_some() && self.prefs.personas.len() > 1,
+        };
+        self.show_modal(Content::Persona(form), popups::FORM_W, popups::PERSONA_H);
+    }
+
+    /// The picture to preview for the persona being edited: its own, or the linked Google photo
+    /// (which is its default), requested for the popup if it is not loaded yet.
+    fn persona_form_avatar(&self, f: &PersonaFormState) -> Option<String> {
+        let own = f.editing.as_ref().and_then(|id| self.prefs.personas.iter().find(|p| p.id == *id)).and_then(|p| p.pfp.clone());
+        let url = own.or_else(|| if f.editing.is_none() { None } else { self.google.as_ref().map(|g| g.photo.clone()).filter(|u| !u.is_empty()) });
+        if let Some(u) = &url
+            && !self.popups.has_image(u)
+        {
+            let _ = self.icons_tx.send(u.clone());
+        }
+        url
+    }
+
+    /// Shows the chosen color on the chrome while editing, so the persona can be judged live.
+    fn preview_persona_color(&mut self) {
+        let Some(f) = &self.persona_form else { return };
+        let color = PersonaColor::ALL.get(f.color).copied().unwrap_or(PersonaColor::Orange);
+        let letter = f.name.trim().chars().next().map_or("P".to_string(), |c| c.to_uppercase().to_string());
+        self.toolbar.set_persona_theme(self.dark, color, &letter);
+        self.window.request_redraw();
+    }
+
+    fn restore_chrome_theme(&mut self) {
+        let p = self.prefs.active_persona().clone();
+        self.toolbar.set_persona_theme(self.dark, p.parsed_color(), &p.badge_letter());
+        self.window.request_redraw();
+    }
+
+    fn ask_delete_persona(&mut self, id: &str) {
+        let Some(p) = self.prefs.personas.iter().find(|p| p.id == id) else { return };
+        let note = format!("“{}” and its bookmarks will be removed.", p.name);
+        self.modal_kind = Some(ModalKind::ConfirmDelete(id.to_owned()));
+        self.show_modal(Content::Confirm { title: "Delete persona?".into(), note, ok: "Delete".into() }, popups::FORM_W, popups::CONFIRM_H);
+    }
+
+    /// Typing goes to the main window while a popup dialog is open; make sure the page does not
+    /// hold the keyboard focus.
+    fn focus_chrome_for_typing(&self) {
+        for t in &self.tabs {
+            let _ = t.view.focus_parent();
+        }
+        if let Some(spare) = &self.spare {
+            let _ = spare.view.focus_parent();
+        }
+        self.window.set_focus();
+    }
+
+    /// Routes a key press to the open dialog. Returns true when a dialog took it.
+    fn modal_key(&mut self, e: &KeyEvent) -> bool {
+        if self.modal_kind.is_none() || !self.popups.is_open(PopupKind::Modal) {
+            return false;
+        }
+        if e.state != ElementState::Pressed {
+            return true;
+        }
+        if e.logical_key == Key::Escape {
+            self.hide_modal();
+            return true;
+        }
+        if !matches!(self.modal_kind, Some(ModalKind::Persona)) {
+            return true;
+        }
+        let ctrl = self.mods.control_key();
+        let Some(f) = self.persona_form.as_mut() else { return true };
+        match &e.logical_key {
+            Key::Enter => {
+                self.save_persona_form();
+                return true;
+            }
+            Key::Backspace => f.ed.backspace(&mut f.name, ctrl),
+            Key::Delete => f.ed.delete_forward(&mut f.name, ctrl),
+            Key::ArrowLeft => f.ed.left(&f.name, self.mods.shift_key(), ctrl),
+            Key::ArrowRight => f.ed.right(&f.name, self.mods.shift_key(), ctrl),
+            Key::Home => f.ed.home(self.mods.shift_key()),
+            Key::End => f.ed.end(&f.name, self.mods.shift_key()),
+            _ if !ctrl && !self.mods.alt_key() => {
+                if let Some(t) = e.text {
+                    let clean: String = t.chars().filter(|c| !c.is_control()).collect();
+                    if !clean.is_empty() {
+                        f.ed.insert(&mut f.name, &clean, 24, &anvil_ui::InputKind::Text);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.show_persona_form();
+        true
+    }
+
+    fn save_persona_form(&mut self) {
+        let Some(f) = self.persona_form.take() else { return };
+        let name = if f.name.trim().is_empty() { "Persona".to_owned() } else { f.name.trim().to_owned() };
+        let color = PersonaColor::ALL.get(f.color).map_or("orange", |c| c.name());
+        self.hide_modal();
+        match f.editing {
+            None => {
+                if let Ok(id) = self.prefs.create_persona(&name, color, None) {
+                    self.set_persona(&id);
+                }
+            }
+            Some(id) => {
+                if self.prefs.update_persona(&id, &name, color, None) {
+                    if id == self.prefs.active_persona_id {
+                        self.set_persona(&id);
+                    } else {
+                        self.sync_all_newtabs();
+                        self.sync_ui();
+                    }
+                }
+            }
+        }
     }
 
     /// Covers the page with a blurred, dimmed snapshot of it while a dialog is open. The snapshot
@@ -2508,6 +2683,12 @@ impl Browser {
     }
 
     fn hide_modal(&mut self) {
+        if matches!(self.modal_kind, Some(ModalKind::Persona)) {
+            // Cancelled or closed: undo the live color preview.
+            self.restore_chrome_theme();
+        }
+        self.modal_kind = None;
+        self.persona_form = None;
         self.popups.hide(PopupKind::Modal);
         self.popups.hide(PopupKind::Scrim);
     }
@@ -2527,20 +2708,6 @@ impl Browser {
     fn choose_background(&mut self) {
         let js = "document.dispatchEvent(new CustomEvent('cederic:act', { detail: { cmd: 'pick_bg' } }))";
         self.with_active(|v| v.evaluate_script(js));
-    }
-
-    fn open_persona_editor(&mut self, id: Option<&str>) {
-        let script = match id {
-            Some(i) => format!("window.__personaOpenEditor && window.__personaOpenEditor({i:?});"),
-            None => "window.__personaOpenEditor && window.__personaOpenEditor(null);".to_string(),
-        };
-        let is_newtab = self.tabs.get(self.active).is_some_and(|t| t.is_newtab);
-        if is_newtab {
-            self.with_active(|v| v.evaluate_script(&script));
-        } else {
-            let _ = self.open_tab(None, None, true);
-            self.with_active(|v| v.evaluate_script(&script));
-        }
     }
 
     /// Reads which Google account is signed in to the active persona's profile. Loads Google's
@@ -3179,23 +3346,53 @@ impl Browser {
                     self.run_menu_action(action);
                 }
             }
-            Pick::Modal(index) => {
-                let p = &self.prefs.permissions;
-                let (mut cam, mut mic, mut notif, mut geo) = (p.camera, p.microphone, p.notifications, p.geolocation);
-                match index {
-                    0 => cam = !cam,
-                    1 => mic = !mic,
-                    2 => notif = !notif,
-                    3 => geo = !geo,
-                    _ => {
-                        self.hide_modal();
-                        self.refocus_page();
-                        return;
+            Pick::Modal(index) => match &self.modal_kind {
+                Some(ModalKind::Persona) => match index {
+                    1..=8 => {
+                        if let Some(f) = self.persona_form.as_mut() {
+                            f.color = index - 1;
+                        }
+                        self.preview_persona_color();
+                        self.show_persona_form();
+                    }
+                    9 => {
+                        let id = self.persona_form.as_ref().and_then(|f| f.editing.clone());
+                        if let Some(id) = id {
+                            self.persona_form = None;
+                            self.restore_chrome_theme();
+                            self.ask_delete_persona(&id);
+                        }
+                    }
+                    10 => self.hide_modal(),
+                    11 => self.save_persona_form(),
+                    _ => {}
+                },
+                Some(ModalKind::ConfirmDelete(id)) => {
+                    let id = id.clone();
+                    self.hide_modal();
+                    if index == 1 && self.prefs.delete_persona(&id).is_ok() {
+                        let active_id = self.prefs.active_id().to_string();
+                        self.set_persona(&active_id);
                     }
                 }
-                self.set_permissions(cam, notif, mic, geo);
-                self.show_settings();
-            }
+                _ => {
+                    let p = &self.prefs.permissions;
+                    let (mut cam, mut mic, mut notif, mut geo) = (p.camera, p.microphone, p.notifications, p.geolocation);
+                    match index {
+                        0 => cam = !cam,
+                        1 => mic = !mic,
+                        2 => notif = !notif,
+                        3 => geo = !geo,
+                        _ => {
+                            self.hide_modal();
+                            self.refocus_page();
+                            return;
+                        }
+                    }
+                    self.set_permissions(cam, notif, mic, geo);
+                    self.show_settings();
+                }
+            },
             Pick::Suggest(index) => {
                 if let Some(text) = self.suggestions.get(index).map(|s| s.text.clone()) {
                     self.toolbar.blur_address();
@@ -3339,6 +3536,8 @@ impl Browser {
                 let _ = self.open_tab(Some(GOOGLE_SIGN_IN_URL.into()), None, true);
             }
             NewTabCmd::CheckGoogle => self.schedule_account_probe(Duration::from_millis(100)),
+            NewTabCmd::EditPersona { id } => self.open_persona_editor(id.as_deref()),
+            NewTabCmd::AskDeletePersona { id } => self.ask_delete_persona(&id),
             NewTabCmd::FinishSetup => {
                 // Setup is mandatory: it only finishes once a Google account is linked.
                 if self.google.is_none() {
@@ -3654,11 +3853,21 @@ impl Browser {
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => {
-                self.toolbar.key(&event, self.mods);
+                if !self.modal_key(&event) {
+                    self.toolbar.key(&event, self.mods);
+                }
                 self.window.request_redraw();
             }
             WindowEvent::ReceivedImeText(text) => {
-                self.toolbar.ime(&text);
+                if matches!(self.modal_kind, Some(ModalKind::Persona)) && self.popups.is_open(PopupKind::Modal) {
+                    if let Some(f) = self.persona_form.as_mut() {
+                        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                        f.ed.insert(&mut f.name, &clean, 24, &anvil_ui::InputKind::Text);
+                    }
+                    self.show_persona_form();
+                } else {
+                    self.toolbar.ime(&text);
+                }
                 self.window.request_redraw();
             }
             _ => {}
@@ -3946,6 +4155,8 @@ fn main() -> wry::Result<()> {
         dark,
         popups,
         menu_actions: Vec::new(),
+        modal_kind: None,
+        persona_form: None,
         closed_tabs: Vec::new(),
         menu_subs: Vec::new(),
         sub_actions: Vec::new(),

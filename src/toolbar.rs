@@ -154,8 +154,6 @@ pub struct Toolbar {
     dirty: bool,
     /// Setup is running: the chrome is blurred and only the window buttons and title bar work.
     locked: bool,
-    /// 0..1 phase of the hover gradient's slow turn.
-    shimmer: f32,
     drag: Option<Drag>,
     last_click: (Instant, f32, f32, u32),
     progress: f32,
@@ -316,7 +314,6 @@ impl Toolbar {
             hover_fade: [0.0; 16],
             dirty: false,
             locked: false,
-            shimmer: 0.0,
             drag: None,
             last_click: (now, 0.0, 0.0, 0),
             progress: 0.0,
@@ -1301,11 +1298,6 @@ impl Toolbar {
             busy |= approach01(&mut self.hover_fade[hit_key(h)], target, kf);
         }
 
-        // The hover gradient turns slowly while any button is lit (the address bar has no gradient).
-        if self.hover_fade.iter().enumerate().any(|(i, f)| i != hit_key(Hit::Omni) && *f > 0.01) {
-            self.shimmer = (self.shimmer + dt * 0.45).fract();
-            busy = true;
-        }
         busy |= approach01(&mut self.load_morph, if self.model.loading { 1.0 } else { 0.0 }, kf);
         busy |= approach01(&mut self.focus_f, if self.editing { 1.0 } else { 0.0 }, kf);
         if self.star_pop > 0.0 {
@@ -1399,13 +1391,9 @@ impl Toolbar {
         let g = self.geo();
 
         // New tab button.
-        // A faint round chip is always there, so the plus never floats loose in the strip.
-        c.rrect(g.new_tab.x, g.new_tab.y, g.new_tab.w, g.new_tab.h, 15.0, th.fg.with_alpha(0.07));
+        // The plus is just an icon with the same flat hover as the other buttons.
         self.button_bg(c, g.new_tab, Hit::NewTab, 15.0, &th);
-        // The plus turns a quarter as the pointer arrives.
-        let k = self.press_scale(Hit::NewTab);
-        let sz = 16.0 * k;
-        c.icon_rot(Icon::Plus, g.new_tab.x + 7.0 + (16.0 - sz) / 2.0, g.new_tab.y + 7.0 + (16.0 - sz) / 2.0, sz, th.fg.with_alpha(0.72 + 0.28 * self.fade(Hit::NewTab)), self.fade(Hit::NewTab) * std::f32::consts::FRAC_PI_2);
+        c.icon(Icon::Plus, g.new_tab.x + 7.0, g.new_tab.y + 7.0, 16.0, th.fg.with_alpha(0.8));
 
         // Window controls.
         for (r, h, icon) in [
@@ -1513,12 +1501,10 @@ impl Toolbar {
             c.rrect(r.x, r.y, r.w, r.h, radius, th.btn_press);
             return;
         }
+        // Plain hover: a flat fade, nothing else.
         let f = self.fade(h);
         if f > 0.01 {
             c.rrect(r.x, r.y, r.w, r.h, radius, th.btn_hover.with_alpha(f));
-            // Faint Gemini-style glow, tinted by the persona's accent, turning slowly.
-            let phase = (self.shimmer + hit_key(h) as f32 * 0.11).fract();
-            c.ai_glow(r.x, r.y, r.w, r.h, radius, f, phase, th.accent, th.fg.0 > 128);
         }
     }
 

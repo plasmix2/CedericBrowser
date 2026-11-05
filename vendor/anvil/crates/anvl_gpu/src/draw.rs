@@ -31,6 +31,9 @@ pub enum Gradient {
     Radial { to: Color },
     /// Flowing lit cyan-to-gold diagonal wave bands (matching `anvl.dev/hero-shader.js`).
     HeroWave { time: f32, intensity: f32 },
+    /// Persona patch: a soft glowing orb with ripples in `accent`, animated by `time` (seconds) and
+    /// scaled by `energy`, over the base fill color. Used by Persona's persona editor.
+    Orb { time: f32, energy: f32, accent: Color },
 }
 
 /// How a rounded rectangle looks: a fill, an optional 1 px border, and a corner radius.
@@ -72,6 +75,12 @@ impl RectStyle {
     /// Fills with the animated ANVL website hero wave-band shader over the base fill color.
     pub const fn hero_wave(mut self, time: f32, intensity: f32) -> Self {
         self.gradient = Some(Gradient::HeroWave { time, intensity });
+        self
+    }
+
+    /// Fills with an animated glowing orb in `accent` over the base fill (Persona patch).
+    pub const fn orb(mut self, time: f32, energy: f32, accent: Color) -> Self {
+        self.gradient = Some(Gradient::Orb { time, energy, accent });
         self
     }
 
@@ -118,6 +127,7 @@ impl RectInstance {
             Some(Gradient::Linear { to, angle }) => (to, [1.0, angle, 0.0, 0.0]),
             Some(Gradient::Radial { to }) => (to, [2.0, 0.0, 0.0, 0.0]),
             Some(Gradient::HeroWave { time, intensity }) => (s.fill, [3.0, time, intensity, 0.0]),
+            Some(Gradient::Orb { time, energy, accent }) => (accent, [4.0, time, energy, 0.0]),
         };
         Self {
             clip: NO_CLIP,

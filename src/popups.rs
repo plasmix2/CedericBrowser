@@ -38,7 +38,14 @@ const SHOT_H: f32 = 158.0;
 const CARD_TEXT_H: f32 = 62.0;
 const TIP_H: f32 = 28.0;
 const TIP_FONT: f32 = 12.5;
+/// Width of the form dialogs (persona editor, confirmations).
+pub const FORM_W: f32 = 400.0;
+pub const PERSONA_H: f32 = 352.0;
+pub const CONFIRM_H: f32 = 168.0;
 const MODAL_HEAD: f32 = 74.0;
+/// Height of the persona editor's animated preview, and the size of a color dot.
+const HERO_H: f32 = 160.0;
+const DOT: f32 = 30.0;
 const MODAL_ROW: f32 = 56.0;
 const MODAL_FOOT: f32 = 62.0;
 
@@ -140,6 +147,21 @@ pub struct ToggleEntry {
     pub on: bool,
 }
 
+/// The persona editor: a name field, a grid of colors and Save / Cancel / Delete.
+pub struct PersonaForm {
+    pub title: String,
+    pub name: String,
+    /// Caret position in characters.
+    pub caret: usize,
+    pub selected: usize,
+    pub colors: Vec<Rgba>,
+    /// Names of the colors, in the same order (the selected one is shown under its dot).
+    pub color_names: Vec<String>,
+    /// The persona's picture, shown in the preview, if it has one (a loaded photo URL).
+    pub avatar_url: Option<String>,
+    pub can_delete: bool,
+}
+
 pub struct Card {
     pub title: String,
     pub host: String,
@@ -155,6 +177,10 @@ pub enum Content {
     Tip(String),
     /// A dialog: title, a line of explanation, one switch row per entry, then a Done button.
     Modal { title: String, note: String, items: Vec<ToggleEntry> },
+    /// The persona editor dialog. Rows: 0 = name field, 1..=8 = colors, 9 = Delete, 10 = Cancel, 11 = Save.
+    Persona(PersonaForm),
+    /// A yes/no question. Rows: 0 = Cancel, 1 = the confirming button.
+    Confirm { title: String, note: String, ok: String },
     /// A blurred picture of the page (if there is one yet) and the height to cover, in logical px.
     Scrim { img: Option<Pixmap>, h: f32 },
 }
@@ -163,6 +189,9 @@ pub enum Content {
 struct Row {
     y: f32,
     h: f32,
+    /// Horizontal extent for rows that do not span the card (color swatches, buttons); `w` 0 = full width.
+    x: f32,
+    w: f32,
     label: Option<String>,
     icon: Option<Icon>,
     avatar: Option<Avatar>,
@@ -233,6 +262,8 @@ pub struct Popups {
     pub sub: Popup,
     /// Photos for menu avatars, by URL.
     images: std::collections::HashMap<String, Pixmap>,
+    /// For shader animation time.
+    t0: Instant,
     last_frame: Instant,
 }
 
@@ -252,6 +283,7 @@ impl Popups {
             modal: make(Kind::Modal),
             sub: make(Kind::Sub),
             images: std::collections::HashMap::new(),
+            t0: Instant::now(),
             theme,
             last_frame: Instant::now(),
         }
@@ -412,7 +444,7 @@ impl Popups {
                 p.cursor = (x, y);
                 // The shadow margin is part of the window but not of the card.
                 let inside = x >= 0.0 && x < p.v.size.0;
-                let hover = p.v.rows.iter().position(|r| inside && r.enabled && y >= r.y && y < r.y + r.h);
+                let hover = p.v.rows.iter().position(|r| inside && row_hit(r, x, y));
                 if hover != p.v.hover {
                     p.v.hover = hover;
                     if kind == Kind::Suggest
@@ -439,7 +471,7 @@ impl Popups {
                 if *state == ElementState::Pressed && p.v.hover.is_none() {
                     let (x, y) = p.cursor;
                     let inside = x >= 0.0 && x < p.v.size.0;
-                    p.v.hover = p.v.rows.iter().position(|r| inside && r.enabled && y >= r.y && y < r.y + r.h);
+                    p.v.hover = p.v.rows.iter().position(|r| inside && row_hit(r, x, y));
                 }
                 match (kind, state) {
                 // Suggestions act on press: the address bar may lose focus before release.
@@ -478,6 +510,10 @@ impl Popups {
             let mut moved = false;
             if p.v.enter < 1.0 {
                 p.v.enter = (p.v.enter + dt / 0.12).min(1.0);
+                moved = true;
+            }
+            // The persona editor's orb is a live shader: keep drawing while it is open.
+            if matches!(p.v.content, Content::Persona(_)) {
                 moved = true;
             }
             for (i, f) in p.v.hover_fade.iter_mut().enumerate() {
@@ -530,7 +566,7 @@ impl Popups {
             let Some(pm) = Pixmap::new(cw, ch) else { return };
             p.card = pm;
         }
-        draw(&mut p.v, &mut p.card, engine, images, &th, s);
+        draw(&mut p.v, &mut p.card, engine, images, self.t0.elapsed().as_secs_f32(), &th, s);
         compose(&p.card, &mut p.pm, &mut p.frame, engine.as_mut(), margins(kind), corner_radius(kind), kind != Kind::Scrim, s, &th);
         let (w_u32, h_u32) = (w.get(), h.get());
         if p.surface_size != (w_u32, h_u32) {
@@ -613,7 +649,7 @@ impl Popup {
 fn layout(content: &Content) -> (Vec<Row>, f32) {
     let mut rows = Vec::new();
     let mut y = PAD;
-    let row = |y: f32, h: f32, label: Option<String>, hint: Option<String>, enabled: bool| Row { y, h, label, icon: None, avatar: None, sub: false, tail: String::new(), hint, enabled };
+    let row = |y: f32, h: f32, label: Option<String>, hint: Option<String>, enabled: bool| Row { y, h, x: 0.0, w: 0.0, label, icon: None, avatar: None, sub: false, tail: String::new(), hint, enabled };
     match content {
         Content::Empty => return (rows, 1.0),
         Content::Menu(items) => {
@@ -655,6 +691,33 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
             return (rows, TIP_H);
         }
         Content::Scrim { h, .. } => return (rows, *h),
+        Content::Persona(f) => {
+            // Preview area on top (HERO_H), then the name field, the color dots, the buttons.
+            let mut r = row(HERO_H + 12.0, 42.0, Some("name".into()), None, true);
+            (r.x, r.w) = (22.0, FORM_W - 44.0);
+            rows.push(r);
+            let step = (FORM_W - 44.0 - DOT) / 7.0;
+            for i in 0..8 {
+                let mut r = row(HERO_H + 78.0, DOT, Some(String::new()), None, true);
+                (r.x, r.w) = (22.0 + i as f32 * step, DOT);
+                rows.push(r);
+            }
+            let by = HERO_H + 78.0 + DOT + 26.0;
+            for (k, (x, w)) in [(22.0, 96.0), (FORM_W - 22.0 - 92.0 - 8.0 - 92.0, 92.0), (FORM_W - 22.0 - 92.0, 92.0)].into_iter().enumerate() {
+                let mut r = row(by, 36.0, Some(String::new()), None, k != 0 || f.can_delete);
+                (r.x, r.w) = (x, w);
+                rows.push(r);
+            }
+            return (rows, by + 36.0 + 22.0);
+        }
+        Content::Confirm { .. } => {
+            for (x, w) in [(FORM_W - 22.0 - 92.0 - 8.0 - 92.0, 92.0), (FORM_W - 22.0 - 92.0, 92.0)] {
+                let mut r = row(112.0, 34.0, Some(String::new()), None, true);
+                (r.x, r.w) = (x, w);
+                rows.push(r);
+            }
+            return (rows, CONFIRM_H);
+        }
         Content::Modal { items, .. } => {
             y = MODAL_HEAD;
             for it in items {
@@ -668,7 +731,7 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
     (rows, y + PAD)
 }
 
-fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std::collections::HashMap<String, Pixmap>, th: &Theme, s: f32) {
+fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std::collections::HashMap<String, Pixmap>, time: f32, th: &Theme, s: f32) {
     let bg = th.card;
     let Some(engine) = engine.as_mut() else {
         pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
@@ -689,6 +752,12 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
             }
             _ => {}
         }
+    }
+    // The persona editor's picture goes to the GPU too.
+    if let Content::Persona(PersonaForm { avatar_url: Some(u), .. }) = &p.content
+        && let Some(img) = images.get(u)
+    {
+        engine.ensure_texture(&format!("av:{u}"), img);
     }
     // Menu avatars: their photos go to the GPU once.
     for r in &p.rows {
@@ -790,6 +859,81 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
                 // Dim what is behind the dialog; fades in with the popup.
                 c.rect(0.0, 0.0, w, h, Rgba(0, 0, 0, 255).with_alpha(if dark { 0.42 * a } else { 0.30 * a }));
             }
+            Content::Persona(f) => {
+                let accent = f.colors.get(f.selected).copied().unwrap_or(th.accent);
+                // The preview: a shader-driven glowing orb in the chosen color, with the persona's
+                // picture (or initial) floating in the middle of it.
+                c.orb(0.0, 0.0, w, HERO_H, 0.0, time, 1.0, accent, bg);
+                let (ax, ay, ad) = (w / 2.0 - 34.0, HERO_H / 2.0 - 34.0, 68.0);
+                c.circle(ax + ad / 2.0, ay + ad / 2.0, ad / 2.0 + 3.0, accent.with_alpha(a));
+                let shown = f.avatar_url.as_ref().is_some_and(|u| images.contains_key(u));
+                if !(shown && c.image_cover(&format!("av:{}", f.avatar_url.clone().unwrap_or_default()), ax, ay, ad, ad, ad / 2.0)) {
+                    c.circle(ax + ad / 2.0, ay + ad / 2.0, ad / 2.0, accent.mix(Rgba(0, 0, 0, 255), 0.25).with_alpha(a));
+                    let letter = f.name.trim().chars().next().map_or("P".to_string(), |ch| ch.to_uppercase().to_string());
+                    let (lw, lh) = (c.text_width(&letter, 28.0, Weight::SemiBold), c.line_height(28.0, Weight::SemiBold));
+                    c.text(&letter, ax + (ad - lw) / 2.0, ay + (ad - lh) / 2.0, 28.0, Weight::SemiBold, Rgba(255, 255, 255, 255).with_alpha(a), w);
+                }
+                c.text(&f.title, 22.0, 18.0, 12.0, Weight::SemiBold, th.fg.with_alpha(0.75 * a), w - 22.0);
+                // Name field: accent rim (it always has the keyboard), text and a caret.
+                if let Some(r) = p.rows.first() {
+                    c.rrect(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0, 11.0, accent.with_alpha(a));
+                    c.rrect(r.x, r.y, r.w, r.h, 10.0, th.field.with_alpha(a));
+                    let ty = r.y + (r.h - c.line_height(14.0, Weight::Regular)) / 2.0;
+                    let prefix: String = f.name.chars().take(f.caret).collect();
+                    let cx = r.x + 14.0 + c.text_width(&prefix, 14.0, Weight::Regular);
+                    if f.name.is_empty() {
+                        c.text("Persona name", r.x + 14.0, ty, 14.0, Weight::Regular, th.faint.with_alpha(a), r.x + r.w - 10.0);
+                    } else {
+                        c.text(&f.name, r.x + 14.0, ty, 14.0, Weight::Regular, th.fg.with_alpha(a), r.x + r.w - 10.0);
+                    }
+                    let lh = c.line_height(14.0, Weight::Regular);
+                    c.rect(cx, ty, 1.5, lh, th.fg.with_alpha(a));
+                }
+                // Color dots, the chosen one ringed and named underneath.
+                for (i, col) in f.colors.iter().enumerate() {
+                    let Some(r) = p.rows.get(1 + i) else { break };
+                    let hov = p.hover_fade.get(1 + i).copied().unwrap_or(0.0);
+                    let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+                    if i == f.selected {
+                        c.circle(cx, cy, DOT / 2.0 + 5.0, col.with_alpha(a));
+                        c.circle(cx, cy, DOT / 2.0 + 2.5, bg);
+                    }
+                    c.circle(cx, cy, DOT / 2.0 - 1.0 + 1.5 * hov, col.with_alpha(a));
+                }
+                if let (Some(name), Some(r)) = (f.color_names.get(f.selected), p.rows.get(1 + f.selected)) {
+                    let tw = c.text_width(name, 11.5, Weight::SemiBold);
+                    let x = (r.x + r.w / 2.0 - tw / 2.0).clamp(22.0, w - 22.0 - tw);
+                    c.text(name, x, r.y + r.h + 12.0, 11.5, Weight::SemiBold, accent.with_alpha(a), w);
+                }
+                let btn = |c: &mut crate::anvil::Painter, r: &Row, label: &str, fill: Rgba, fg: Rgba, f: f32| {
+                    c.rrect(r.x, r.y, r.w, r.h, 10.0, fill.mix(Rgba(255, 255, 255, 255), 0.12 * f).with_alpha(a));
+                    let tw = c.text_width(label, 13.0, Weight::SemiBold);
+                    let ty = r.y + (r.h - c.line_height(13.0, Weight::SemiBold)) / 2.0;
+                    c.text(label, r.x + (r.w - tw) / 2.0, ty, 13.0, Weight::SemiBold, fg.with_alpha(a), w);
+                };
+                let fade = |i: usize| p.hover_fade.get(i).copied().unwrap_or(0.0);
+                if f.can_delete && let Some(r) = p.rows.get(9) {
+                    btn(c, r, "Delete", th.close.with_alpha(0.14), th.close, fade(9));
+                }
+                if let Some(r) = p.rows.get(10) {
+                    btn(c, r, "Cancel", th.field, th.fg, fade(10));
+                }
+                if let Some(r) = p.rows.get(11) {
+                    btn(c, r, "Save", accent, Rgba(255, 255, 255, 255), fade(11));
+                }
+            }
+            Content::Confirm { title, note, ok } => {
+                c.text(title, 22.0, 20.0, 17.0, Weight::SemiBold, th.fg.with_alpha(a), w - 22.0);
+                c.text(note, 22.0, 56.0, 12.5, Weight::Regular, th.dim.with_alpha(a), w - 22.0);
+                for (i, r) in p.rows.iter().enumerate() {
+                    let f = p.hover_fade.get(i).copied().unwrap_or(0.0);
+                    let (label, fill, fg) = if i == 0 { ("Cancel", th.field, th.fg) } else { (ok.as_str(), th.close, Rgba(255, 255, 255, 255)) };
+                    c.rrect(r.x, r.y, r.w, r.h, 10.0, fill.mix(Rgba(255, 255, 255, 255), 0.12 * f).with_alpha(a));
+                    let tw = c.text_width(label, 13.0, Weight::SemiBold);
+                    let ty = r.y + (r.h - c.line_height(13.0, Weight::SemiBold)) / 2.0;
+                    c.text(label, r.x + (r.w - tw) / 2.0, ty, 13.0, Weight::SemiBold, fg.with_alpha(a), w);
+                }
+            }
             Content::Modal { title, note, items } => {
                 c.text(title, 22.0, 20.0, 17.0, Weight::SemiBold, th.fg.with_alpha(a), w - 22.0);
                 c.text(note, 22.0, 46.0, 12.0, Weight::Regular, th.dim.with_alpha(a), w - 22.0);
@@ -861,6 +1005,11 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
     crate::anvil::copy_to_pixmap(&frame, pm);
 }
 
+/// Whether a point (card coordinates) is on an enabled row, honouring rows narrower than the card.
+fn row_hit(r: &Row, x: f32, y: f32) -> bool {
+    r.enabled && y >= r.y && y < r.y + r.h && (r.w == 0.0 || (x >= r.x && x < r.x + r.w))
+}
+
 /// Background the system paints before the first frame: transparent when popups are rounded.
 fn window_bg(card: Rgba) -> (u8, u8, u8, u8) {
     if rounded_popups() { (0, 0, 0, 0) } else { (card.0, card.1, card.2, 255) }
@@ -930,6 +1079,39 @@ fn compose(card: &Pixmap, out: &mut Pixmap, frame: &mut Option<Frame>, engine: O
 mod tests {
     use super::*;
 
+    #[test]
+    fn persona_dialog_rows_and_hit_testing() {
+        let form = |can_delete| {
+            Content::Persona(PersonaForm {
+                title: "New persona".into(),
+                name: String::new(),
+                caret: 0,
+                selected: 0,
+                colors: vec![Rgba(255, 0, 0, 255); 8],
+                color_names: vec![String::new(); 8],
+                avatar_url: None,
+                can_delete,
+            })
+        };
+        let (rows, h) = layout(&form(false));
+        // name field, 8 colors, delete / cancel / save
+        assert_eq!(rows.len(), 12);
+        assert!((h - PERSONA_H).abs() < 0.5);
+        assert!(!rows[9].enabled, "Delete is off when the persona cannot be deleted");
+        assert!(rows[10].enabled && rows[11].enabled);
+        // A press inside the second color dot hits that dot and nothing else.
+        let r = &rows[2];
+        let hit = |x: f32, y: f32| rows.iter().position(|r| row_hit(r, x, y));
+        assert_eq!(hit(r.x + 3.0, r.y + 3.0), Some(2));
+        // The gap between two dots belongs to no row.
+        assert_eq!(hit(rows[1].x + rows[1].w + 2.0, rows[1].y + 5.0), None);
+        let (rows, _) = layout(&form(true));
+        assert!(rows[9].enabled);
+        let (rows, h) = layout(&Content::Confirm { title: "t".into(), note: "n".into(), ok: "Delete".into() });
+        assert_eq!(rows.len(), 2);
+        assert!((h - CONFIRM_H).abs() < 0.5);
+    }
+
     /// Renders each popup off-screen: `CEDERIC_SHOT=<dir> cargo test -- --ignored render_popups`.
     #[test]
     #[ignore]
@@ -976,7 +1158,7 @@ mod tests {
                 shot_ready: false,
             };
             let mut pm = Pixmap::new((w * s) as u32, (h * s) as u32).unwrap();
-            draw(&mut v, &mut pm, &mut engine, &Default::default(), &th, s);
+            draw(&mut v, &mut pm, &mut engine, &Default::default(), 0.0, &th, s);
             let m = margins(Kind::Menu);
             let mut out = Pixmap::new(((w + m.l + m.r) * s) as u32, ((h + m.t + m.b) * s) as u32).unwrap();
             compose(&pm, &mut out, &mut None, engine.as_mut(), m, corner_radius(Kind::Menu), true, s, &th);
@@ -1039,7 +1221,7 @@ mod tests {
         let mut cache = None;
         let start = Instant::now();
         for _ in 0..120 {
-            draw(&mut v, &mut card, &mut engine, &Default::default(), &th, s);
+            draw(&mut v, &mut card, &mut engine, &Default::default(), 0.0, &th, s);
             compose(&card, &mut out, &mut cache, engine.as_mut(), m, corner_radius(Kind::Menu), true, s, &th);
         }
         println!("popup frame (draw + compose at 2x): {:?}", start.elapsed() / 120);

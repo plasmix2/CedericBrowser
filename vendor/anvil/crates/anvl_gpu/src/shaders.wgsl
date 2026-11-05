@@ -113,6 +113,35 @@ fn fill_at(inp: RectOut, p: vec2<f32>) -> vec4<f32> {
     if (kind < 0.5) {
         return inp.fill;
     }
+    if (kind > 3.5) {
+        // Persona patch: a glowing orb with a wobbling edge and ripples, tinted by `fill2`.
+        let res = max(inp.rect.zw, vec2<f32>(1.0, 1.0));
+        let rel = (p - inp.rect.xy) / res;
+        let c = (rel - vec2<f32>(0.5, 0.5)) * vec2<f32>(res.x / res.y, 1.0);
+        let t = inp.grad.y;
+        let e = inp.grad.z;
+        let r = length(c);
+        let ang = atan2(c.y, c.x);
+        let wob = 0.022 * sin(ang * 3.0 + t * 1.3) + 0.015 * sin(ang * 5.0 - t * 1.9) + 0.01 * sin(ang * 7.0 + t * 2.7);
+        let rad = 0.2 + wob * e;
+        let accent = inp.fill2.rgb;
+        // A second and third hue, rotated from the accent, so the glow shimmers instead of being flat.
+        let alt1 = vec3<f32>(accent.b, accent.r, accent.g);
+        let alt2 = vec3<f32>(accent.g, accent.b, accent.r);
+        let swirl = 0.5 + 0.5 * sin(ang * 2.0 + t * 0.9);
+        let tint = mix(mix(accent, alt1, swirl * 0.5), alt2, (1.0 - swirl) * 0.3);
+        let outside = max(r - rad, 0.0);
+        let halo = exp(-outside * 6.5) * 0.5;
+        let ring_phase = (r - t * 0.06) * 40.0 + sin(ang * 4.0 + t * 1.1) * 1.3;
+        let rings = pow(0.5 + 0.5 * sin(ring_phase), 3.0) * exp(-outside * 5.0) * step(rad, r) * 0.5;
+        let rim = exp(-abs(r - rad) * 16.0) * 0.55;
+        let glow = exp(-pow(r / (rad * 1.05), 2.0) * 1.7);
+        var col = tint * (halo + rings + rim) * e;
+        col += mix(accent, vec3<f32>(1.0, 1.0, 1.0), 0.4) * glow * (0.92 + 0.08 * sin(t * 2.0));
+        // A faint outer haze keeps the area from looking cut off.
+        col += accent * exp(-r * 3.2) * 0.12 * e;
+        return vec4<f32>(clamp(inp.fill.rgb + col, vec3<f32>(0.0), vec3<f32>(1.0)), inp.fill.a);
+    }
     if (kind > 2.5) {
         let res = max(inp.rect.zw, vec2<f32>(1.0, 1.0));
         let rel = clamp((p - inp.rect.xy) / res, vec2<f32>(0.0), vec2<f32>(1.0));

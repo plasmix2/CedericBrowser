@@ -633,34 +633,10 @@
   document.getElementById('modal-name-input').addEventListener('input', updateModalPreview);
 
   // Modal open/close
+  // The persona editor is a native dialog now; the page only asks the browser to open it.
   const openEditorModal = (mode, personaId) => {
     toggleDropdown(false);
-    curEditorMode = mode;
-    curEditorId = personaId || '';
-    const modal = document.getElementById('modal-backdrop');
-    const titleEl = document.getElementById('modal-title');
-    const nameInp = document.getElementById('modal-name-input');
-    const delBtn = document.getElementById('modal-delete-btn');
-
-    if (mode === 'edit') {
-      const p = curState && curState.personas.find(x => x.id === personaId);
-      titleEl.textContent = 'Edit Persona';
-      nameInp.value = p ? p.name : '';
-      curEditorColor = p ? p.color : 'orange';
-      curEditorPfp = p ? p.pfp : null;
-      delBtn.style.display = (curState && curState.can_delete) ? 'block' : 'none';
-    } else {
-      titleEl.textContent = 'Create New Persona';
-      const num = (curState && curState.personas) ? curState.personas.length + 1 : 1;
-      nameInp.value = `Persona ${num}`;
-      curEditorColor = COLOR_PALETTE[num % COLOR_PALETTE.length].name;
-      curEditorPfp = null;
-      delBtn.style.display = 'none';
-    }
-    renderSwatches();
-    updateModalPreview();
-    modal.classList.add('open');
-    setTimeout(() => nameInp.focus(), 50);
+    send({ nt: 'edit_persona', id: mode === 'edit' ? personaId : null });
   };
 
   const closeModal = () => {
@@ -976,9 +952,7 @@
         delBtn.innerHTML = '<svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
         delBtn.onclick = (e) => {
           e.stopPropagation();
-          if (confirm(`Delete persona "${p.name}"?`)) {
-            send({ nt: 'delete_persona', id: p.id });
-          }
+          send({ nt: 'ask_delete_persona', id: p.id });
         };
         actions.append(delBtn);
       }
