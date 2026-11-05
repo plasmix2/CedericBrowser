@@ -101,6 +101,8 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`claude/kind-brown-esznx2` (persona avatar)**: the persona button (`Hit::Theme`) shows the active persona's profile picture cropped to a circle (`Toolbar::draw_avatar`, `bake_avatar`), or its initial on the persona color. New `Model::pfp` (appended), loaded through the favicon worker. `favicons::decode` now handles JPEG via the `jpeg-decoder` crate (the New Tab page saves pictures as JPEG). Tests: `decodes_jpeg`, and a `toolbar-pfp` case in `render_toolbar`.
+
 - **`claude/kind-brown-esznx2` (saved sign-ins, popup speed)**:
   - Cookies are **no longer wiped** on exit or by "Clear search history" (`ChromeCmd::ClearHistory` now only clears the encrypted search history). That wipe signed users out of Google on every restart. Search history still auto-clears per session. Clearing cookies is now an explicit history-menu item: `MenuAction::ClearSiteData` → `ChromeCmd::ClearSiteData` ("Clear cookies and site data — Signs you out").
   - `popups::compose` caches the shadow pixmap and clip mask (`Popup::frame`, keyed by size/scale/theme). A popup frame went from 13.7 ms to 1.85 ms at 2x (`bench_popup`, ignored test), pixel-identical output.

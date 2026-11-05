@@ -1771,6 +1771,7 @@ impl Browser {
             brand,
             color,
             badge_letter,
+            pfp: self.prefs.active_persona().pfp.clone().unwrap_or_default(),
         };
         if tab.is_newtab {
             Self::push_newtab_state(&tab.view, &self.prefs, &self.history);

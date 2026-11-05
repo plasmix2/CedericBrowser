@@ -63,6 +63,8 @@ pub struct Model {
     pub brand: Brand,
     pub color: PersonaColor,
     pub badge_letter: String,
+    /// The active persona's profile picture (a data: or web URL), or empty for none.
+    pub pfp: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -169,6 +171,10 @@ pub struct Toolbar {
     logo: Option<Pixmap>,
     /// Requests for the browser, drained after each event.
     pub cmds: Vec<ChromeCmd>,
+    /// The profile picture cropped to a circle at the current scale: (source URL, scale, image).
+    avatar: Option<(String, f32, Pixmap)>,
+    /// The persona's initial, shown when it has no picture: (letter, laid-out text, width).
+    avatar_letter: Option<(String, Buffer, f32)>,
 }
 
 fn approach(v: &mut f32, target: f32, k: f32) -> bool {
@@ -191,6 +197,20 @@ fn approach01(v: &mut f32, target: f32, k: f32) -> bool {
         *v += d * k;
         true
     }
+}
+
+/// Scales `src` to cover an `n`x`n` square and crops it to a circle, ready to draw 1:1.
+fn bake_avatar(src: &Pixmap, n: u32) -> Option<Pixmap> {
+    use tiny_skia::{FillRule, FilterQuality, Mask, PathBuilder, PixmapPaint, Transform};
+    let mut out = Pixmap::new(n.max(1), n.max(1))?;
+    let mut mask = Mask::new(out.width(), out.height())?;
+    let r = n as f32 / 2.0;
+    mask.fill_path(&PathBuilder::from_circle(r, r, r)?, FillRule::Winding, true, Transform::identity());
+    let k = (n as f32 / src.width() as f32).max(n as f32 / src.height() as f32);
+    let (dx, dy) = ((n as f32 - src.width() as f32 * k) / 2.0, (n as f32 - src.height() as f32 * k) / 2.0);
+    let paint = PixmapPaint { quality: FilterQuality::Bicubic, ..PixmapPaint::default() };
+    out.draw_pixmap(0, 0, src.as_ref(), &paint, Transform::from_row(k, 0.0, 0.0, k, dx, dy), Some(&mask));
+    Some(out)
 }
 
 const TIP_DELAY: Duration = Duration::from_millis(450);
@@ -270,6 +290,8 @@ impl Toolbar {
             bg: None,
             logo: Pixmap::decode_png(include_bytes!("ui/logo_64.png")).ok(),
             cmds: Vec::new(),
+            avatar: None,
+            avatar_letter: None,
         }
     }
 
@@ -320,6 +342,10 @@ impl Toolbar {
                 self.icons.insert(t.favicon.clone(), None);
                 self.icon_requests.push(t.favicon.clone());
             }
+        }
+        if !model.pfp.is_empty() && !self.icons.contains_key(&model.pfp) {
+            self.icons.insert(model.pfp.clone(), None);
+            self.icon_requests.push(model.pfp.clone());
         }
         // Titles changed: drop cached layouts.
         for v in &mut self.vis {
@@ -819,7 +845,7 @@ impl Toolbar {
             Hit::Bookmarks => "Bookmarks (Ctrl+B)",
             Hit::Pip => "Picture in picture (Alt+P)",
             Hit::History => "Search history (Ctrl+H)",
-            Hit::Theme => "Theme and persona",
+            Hit::Theme => "Persona and theme",
             Hit::Devtools => "Developer tools (F12)",
             Hit::NewTab => "New tab (Ctrl+T)",
             Hit::Min => "Minimize",
@@ -1223,9 +1249,10 @@ impl Toolbar {
         let m = self.load_morph;
         c.icon(Icon::Reload, g.reload.x + 7.0, g.reload.y + 7.0, 20.0, th.fg.with_alpha(1.0 - m));
         c.icon(Icon::Stop, g.reload.x + 7.0, g.reload.y + 7.0, 20.0, th.fg.with_alpha(m));
+        self.button_bg(&mut c, g.theme, Hit::Theme, 9.0, &th);
+        self.draw_avatar(&mut c, g.theme, &th);
         for (r, h, icon, active) in [
             (g.pip, Hit::Pip, Icon::Pip, self.model.pip),
-            (g.theme, Hit::Theme, Icon::Palette, self.model.color != PersonaColor::Orange || self.model.brand == Brand::Uzaki),
             (g.dev, Hit::Devtools, Icon::Code, self.model.devtools),
         ] {
             if active {
@@ -1375,6 +1402,34 @@ impl Toolbar {
         }
     }
 
+    /// The persona button: the active persona's profile picture in a circle, or its initial on
+    /// its color when it has none.
+    fn draw_avatar(&mut self, c: &mut Canvas, r: R, th: &Theme) {
+        const D: f32 = 24.0;
+        let (x, y) = (r.x + (r.w - D) / 2.0, r.y + (r.h - D) / 2.0);
+        let s = self.s;
+        let pfp = self.model.pfp.clone();
+        if let Some(Some(src)) = self.icons.get(&pfp) {
+            if self.avatar.as_ref().is_none_or(|(u, sc, _)| *u != pfp || *sc != s) {
+                self.avatar = bake_avatar(src, (D * s).round() as u32).map(|img| (pfp.clone(), s, img));
+            }
+            if let Some((_, _, img)) = &self.avatar {
+                c.image(img, x, y, D, D, 1.0);
+                return;
+            }
+        }
+        c.circle(x + D / 2.0, y + D / 2.0, D / 2.0, th.accent);
+        let letter = if self.model.badge_letter.is_empty() { self.model.brand.badge_letter().to_owned() } else { self.model.badge_letter.clone() };
+        if self.avatar_letter.as_ref().is_none_or(|(l, _, _)| *l != letter) {
+            let buf = self.fonts.line(&letter, 12.0, Weight::BOLD, s);
+            let w = text_width(&buf, s);
+            self.avatar_letter = Some((letter, buf, w));
+        }
+        if let Some((_, buf, w)) = &mut self.avatar_letter {
+            c.text(&mut self.fonts, buf, x + (D - *w) / 2.0, y + (D - 12.0 * 1.35) / 2.0, Rgba(255, 255, 255, 255), f32::MAX, 0.0);
+        }
+    }
+
     fn draw_omni(&mut self, c: &mut Canvas, o: R, th: &Theme) {
         let f = if self.editing { 0.0 } else { self.fade(Hit::Omni) };
         if self.editing {
@@ -1508,7 +1563,7 @@ mod tests {
     #[ignore]
     fn render_toolbar() {
         let dir = std::path::PathBuf::from(std::env::var("CEDERIC_SHOT").expect("CEDERIC_SHOT"));
-        for (name, dark, editing) in [("toolbar-dark", true, false), ("toolbar-light", false, false), ("toolbar-editing", true, true)] {
+        for (name, dark, editing) in [("toolbar-dark", true, false), ("toolbar-light", false, false), ("toolbar-editing", true, true), ("toolbar-pfp", true, false)] {
             let s = 2.0;
             let mut tb = Toolbar::new(dark, s, 1280.0);
             let tab = |id, title: &str, favicon: &str, loading| TabInfo { id, title: title.into(), favicon: favicon.into(), loading, pip: false };
@@ -1522,8 +1577,20 @@ mod tests {
                 url: "https://search.cederic.com/search?q=rust+borrow+checker".into(),
                 can_back: true,
                 loading: false,
+                badge_letter: "M".into(),
+                pfp: if name == "toolbar-pfp" { "data:test-pfp".into() } else { String::new() },
                 ..Model::default()
             });
+            if name == "toolbar-pfp" {
+                // A stand-in picture: a diagonal two-color split, to show the circular crop.
+                let mut img = Pixmap::new(64, 48).unwrap();
+                img.fill(tiny_skia::Color::from_rgba8(230, 120, 60, 255));
+                let tri = tiny_skia::PathBuilder::from_rect(tiny_skia::Rect::from_xywh(0.0, 24.0, 64.0, 24.0).unwrap());
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(60, 110, 220, 255);
+                img.fill_path(&tri, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                tb.icon_loaded("data:test-pfp".into(), Some(img));
+            }
             if editing {
                 tb.focus_address();
             }
