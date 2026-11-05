@@ -686,6 +686,13 @@ enum NewTabCmd {
         pfp: Option<String>,
     },
     DeletePersona { id: String },
+    SetPermissions {
+        camera: bool,
+        notifications: bool,
+        microphone: bool,
+        #[serde(default)]
+        geolocation: bool,
+    },
     SetBackground {
         #[serde(default)]
         data: String,
@@ -804,6 +811,10 @@ enum MenuAction {
     ToggleFullscreen,
     ClearSiteData,
     OpenTab(String),
+    ToggleCamera,
+    ToggleNotifications,
+    ToggleMicrophone,
+    OpenSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -926,6 +937,33 @@ impl PersonaProfile {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SitePermissions {
+    #[serde(default = "default_true")]
+    pub camera: bool,
+    #[serde(default = "default_true")]
+    pub notifications: bool,
+    #[serde(default = "default_true")]
+    pub microphone: bool,
+    #[serde(default)]
+    pub geolocation: bool,
+}
+
+impl Default for SitePermissions {
+    fn default() -> Self {
+        Self {
+            camera: true,
+            notifications: true,
+            microphone: true,
+            geolocation: false,
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct PrefsData {
     #[serde(default)]
@@ -936,6 +974,8 @@ struct PrefsData {
     brand: Option<Brand>,
     #[serde(default)]
     bookmarks: Option<Vec<Bookmark>>,
+    #[serde(default)]
+    permissions: Option<SitePermissions>,
 }
 
 struct Prefs {
@@ -943,6 +983,7 @@ struct Prefs {
     data_dir: PathBuf,
     active_persona_id: String,
     personas: Vec<PersonaProfile>,
+    permissions: SitePermissions,
     bg_cache: HashMap<String, Option<String>>,
     strip_cache: HashMap<String, Option<Pixmap>>,
 }
@@ -1015,11 +1056,14 @@ impl Prefs {
             strip_cache.insert(p.id.clone(), strip);
         }
 
+        let permissions = data.permissions.unwrap_or_default();
+
         Self {
             path,
             data_dir: data_dir.to_path_buf(),
             active_persona_id: active_id,
             personas,
+            permissions,
             bg_cache,
             strip_cache,
         }
@@ -1121,6 +1165,7 @@ impl Prefs {
             personas: self.personas.clone(),
             brand: Some(self.brand()),
             bookmarks: Some(self.active_bookmarks().to_vec()),
+            permissions: Some(self.permissions.clone()),
         };
         if let Ok(json) = serde_json::to_string_pretty(&data) {
             let tmp = self.path.with_extension("json.tmp");
@@ -1131,6 +1176,14 @@ impl Prefs {
                 let _ = std::fs::rename(&tmp, &self.path);
             }
         }
+    }
+
+    pub fn set_permissions(&mut self, camera: bool, notifications: bool, microphone: bool, geolocation: bool) {
+        self.permissions.camera = camera;
+        self.permissions.notifications = notifications;
+        self.permissions.microphone = microphone;
+        self.permissions.geolocation = geolocation;
+        self.save();
     }
 
     fn set_active_persona(&mut self, id: &str) -> bool {
@@ -1396,6 +1449,10 @@ struct NewTabState<'a> {
     logo: &'a str,
     can_create: bool,
     can_delete: bool,
+    allow_camera: bool,
+    allow_notifications: bool,
+    allow_microphone: bool,
+    allow_geolocation: bool,
 }
 
 struct Devtools {
@@ -1459,6 +1516,10 @@ struct Browser {
     probe_again: bool,
     /// A probe is already scheduled to run shortly.
     probe_scheduled: bool,
+    allow_camera: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    allow_notifications: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    allow_microphone: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    allow_geolocation: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Browser {
@@ -1521,6 +1582,10 @@ impl Browser {
         let p_new = self.proxy.clone();
         let p_ipc = self.proxy.clone();
         let p_nav = self.proxy.clone();
+        let cam = self.allow_camera.clone();
+        let notif = self.allow_notifications.clone();
+        let mic = self.allow_microphone.clone();
+        let geo = self.allow_geolocation.clone();
 
         let mut builder = WebViewBuilder::new_with_web_context(&mut self.context)
             .with_bounds(bounds)
@@ -1538,11 +1603,35 @@ impl Browser {
             .with_hotkeys_zoom(true)
             .with_general_autofill_enabled(false)
             .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
-            .with_permission_handler(|kind| match kind {
-                PermissionKind::Microphone
-                | PermissionKind::Camera
-                | PermissionKind::Geolocation
-                | PermissionKind::Notifications => PermissionResponse::Deny,
+            .with_permission_handler(move |kind| match kind {
+                PermissionKind::Camera | PermissionKind::DisplayCapture => {
+                    if cam.load(std::sync::atomic::Ordering::Relaxed) {
+                        PermissionResponse::Allow
+                    } else {
+                        PermissionResponse::Deny
+                    }
+                }
+                PermissionKind::Notifications => {
+                    if notif.load(std::sync::atomic::Ordering::Relaxed) {
+                        PermissionResponse::Allow
+                    } else {
+                        PermissionResponse::Deny
+                    }
+                }
+                PermissionKind::Microphone => {
+                    if mic.load(std::sync::atomic::Ordering::Relaxed) {
+                        PermissionResponse::Allow
+                    } else {
+                        PermissionResponse::Deny
+                    }
+                }
+                PermissionKind::Geolocation => {
+                    if geo.load(std::sync::atomic::Ordering::Relaxed) {
+                        PermissionResponse::Allow
+                    } else {
+                        PermissionResponse::Deny
+                    }
+                }
                 _ => PermissionResponse::Allow,
             })
             .with_navigation_handler(move |nav_url| {
@@ -1823,6 +1912,10 @@ impl Browser {
             logo: LOGO_DATA_URI.as_str(),
             can_create: prefs.personas.len() < 5,
             can_delete: prefs.personas.len() > 1,
+            allow_camera: prefs.permissions.camera,
+            allow_notifications: prefs.permissions.notifications,
+            allow_microphone: prefs.permissions.microphone,
+            allow_geolocation: prefs.permissions.geolocation,
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -2156,7 +2249,44 @@ impl Browser {
         let rm_label = format!("Remove {cur_name} background image");
         items.push(MenuItem::new(bg_label, MenuAction::ChooseBackground));
         items.push(MenuItem::new(rm_label, MenuAction::ClearBackground).enabled(has_bg));
+        items.push(MenuItem::sep());
+        let cam_allowed = self.allow_camera.load(std::sync::atomic::Ordering::Relaxed);
+        let notif_allowed = self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed);
+        let mic_allowed = self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed);
+        items.push(MenuItem::new(
+            if cam_allowed { "✓ Camera Access" } else { "   Camera Access" },
+            MenuAction::ToggleCamera,
+        ).hint(if cam_allowed { "Allowed" } else { "Blocked" }));
+        items.push(MenuItem::new(
+            if notif_allowed { "✓ Notifications" } else { "   Notifications" },
+            MenuAction::ToggleNotifications,
+        ).hint(if notif_allowed { "Allowed" } else { "Blocked" }));
+        items.push(MenuItem::new(
+            if mic_allowed { "✓ Microphone Access" } else { "   Microphone Access" },
+            MenuAction::ToggleMicrophone,
+        ).hint(if mic_allowed { "Allowed" } else { "Blocked" }));
+        items.push(MenuItem::new("Permissions & Settings…", MenuAction::OpenSettings));
         self.show_menu(items, (right - 260.0).max(0.0), y);
+    }
+
+    fn set_permissions(&mut self, camera: bool, notifications: bool, microphone: bool, geolocation: bool) {
+        self.allow_camera.store(camera, std::sync::atomic::Ordering::Relaxed);
+        self.allow_notifications.store(notifications, std::sync::atomic::Ordering::Relaxed);
+        self.allow_microphone.store(microphone, std::sync::atomic::Ordering::Relaxed);
+        self.allow_geolocation.store(geolocation, std::sync::atomic::Ordering::Relaxed);
+        self.prefs.set_permissions(camera, notifications, microphone, geolocation);
+        self.sync_all_newtabs();
+    }
+
+    fn open_settings(&mut self) {
+        let js = "window.__personaOpenSettings && window.__personaOpenSettings();";
+        let is_newtab = self.tabs.get(self.active).is_some_and(|t| t.is_newtab);
+        if is_newtab {
+            self.with_active(|v| v.evaluate_script(js));
+        } else {
+            let _ = self.open_tab(None, None, true);
+            self.with_active(|v| v.evaluate_script(js));
+        }
     }
 
     fn apply_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
@@ -2493,6 +2623,19 @@ impl Browser {
             }
             MenuAction::ClearBackground => self.apply_background(None, None),
             MenuAction::ToggleFullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
+            MenuAction::ToggleCamera => {
+                let cur = self.allow_camera.load(std::sync::atomic::Ordering::Relaxed);
+                self.set_permissions(!cur, self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed), self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed), self.allow_geolocation.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            MenuAction::ToggleNotifications => {
+                let cur = self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed);
+                self.set_permissions(self.allow_camera.load(std::sync::atomic::Ordering::Relaxed), !cur, self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed), self.allow_geolocation.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            MenuAction::ToggleMicrophone => {
+                let cur = self.allow_microphone.load(std::sync::atomic::Ordering::Relaxed);
+                self.set_permissions(self.allow_camera.load(std::sync::atomic::Ordering::Relaxed), self.allow_notifications.load(std::sync::atomic::Ordering::Relaxed), !cur, self.allow_geolocation.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            MenuAction::OpenSettings => self.open_settings(),
         }
     }
 
@@ -2909,6 +3052,9 @@ impl Browser {
                     let active_id = self.prefs.active_id().to_string();
                     self.set_persona(&active_id);
                 }
+            }
+            NewTabCmd::SetPermissions { camera, notifications, microphone, geolocation } => {
+                self.set_permissions(camera, notifications, microphone, geolocation);
             }
             NewTabCmd::SetBrand { brand } => self.set_brand(brand),
             NewTabCmd::SetBackground { .. } => {}
@@ -3454,6 +3600,11 @@ fn main() -> wry::Result<()> {
     // Warm up DNS + TLS to the suggestion server so the first keystroke is fast.
     let _ = suggest_tx.send(suggest::Request { seq: 0, query: String::new() });
 
+    let allow_camera = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(prefs.permissions.camera));
+    let allow_notifications = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(prefs.permissions.notifications));
+    let allow_microphone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(prefs.permissions.microphone));
+    let allow_geolocation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(prefs.permissions.geolocation));
+
     let mut browser = Browser {
         window,
         toolbar,
@@ -3496,6 +3647,10 @@ fn main() -> wry::Result<()> {
         account_probe: None,
         probe_again: false,
         probe_scheduled: false,
+        allow_camera,
+        allow_notifications,
+        allow_microphone,
+        allow_geolocation,
     };
     let start = std::env::args().nth(1).and_then(|a| {
         let resolved = input::resolve_with_info(&unmask(&a))?;
@@ -3751,5 +3906,38 @@ mod tests {
         assert_eq!(other.profile_name().as_deref(), Some("persona_uzaki"));
         other.id = "p_17/../x y".into();
         assert_eq!(other.profile_name().as_deref(), Some("persona_p_17xy"));
+    }
+
+    #[test]
+    fn prefs_permissions_persistence() {
+        let dir = std::env::temp_dir().join(format!(
+            "persona_perms_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut prefs = Prefs::open(&dir);
+        // Defaults: camera=true, notifications=true, microphone=true, geolocation=false
+        assert!(prefs.permissions.camera);
+        assert!(prefs.permissions.notifications);
+        assert!(prefs.permissions.microphone);
+        assert!(!prefs.permissions.geolocation);
+
+        // Update permissions
+        prefs.set_permissions(false, false, false, true);
+        assert!(!prefs.permissions.camera);
+        assert!(!prefs.permissions.notifications);
+        assert!(!prefs.permissions.microphone);
+        assert!(prefs.permissions.geolocation);
+
+        // Verify disk persistence
+        let reloaded = Prefs::open(&dir);
+        assert!(!reloaded.permissions.camera);
+        assert!(!reloaded.permissions.notifications);
+        assert!(!reloaded.permissions.microphone);
+        assert!(reloaded.permissions.geolocation);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

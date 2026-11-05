@@ -88,8 +88,8 @@
   .p-check { color: var(--accent); font-weight: 700; font-size: 14px; margin-left: 4px; }
 
   /* Modal Backdrop & Dialog */
-  #modal-backdrop { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.65); backdrop-filter: blur(8px); display: none; place-items: center; padding: 20px; animation: fadeIn .2s var(--ease); }
-  #modal-backdrop.open { display: grid; }
+  .modal-backdrop { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.65); backdrop-filter: blur(8px); display: none; place-items: center; padding: 20px; animation: fadeIn .2s var(--ease); }
+  .modal-backdrop.open { display: grid; }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
   .modal-box { width: min(430px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 24px 60px rgba(0,0,0,.5); padding: 24px; display: flex; flex-direction: column; gap: 20px; text-align: left; animation: scaleUp .22s var(--ease); }
   @keyframes scaleUp { from { opacity: 0; transform: scale(.94); } to { opacity: 1; transform: scale(1); } }
@@ -115,6 +115,23 @@
   .modal-right-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
   .btn-primary { height: 34px; padding: 0 18px; border-radius: 10px; border: 0; background: var(--accent); color: #fff; font-size: 12.5px; font-weight: 600; cursor: pointer; transition: opacity .15s, transform .15s; }
   .btn-primary:hover { opacity: .92; transform: translateY(-1px); }
+
+  /* Permission settings styles */
+  .settings-list { display: flex; flex-direction: column; gap: 8px; }
+  .setting-row { display: flex; align-items: center; gap: 14px; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--field); cursor: pointer; transition: border-color .15s, background .15s; }
+  .setting-row:hover { border-color: var(--accent); }
+  .setting-icon { width: 36px; height: 36px; border-radius: 10px; background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); display: grid; place-items: center; flex: none; }
+  .setting-icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .setting-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .setting-title { font-size: 13.5px; font-weight: 600; color: var(--fg); }
+  .setting-desc { font-size: 11.5px; color: var(--dim); line-height: 1.3; }
+  .toggle-switch { position: relative; width: 44px; height: 24px; flex: none; }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .toggle-slider { position: absolute; cursor: pointer; inset: 0; background-color: var(--border); border-radius: 24px; transition: .25s var(--ease); }
+  .toggle-slider::before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: #fff; border-radius: 50%; transition: .25s var(--ease); box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+  .toggle-switch input:checked + .toggle-slider { background-color: var(--accent); }
+  .toggle-switch input:checked + .toggle-slider::before { transform: translateX(20px); }
+  .toggle-switch input:focus-visible + .toggle-slider { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   /* Hero & search */
   main { position: relative; z-index: 1; min-height: 100%; display: grid; place-content: center; justify-items: center;
@@ -161,6 +178,11 @@
 
 <!-- Top Actions Bar -->
 <div id="top-bar">
+  <button id="settings-btn" class="top-pill" type="button" title="Site Permissions &amp; Settings">
+    <svg viewBox="0 0 24 24"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
+    <span>Permissions</span>
+  </button>
+
   <label id="bg-btn" class="top-pill" for="bg-file" title="Choose a background image from your computer (or drag &amp; drop an image anywhere)">
     <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="M21 15l-4.5-4.5a1.5 1.5 0 0 0-2.1 0L6 19"/></svg>
     <span id="bg-lbl">Background</span>
@@ -185,7 +207,7 @@
 </div>
 
 <!-- Persona Editor Modal -->
-<div id="modal-backdrop">
+<div id="modal-backdrop" class="modal-backdrop">
   <div class="modal-box">
     <div class="modal-head">
       <h2 id="modal-title">Create Persona</h2>
@@ -224,6 +246,83 @@
         <button id="modal-cancel-btn" class="btn-subtle" type="button">Cancel</button>
         <button id="modal-save-btn" class="btn-primary" type="button">Save</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Site Permissions & Settings Modal -->
+<div id="settings-modal-backdrop" class="modal-backdrop">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2>Site Permissions</h2>
+      <button id="settings-close-x" class="modal-close" type="button">×</button>
+    </div>
+    <p style="margin: 0; color: var(--dim); font-size: 13px;">Allow websites to request access to your camera, notifications, microphone, and location.</p>
+
+    <div class="settings-list">
+      <!-- Camera -->
+      <label class="setting-row" for="perm-camera">
+        <div class="setting-icon">
+          <svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+        </div>
+        <div class="setting-info">
+          <div class="setting-title">Camera &amp; Video</div>
+          <div class="setting-desc">Websites can ask to access your webcam or video feed</div>
+        </div>
+        <div class="toggle-switch">
+          <input type="checkbox" id="perm-camera">
+          <span class="toggle-slider"></span>
+        </div>
+      </label>
+
+      <!-- Notifications -->
+      <label class="setting-row" for="perm-notifications">
+        <div class="setting-icon">
+          <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        </div>
+        <div class="setting-info">
+          <div class="setting-title">Desktop Notifications</div>
+          <div class="setting-desc">Sites can send you notifications and alerts in Windows</div>
+        </div>
+        <div class="toggle-switch">
+          <input type="checkbox" id="perm-notifications">
+          <span class="toggle-slider"></span>
+        </div>
+      </label>
+
+      <!-- Microphone -->
+      <label class="setting-row" for="perm-microphone">
+        <div class="setting-icon">
+          <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+        </div>
+        <div class="setting-info">
+          <div class="setting-title">Microphone &amp; Audio</div>
+          <div class="setting-desc">Websites can request access to your microphone</div>
+        </div>
+        <div class="toggle-switch">
+          <input type="checkbox" id="perm-microphone">
+          <span class="toggle-slider"></span>
+        </div>
+      </label>
+
+      <!-- Geolocation -->
+      <label class="setting-row" for="perm-geolocation">
+        <div class="setting-icon">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+        </div>
+        <div class="setting-info">
+          <div class="setting-title">Location Services</div>
+          <div class="setting-desc">Websites can ask for your current geographical location</div>
+        </div>
+        <div class="toggle-switch">
+          <input type="checkbox" id="perm-geolocation">
+          <span class="toggle-slider"></span>
+        </div>
+      </label>
+    </div>
+
+    <div class="modal-actions" style="justify-content: flex-end;">
+      <button id="settings-done-btn" class="btn-primary" type="button">Done</button>
     </div>
   </div>
 </div>
@@ -481,6 +580,46 @@
     }
   };
 
+  // Settings modal open/close
+  const openSettingsModal = () => {
+    toggleDropdown(false);
+    const m = document.getElementById('settings-modal-backdrop');
+    if (m) m.classList.add('open');
+  };
+
+  const closeSettingsModal = () => {
+    const m = document.getElementById('settings-modal-backdrop');
+    if (m) m.classList.remove('open');
+  };
+
+  window.__personaOpenSettings = openSettingsModal;
+
+  document.getElementById('settings-btn').onclick = openSettingsModal;
+  document.getElementById('settings-close-x').onclick = closeSettingsModal;
+  document.getElementById('settings-done-btn').onclick = closeSettingsModal;
+  document.getElementById('settings-modal-backdrop').onclick = (e) => {
+    if (e.target === document.getElementById('settings-modal-backdrop')) closeSettingsModal();
+  };
+
+  const sendCurrentPermissions = () => {
+    const camera = document.getElementById('perm-camera').checked;
+    const notifications = document.getElementById('perm-notifications').checked;
+    const microphone = document.getElementById('perm-microphone').checked;
+    const geolocation = document.getElementById('perm-geolocation').checked;
+    send({
+      nt: 'set_permissions',
+      camera,
+      notifications,
+      microphone,
+      geolocation,
+    });
+  };
+
+  ['perm-camera', 'perm-notifications', 'perm-microphone', 'perm-geolocation'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', sendCurrentPermissions);
+  });
+
   // Background pick / clear
   window.__cedericOpenBgPicker = () => document.getElementById('bg-file').click();
   window.__cedericApplyBgUrl = (url) => applyDataUrl(url, false);
@@ -538,6 +677,24 @@
     // Top pill updates
     document.getElementById('persona-btn-name').textContent = `Persona: ${personaName}`;
     renderAvatarContent(document.getElementById('persona-btn-avatar'), personaName, accentHex, s.persona_pfp);
+
+    // Permissions sync
+    if (typeof s.allow_camera === 'boolean') {
+      const el = document.getElementById('perm-camera');
+      if (el) el.checked = s.allow_camera;
+    }
+    if (typeof s.allow_notifications === 'boolean') {
+      const el = document.getElementById('perm-notifications');
+      if (el) el.checked = s.allow_notifications;
+    }
+    if (typeof s.allow_microphone === 'boolean') {
+      const el = document.getElementById('perm-microphone');
+      if (el) el.checked = s.allow_microphone;
+    }
+    if (typeof s.allow_geolocation === 'boolean') {
+      const el = document.getElementById('perm-geolocation');
+      if (el) el.checked = s.allow_geolocation;
+    }
 
     // Dropdown list
     const pCount = (s.personas || []).length;
