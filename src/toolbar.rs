@@ -17,7 +17,7 @@ use tiny_skia::Pixmap;
 
 use crate::{
     ChromeCmd, TabId,
-    gfx::{Brand, Canvas, Fonts, Icon, Rgba, Theme, attrs, text_width},
+    gfx::{Brand, Canvas, Fonts, Icon, PersonaColor, Rgba, Theme, attrs, text_width},
 };
 
 /// Height of the tab strip (also the window's title bar).
@@ -61,6 +61,8 @@ pub struct Model {
     pub pip: bool,
     pub bookmarked: bool,
     pub brand: Brand,
+    pub color: PersonaColor,
+    pub badge_letter: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -153,7 +155,7 @@ pub struct Toolbar {
     sidx: usize,
     blink_from: Instant,
     pretty: Option<(String, Buffer)>,
-    badge: Option<(Brand, Buffer, f32)>,
+    badge: Option<(String, Buffer, f32)>,
     placeholder: Buffer,
     clipboard: Option<arboard::Clipboard>,
     // hover cards
@@ -163,6 +165,8 @@ pub struct Toolbar {
     /// Button under the pointer, when it started hovering, and whether its tooltip is up.
     tip: Option<(Hit, Instant, bool)>,
     last_frame: Instant,
+    bg: Option<Pixmap>,
+    logo: Option<Pixmap>,
     /// Requests for the browser, drained after each event.
     pub cmds: Vec<ChromeCmd>,
 }
@@ -263,16 +267,32 @@ impl Toolbar {
             card_leave: None,
             tip: None,
             last_frame: now,
+            bg: None,
+            logo: Pixmap::decode_png(include_bytes!("ui/logo_64.png")).ok(),
             cmds: Vec::new(),
         }
     }
 
     // ---------- outside updates ----------
 
+    #[allow(dead_code)]
     pub fn set_theme(&mut self, dark: bool, brand: Brand) {
-        self.theme = Theme::for_brand(dark, brand);
-        self.model.brand = brand;
+        self.set_persona_theme(dark, PersonaColor::from(brand), brand.badge_letter());
+    }
+
+    pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor, badge_letter: &str) {
+        self.theme = Theme::for_persona(dark, color);
+        self.model.brand = match color {
+            PersonaColor::Slate => Brand::Uzaki,
+            _ => Brand::Cederic,
+        };
+        self.model.color = color;
+        self.model.badge_letter = badge_letter.to_uppercase();
         self.pretty = None;
+    }
+
+    pub fn set_background(&mut self, bg: Option<Pixmap>) {
+        self.bg = bg;
     }
 
     pub fn set_size(&mut self, scale: f32, width: f32) {
@@ -945,6 +965,7 @@ impl Toolbar {
             (_, Some("w")) if ctrl => Some(ChromeCmd::CloseTab { id: self.model.active }),
             (_, Some("r")) if ctrl => Some(ChromeCmd::Reload),
             (Key::F5, _) => Some(ChromeCmd::Reload),
+            (Key::F11, _) => Some(ChromeCmd::ToggleFullscreen),
             (Key::F12, _) => Some(ChromeCmd::Devtools),
             (_, Some("i")) if ctrl && shift => Some(ChromeCmd::Devtools),
             (_, Some("d")) if ctrl && !shift && !alt => Some(ChromeCmd::ToggleBookmark),
@@ -1142,6 +1163,11 @@ impl Toolbar {
         let mut c = Canvas { pm, s };
         c.rect(0.0, 0.0, self.width, TITLE_H, th.strip);
         c.rect(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar);
+        if let Some(bg) = &self.bg {
+            c.image(bg, 0.0, 0.0, self.width, HEIGHT, 0.44);
+            c.rect(0.0, 0.0, self.width, TITLE_H, th.strip.with_alpha(0.56));
+            c.rect(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar.with_alpha(0.74));
+        }
 
         self.draw_tabs(&mut c, &th);
         let g = self.geo();
@@ -1199,7 +1225,7 @@ impl Toolbar {
         c.icon(Icon::Stop, g.reload.x + 7.0, g.reload.y + 7.0, 20.0, th.fg.with_alpha(m));
         for (r, h, icon, active) in [
             (g.pip, Hit::Pip, Icon::Pip, self.model.pip),
-            (g.theme, Hit::Theme, Icon::Palette, self.model.brand == Brand::Uzaki),
+            (g.theme, Hit::Theme, Icon::Palette, self.model.color != PersonaColor::Orange || self.model.brand == Brand::Uzaki),
             (g.dev, Hit::Devtools, Icon::Code, self.model.devtools),
         ] {
             if active {
@@ -1296,16 +1322,24 @@ impl Toolbar {
         let icon_x = if narrow && !active { x + (w - 16.0) / 2.0 } else { x + 12.0 };
         let show_close = !self.vis[i].leaving && (active || hovered) && (!narrow || active) && w >= 44.0;
         let close = self.close_rect(&self.vis[i]);
-        // Favicon, spinner, or the Cederic/Uzaki badge.
+        // Favicon, spinner, or the Persona logo badge.
         if loading {
             c.spinner(icon_x + 8.0, cy, 6.0, self.spin, th.accent.with_alpha(alpha));
+        } else if (favicon == BRAND_ICON || (favicon.is_empty() && (title.is_empty() || title == "New Tab")))
+            && let Some(logo) = &self.logo
+        {
+            c.image(logo, icon_x, cy - 8.0, 16.0, 16.0, alpha);
         } else if favicon == BRAND_ICON {
             c.rrect(icon_x, cy - 8.0, 16.0, 16.0, [4.0; 4], th.accent.mix(th.accent2, 0.3).with_alpha(alpha));
-            let brand = self.model.brand;
-            if self.badge.as_ref().is_none_or(|(b, _, _)| *b != brand) {
-                let buf = self.fonts.line(brand.badge_letter(), 11.0, Weight::BOLD, self.s);
+            let letter = if !self.model.badge_letter.is_empty() {
+                self.model.badge_letter.as_str()
+            } else {
+                self.model.brand.badge_letter()
+            };
+            if self.badge.as_ref().is_none_or(|(l, _, _)| l.as_str() != letter) {
+                let buf = self.fonts.line(letter, 11.0, Weight::BOLD, self.s);
                 let bw = text_width(&buf, self.s);
-                self.badge = Some((brand, buf, bw));
+                self.badge = Some((letter.to_string(), buf, bw));
             }
             if let Some((_, buf, bw)) = &mut self.badge {
                 c.text(&mut self.fonts, buf, icon_x + (16.0 - *bw) / 2.0, cy - 7.5, Rgba(255, 255, 255, 255).with_alpha(alpha), f32::MAX, 0.0);

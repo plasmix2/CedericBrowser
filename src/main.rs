@@ -13,6 +13,7 @@ mod thumbs;
 mod toolbar;
 
 use std::{
+    collections::HashMap,
     num::NonZeroU32,
     path::PathBuf,
     rc::Rc,
@@ -20,8 +21,8 @@ use std::{
     time::Instant,
 };
 
-use gfx::Brand;
-use history::HistoryStore;
+use gfx::{Brand, PersonaColor};
+use history::{HistoryEntry, HistoryStore};
 use popups::{Card, Content, Kind as PopupKind, MenuEntry, Pick, Popups, SuggestEntry};
 use tiny_skia::Pixmap;
 use toolbar::{BRAND_ICON, Toolbar};
@@ -32,12 +33,12 @@ use tao::{
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     platform::windows::WindowBuilderExtWindows,
     keyboard::ModifiersState,
-    window::{CursorIcon, Theme, Window, WindowBuilder, WindowId},
+    window::{CursorIcon, Fullscreen, Icon as WinIcon, Theme, Window, WindowBuilder, WindowId},
 };
 use wry::{
     BackgroundThrottlingPolicy, MemoryUsageLevel, NewWindowResponse, PageLoadEvent,
-    PermissionResponse, Rect, ScrollBarStyle, WebContext, WebView, WebViewBuilder,
-    WebViewBuilderExtWindows, WebViewExtWindows,
+    PermissionKind, PermissionResponse, Rect, ScrollBarStyle, WebContext, WebView,
+    WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows,
 };
 
 /// Height of the native tab strip + toolbar, in logical pixels.
@@ -48,24 +49,63 @@ const DEVTOOLS_MIN: f64 = 280.0;
 
 const NEWTAB_HTML: &str = include_str!("ui/newtab.html");
 
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+
+const STEALTH_SCRIPT: &str = r#"
+(() => {
+  try {
+    delete Object.getPrototypeOf(navigator).webdriver;
+  } catch (_) {}
+  try {
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => undefined,
+      configurable: true,
+    });
+  } catch (_) {}
+
+  if (!window.chrome) window.chrome = {};
+  if (window.chrome.webview) {
+    const realWebview = window.chrome.webview;
+    let internalCall = false;
+    window.__cedericSendIpc = (msg) => {
+      internalCall = true;
+      try {
+        if (window.ipc && typeof window.ipc.postMessage === 'function') {
+          window.ipc.postMessage(msg);
+        } else if (realWebview && typeof realWebview.postMessage === 'function') {
+          realWebview.postMessage(msg);
+        }
+      } finally {
+        internalCall = false;
+      }
+    };
+    try {
+      delete window.chrome.webview;
+      Object.defineProperty(window.chrome, 'webview', {
+        get() {
+          if (internalCall) return realWebview;
+          return undefined;
+        },
+        configurable: true,
+        enumerable: false,
+      });
+    } catch (_) {}
+  }
+})();
+"#;
+
 /// Every WebView sharing a data directory must use identical arguments.
-/// Tuned for fast page loads, GPU rasterization, and Wi-Fi privacy:
-/// - In-process network service, async DNS, Happy Eyeballs v3, parallel downloading, back-forward
-///   cache, GPU/zero-copy rasterization, and QUIC enabled.
-/// - Encrypted Client Hello (ECH) enabled; WebRTC non-proxied UDP disabled to prevent local Wi-Fi IP leaks.
-/// - SmartScreen, hyperlink auditing (`<a ping>`), and background telemetry disabled while keeping
-///   the engine's speculative preconnect and loading predictor active.
-/// - A loopback-only DevTools port chosen by the OS, which the docked DevTools pane connects to.
 const BROWSER_ARGS: &str = "\
-    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,RendererCodeIntegrity \
-    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,BackForwardCache,ParallelDownloading,CanvasOopRasterization,UseEcoQoSForBackgroundProcess \
-    --enable-quic \
+    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,UserAgentClientHint \
+    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,BackForwardCache,ParallelDownloading,CanvasOopRasterization \
+    --disable-blink-features=AutomationControlled \
+    --autoplay-policy=no-user-gesture-required \
     --enable-gpu-rasterization \
     --enable-zero-copy \
-    --ssl-version-min=tls1.2 \
+    --enable-accelerated-video-decode \
+    --enable-smooth-scrolling \
+    --enable-fast-unload \
     --no-pings \
-    --reduced-referrer-granularity \
-    --disable-component-update \
     --disable-domain-reliability \
     --disable-client-side-phishing-detection \
     --disable-sync \
@@ -78,6 +118,14 @@ const BROWSER_ARGS: &str = "\
 /// whitelist and a validated `ContextRequest` over IPC.
 const SHORTCUT_SCRIPT: &str = r#"
 (() => {
+  if (window !== window.top) return;
+  const post = (msg) => {
+    if (typeof window.__cedericSendIpc === 'function') {
+      window.__cedericSendIpc(msg);
+    } else if (window.ipc && typeof window.ipc.postMessage === 'function') {
+      window.ipc.postMessage(msg);
+    }
+  };
   const preconnected = new Set();
   const preconnect = (raw) => {
     if (!raw || preconnected.size >= 48) return;
@@ -106,6 +154,8 @@ const SHORTCUT_SCRIPT: &str = r#"
 
   const injectSpeculation = () => {
     if (location.protocol !== 'https:' && location.protocol !== 'http:') return;
+    const h = (location.hostname || '').toLowerCase();
+    if (h.includes('youtube.com') || h.includes('youtu.be') || h.includes('googlevideo.com')) return;
     const root = document.head || document.documentElement;
     if (!root || document.getElementById('__cederic_spec')) return;
     const s = document.createElement('script');
@@ -121,6 +171,8 @@ const SHORTCUT_SCRIPT: &str = r#"
   }
 
   window.addEventListener('pointerover', (e) => {
+    const h = (location.hostname || '').toLowerCase();
+    if (h.includes('youtube.com') || h.includes('youtu.be')) return;
     const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
     if (a && a.href) preconnect(a.href);
   }, { capture: true, passive: true });
@@ -164,30 +216,37 @@ const SHORTCUT_SCRIPT: &str = r#"
     list.sort((a, b) => score(b) - score(a));
     return list[0];
   };
-  window.__cedericTogglePip = async (preferCtx = false) => {
+  const togglePip = async (preferCtx = false) => {
     try {
       if (document.pictureInPictureElement) {
         await document.exitPictureInPicture();
-        window.ipc.postMessage('pip_off');
+        post('pip_off');
         return true;
       }
       const v = bestVideo(preferCtx);
       if (!v) return false;
       v.disablePictureInPicture = false;
       v.removeAttribute('disablepictureinpicture');
-      v.addEventListener('leavepictureinpicture', () => window.ipc.postMessage('pip_off'), { once: true });
+      v.addEventListener('leavepictureinpicture', () => post('pip_off'), { once: true });
       await v.requestPictureInPicture();
-      window.ipc.postMessage('pip_on');
+      post('pip_on');
       return true;
     } catch (_) {
       return false;
     }
   };
-  window.addEventListener('enterpictureinpicture', () => window.ipc.postMessage('pip_on'), true);
-  window.addEventListener('leavepictureinpicture', () => window.ipc.postMessage('pip_off'), true);
+  window.addEventListener('enterpictureinpicture', () => post('pip_on'), true);
+  window.addEventListener('leavepictureinpicture', () => post('pip_off'), true);
   window.addEventListener('pagehide', () => {
-    if (document.pictureInPictureElement) window.ipc.postMessage('pip_off');
+    if (document.pictureInPictureElement) post('pip_off');
   }, true);
+
+  const updateFs = () => {
+    const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    post(isFs ? 'fs_on' : 'fs_off');
+  };
+  document.addEventListener('fullscreenchange', updateFs, true);
+  document.addEventListener('webkitfullscreenchange', updateFs, true);
 
   const map = (e) => {
     const c = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
@@ -202,17 +261,23 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (e.altKey && e.key === 'ArrowLeft') return 'back';
     if (e.altKey && e.key === 'ArrowRight') return 'forward';
     if (e.altKey && !c && !e.shiftKey && k === 'p') return 'pip';
+    if (e.key === 'F11') return 'fullscreen';
     if (e.key === 'F12' || (c && e.shiftKey && k === 'i')) return 'devtools';
     return null;
   };
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') window.ipc.postMessage('dismiss');
+    if (e.key === 'Escape') post('escape');
     const cmd = map(e);
     if (cmd === 'pip') {
       e.preventDefault(); e.stopPropagation();
-      window.__cedericTogglePip(false).then((ok) => { if (!ok) window.ipc.postMessage('pip'); });
+      togglePip(false).then((ok) => { if (!ok) post('pip'); });
       return;
     }
+    if (cmd) { e.preventDefault(); e.stopPropagation(); post(cmd); }
+  }, true);
+  // Popups never take focus, so a click or focus inside the page is what closes an open menu / address bar edit.
+  window.addEventListener('pointerdown', () => post('dismiss'), true);
+  window.addEventListener('focusin', () => post('dismiss'), true);
     if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); return; }
     if (!e.ctrlKey && !e.altKey && !e.metaKey && (location.protocol === 'about:' || location.protocol === 'data:')) {
       const a = document.activeElement;
@@ -238,6 +303,8 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (t && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
     e.preventDefault();
     const a = t && t.closest('a[href]'), img = t && t.closest('img');
+    ctxVideo = videoAt(e.clientX, e.clientY) || bestVideo(false);
+    post(JSON.stringify({
     ctxVideo = videoAt(e.clientX, e.clientY) || (document.querySelector('video') && bestVideo(false)) || null;
     window.ipc.postMessage(JSON.stringify({
       x: e.clientX, y: e.clientY, dpr: window.devicePixelRatio,
@@ -261,6 +328,114 @@ const SHORTCUT_SCRIPT: &str = r#"
       } catch (_) {}
     }
   }, true);
+
+  const sendBg = (rawUrl, keepRaw) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      let data = rawUrl;
+      if (!keepRaw) {
+        try {
+          const maxW = 1920, maxH = 1080;
+          let w = img.naturalWidth || 1920, h = img.naturalHeight || 1080;
+          const r = Math.min(1, maxW / w, maxH / h);
+          w = Math.max(1, Math.round(w * r));
+          h = Math.max(1, Math.round(h * r));
+          const c = document.createElement('canvas');
+          c.width = w; c.height = h;
+          c.getContext('2d').drawImage(img, 0, 0, w, h);
+          data = c.toDataURL('image/jpeg', 0.88);
+        } catch (_) {}
+      }
+      let strip = '';
+      try {
+        const sc = document.createElement('canvas');
+        sc.width = 640; sc.height = 84;
+        const sx = sc.getContext('2d');
+        const iw = img.naturalWidth || img.width || 640;
+        const ih = img.naturalHeight || img.height || 360;
+        const scale = Math.max(sc.width / iw, sc.height / ih);
+        const dw = iw * scale, dh = ih * scale;
+        sx.filter = 'blur(3px)';
+        sx.drawImage(img, (sc.width - dw) / 2, (sc.height - dh) * 0.2, dw, dh);
+        strip = sc.toDataURL('image/png');
+      } catch (_) {}
+      post(JSON.stringify({ nt: 'set_background', data, strip }));
+    };
+    img.onerror = () => {
+      if (rawUrl) post(JSON.stringify({ nt: 'set_background', data: rawUrl, strip: '' }));
+    };
+    img.src = rawUrl;
+  };
+  const openBgPicker = () => {
+    const existing = document.getElementById('bg-file');
+    if (existing) { existing.click(); return; }
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = 'image/*';
+    inp.style.display = 'none';
+    inp.onchange = () => {
+      const f = inp.files && inp.files[0];
+      if (f && f.type.startsWith('image/')) {
+        const reader = new FileReader();
+        const keepGif = f.type === 'image/gif' && f.size <= 4 * 1024 * 1024;
+        reader.onload = () => {
+          if (typeof reader.result === 'string') sendBg(reader.result, keepGif);
+        };
+        reader.readAsDataURL(f);
+      }
+      inp.remove();
+    };
+    (document.body || document.documentElement).appendChild(inp);
+    inp.click();
+  };
+  document.addEventListener('cederic:act', (e) => {
+    const d = e.detail;
+    if (!d) return;
+    if (d.cmd === 'pip') togglePip(!!d.preferCtx);
+    else if (d.cmd === 'pick_bg') openBgPicker();
+    else if (d.cmd === 'apply_bg' && d.url) sendBg(d.url, false);
+  });
+
+  if (location.hostname === 'www.youtube.com' || location.hostname === 'm.youtube.com') {
+    let lastPos = 0, lastRecover = 0;
+    const recover = () => {
+      if (lastPos < 0.5 || Date.now() - lastRecover < 4000) return;
+      lastRecover = Date.now();
+      const p = document.getElementById('movie_player');
+      if (p && typeof p.loadVideoById === 'function' && typeof p.getVideoData === 'function') {
+        const vd = p.getVideoData();
+        if (vd && vd.video_id) {
+          p.loadVideoById(vd.video_id, Math.max(0, lastPos - 0.5));
+          if (typeof p.playVideo === 'function') setTimeout(() => p.playVideo(), 300);
+          return;
+        }
+      }
+      const u = new URL(location.href);
+      if (u.pathname === '/watch' && u.searchParams.get('v')) {
+        u.searchParams.set('t', Math.floor(Math.max(0, lastPos - 0.5)) + 's');
+        location.replace(u.toString());
+      }
+    };
+    setInterval(() => {
+      const v = document.querySelector('video');
+      if (v && v.currentTime > lastPos) lastPos = v.currentTime;
+      const err = document.querySelector('.ytp-error, .ytp-error-content, [class*="ytp-error"]');
+      const isVisible = err && (
+        (typeof err.checkVisibility === 'function' && err.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) ||
+        err.offsetParent !== null ||
+        (err.getBoundingClientRect && err.getBoundingClientRect().height > 20)
+      );
+      if (isVisible) {
+        recover();
+      }
+    }, 800);
+    document.addEventListener('error', (e) => {
+      if (e.target && e.target.tagName === 'VIDEO') {
+        recover();
+      }
+    }, true);
+  }
 })();
 "#;
 
@@ -323,11 +498,11 @@ const BRAND_SCRIPT: &str = r#"
     }
   };
   window.__cedericSetBrand = (b) => {
-    const uzaki = b === 'uzaki';
-    brandName = uzaki ? 'Uzaki' : 'Cederic';
-    const letter = uzaki ? 'U' : 'C';
-    const grad = uzaki ? 'linear-gradient(90deg, #6a5acd, #94a3f8)' : 'linear-gradient(90deg, #ff6a3d, #ffb03d)';
-    const badgeGrad = uzaki ? 'linear-gradient(135deg, #6a5acd, #94a3f8)' : 'linear-gradient(135deg, #ff6a3d, #ffb03d)';
+    brandName = window.__cedericBrandName || (b === 'uzaki' ? 'Uzaki' : 'Persona');
+    const letter = (brandName.trim().charAt(0) || 'P').toUpperCase();
+    const color = window.__cedericBrandColor || (b === 'uzaki' ? '#7366e6' : '#ff6a3d');
+    const grad = `linear-gradient(90deg, ${color}, #ffffff)`;
+    const badgeGrad = `linear-gradient(135deg, ${color}, ${color})`;
     style.textContent = `
       img[src*="brave-logo" i], img[alt*="Brave logo" i], img[alt*="Cederic logo" i], img[alt*="Uzaki logo" i],
       picture:has(img[alt*="logo" i]) source,
@@ -429,6 +604,7 @@ enum UserEvent {
     Prewarm,
     /// Frame tick from the pacer while the UI animates.
     Frame,
+    FullscreenState(TabId, bool),
 }
 
 /// What the browser chrome (the native toolbar, menus) asks the browser to do.
@@ -467,6 +643,7 @@ enum ChromeCmd {
     ToggleBookmark,
     BookmarksMenu { x: f64, y: f64 },
     ThemeMenu { x: f64, y: f64 },
+    ToggleFullscreen,
     /// Tooltip centred under a toolbar button.
     Tip { text: String, x: f64, y: f64 },
     TipEnd,
@@ -483,6 +660,27 @@ enum NewTabCmd {
     OpenBookmark { url: String },
     DeleteBookmark { url: String },
     SetBrand { brand: Brand },
+    SelectPersona { id: String },
+    CreatePersona {
+        name: String,
+        color: String,
+        #[serde(default)]
+        pfp: Option<String>,
+    },
+    UpdatePersona {
+        id: String,
+        name: String,
+        color: String,
+        #[serde(default)]
+        pfp: Option<String>,
+    },
+    DeletePersona { id: String },
+    SetBackground {
+        #[serde(default)]
+        data: String,
+        #[serde(default)]
+        strip: String,
+    },
     AutoKey { key: String },
 }
 
@@ -503,6 +701,8 @@ enum Shortcut {
     Pip,
     Bookmark,
     Bookmarks,
+    Fullscreen,
+    Escape,
 }
 
 impl Shortcut {
@@ -522,6 +722,8 @@ impl Shortcut {
             "pip" => Self::Pip,
             "bookmark" => Self::Bookmark,
             "bookmarks" => Self::Bookmarks,
+            "fullscreen" => Self::Fullscreen,
+            "escape" => Self::Escape,
             _ => return None,
         })
     }
@@ -580,41 +782,264 @@ enum MenuAction {
     ClearHistory,
     ToggleBookmark,
     DeleteBookmark(String),
+    #[allow(dead_code)]
     SetBrand(Brand),
+    SelectPersona(String),
+    OpenNewPersona,
+    OpenManagePersonas,
+    ChooseBackground,
+    SetBackgroundUrl(String),
+    ClearBackground,
+    ToggleFullscreen,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct Bookmark {
-    title: String,
-    url: String,
+pub struct Bookmark {
+    pub title: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaProfile {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    #[serde(default)]
+    pub pfp: Option<String>,
+    #[serde(default)]
+    pub bookmarks: Vec<Bookmark>,
+}
+
+impl PersonaProfile {
+    pub fn new_cederic() -> Self {
+        Self {
+            id: "cederic".into(),
+            name: "Cederic".into(),
+            color: "orange".into(),
+            pfp: None,
+            bookmarks: Vec::new(),
+        }
+    }
+
+    pub fn new_uzaki() -> Self {
+        Self {
+            id: "uzaki".into(),
+            name: "Uzaki".into(),
+            color: "slate".into(),
+            pfp: None,
+            bookmarks: Vec::new(),
+        }
+    }
+
+    pub fn parsed_color(&self) -> PersonaColor {
+        PersonaColor::from_str_name(&self.color)
+    }
+
+    pub fn badge_letter(&self) -> String {
+        self.name
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "P".into())
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct PrefsData {
     #[serde(default)]
-    brand: Brand,
+    active_persona: Option<String>,
     #[serde(default)]
-    bookmarks: Vec<Bookmark>,
+    personas: Vec<PersonaProfile>,
+    #[serde(default)]
+    brand: Option<Brand>,
+    #[serde(default)]
+    bookmarks: Option<Vec<Bookmark>>,
 }
 
 struct Prefs {
     path: PathBuf,
-    brand: Brand,
-    bookmarks: Vec<Bookmark>,
+    data_dir: PathBuf,
+    active_persona_id: String,
+    personas: Vec<PersonaProfile>,
+    bg_cache: HashMap<String, Option<String>>,
+    strip_cache: HashMap<String, Option<Pixmap>>,
 }
 
 impl Prefs {
     fn open(data_dir: &std::path::Path) -> Self {
         let path = data_dir.join("prefs.json");
+        let legacy_bg_path = data_dir.join("background.txt");
+        let legacy_strip_path = data_dir.join("background_strip.png");
+        let cederic_bg_path = data_dir.join("background_cederic.txt");
+        let cederic_strip_path = data_dir.join("background_strip_cederic.png");
+
+        if legacy_bg_path.exists() && !cederic_bg_path.exists() {
+            let _ = std::fs::rename(&legacy_bg_path, &cederic_bg_path);
+        }
+        if legacy_strip_path.exists() && !cederic_strip_path.exists() {
+            let _ = std::fs::rename(&legacy_strip_path, &cederic_strip_path);
+        }
+
         let data: PrefsData = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        Self { path, brand: data.brand, bookmarks: data.bookmarks }
+
+        let mut personas = data.personas;
+        if personas.is_empty() {
+            let mut cederic = PersonaProfile::new_cederic();
+            if let Some(bms) = data.bookmarks {
+                cederic.bookmarks = bms;
+            }
+            let uzaki = PersonaProfile::new_uzaki();
+            personas = vec![cederic, uzaki];
+        }
+
+        personas.truncate(5);
+
+        let active_id = if let Some(active) = data.active_persona
+            && personas.iter().any(|p| p.id == active)
+        {
+            active
+        } else if let Some(brand) = data.brand {
+            let legacy_id = match brand {
+                Brand::Cederic => "cederic",
+                Brand::Uzaki => "uzaki",
+            };
+            if personas.iter().any(|p| p.id == legacy_id) {
+                legacy_id.to_string()
+            } else {
+                personas[0].id.clone()
+            }
+        } else {
+            personas[0].id.clone()
+        };
+
+        let mut bg_cache = HashMap::new();
+        let mut strip_cache = HashMap::new();
+
+        for p in &personas {
+            let bg_p = data_dir.join(format!("background_{}.txt", p.id));
+            let bg = std::fs::read_to_string(&bg_p)
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty());
+            bg_cache.insert(p.id.clone(), bg);
+
+            let strip_p = data_dir.join(format!("background_strip_{}.png", p.id));
+            let strip = std::fs::read(&strip_p)
+                .ok()
+                .and_then(|b| Pixmap::decode_png(&b).ok());
+            strip_cache.insert(p.id.clone(), strip);
+        }
+
+        Self {
+            path,
+            data_dir: data_dir.to_path_buf(),
+            active_persona_id: active_id,
+            personas,
+            bg_cache,
+            strip_cache,
+        }
+    }
+
+    fn active_persona(&self) -> &PersonaProfile {
+        self.personas
+            .iter()
+            .find(|p| p.id == self.active_persona_id)
+            .unwrap_or(&self.personas[0])
+    }
+
+    fn active_persona_mut(&mut self) -> &mut PersonaProfile {
+        let active = self.active_persona_id.clone();
+        if let Some(pos) = self.personas.iter().position(|p| p.id == active) {
+            &mut self.personas[pos]
+        } else {
+            &mut self.personas[0]
+        }
+    }
+
+    fn active_id(&self) -> &str {
+        &self.active_persona_id
+    }
+
+    fn active_name(&self) -> &str {
+        &self.active_persona().name
+    }
+
+    fn active_color(&self) -> PersonaColor {
+        self.active_persona().parsed_color()
+    }
+
+    fn active_badge_letter(&self) -> String {
+        self.active_persona().badge_letter()
+    }
+
+    fn active_bookmarks(&self) -> &[Bookmark] {
+        &self.active_persona().bookmarks
+    }
+
+    #[cfg(test)]
+    fn bookmarks(&self) -> &[Bookmark] {
+        self.active_bookmarks()
+    }
+
+    fn brand(&self) -> Brand {
+        match self.active_color() {
+            PersonaColor::Slate => Brand::Uzaki,
+            _ => Brand::Cederic,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_brand(&mut self, brand: Brand) {
+        let target_id = match brand {
+            Brand::Cederic => "cederic",
+            Brand::Uzaki => "uzaki",
+        };
+        if self.personas.iter().any(|p| p.id == target_id) {
+            self.set_active_persona(target_id);
+        } else {
+            let color = PersonaColor::from(brand);
+            let active_id = self.active_persona_id.clone();
+            let cur_name = self.active_name().to_string();
+            self.update_persona(&active_id, &cur_name, color.name(), None);
+        }
+    }
+
+    fn background(&self) -> Option<&str> {
+        self.background_for(&self.active_persona_id)
+    }
+
+    fn background_for(&self, id_or_brand: impl AsRef<str>) -> Option<&str> {
+        let key = id_or_brand.as_ref().to_ascii_lowercase();
+        self.bg_cache.get(&key).and_then(|opt| opt.as_deref())
+    }
+
+    fn bg_strip(&self) -> Option<Pixmap> {
+        self.bg_strip_for(&self.active_persona_id)
+    }
+
+    fn bg_strip_for(&self, id_or_brand: impl AsRef<str>) -> Option<Pixmap> {
+        let key = id_or_brand.as_ref().to_ascii_lowercase();
+        self.strip_cache.get(&key).and_then(|opt| opt.clone())
+    }
+
+    fn bg_path(&self, id: &str) -> PathBuf {
+        self.data_dir.join(format!("background_{id}.txt"))
+    }
+
+    fn strip_path(&self, id: &str) -> PathBuf {
+        self.data_dir.join(format!("background_strip_{id}.png"))
     }
 
     fn save(&self) {
-        let data = PrefsData { brand: self.brand, bookmarks: self.bookmarks.clone() };
+        let data = PrefsData {
+            active_persona: Some(self.active_persona_id.clone()),
+            personas: self.personas.clone(),
+            brand: Some(self.brand()),
+            bookmarks: Some(self.active_bookmarks().to_vec()),
+        };
         if let Ok(json) = serde_json::to_string_pretty(&data) {
             let tmp = self.path.with_extension("json.tmp");
             if let Some(p) = self.path.parent() {
@@ -626,16 +1051,150 @@ impl Prefs {
         }
     }
 
+    fn set_active_persona(&mut self, id: &str) -> bool {
+        if self.personas.iter().any(|p| p.id == id) {
+            self.active_persona_id = id.to_string();
+            self.save();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn create_persona(
+        &mut self,
+        name: &str,
+        color: &str,
+        pfp: Option<String>,
+    ) -> Result<String, &'static str> {
+        if self.personas.len() >= 5 {
+            return Err("Maximum 5 personas allowed");
+        }
+        let clean_name = name.trim();
+        let final_name = if clean_name.is_empty() {
+            format!("Persona {}", self.personas.len() + 1)
+        } else {
+            clean_name.to_string()
+        };
+        let valid_color = PersonaColor::from_str_name(color).name().to_string();
+        let id = format!(
+            "p_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        let persona = PersonaProfile {
+            id: id.clone(),
+            name: final_name,
+            color: valid_color,
+            pfp: pfp.filter(|s| s.starts_with("data:image/") || s.starts_with("http")),
+            bookmarks: Vec::new(),
+        };
+        self.personas.push(persona);
+        self.active_persona_id = id.clone();
+        self.save();
+        Ok(id)
+    }
+
+    fn update_persona(
+        &mut self,
+        id: &str,
+        name: &str,
+        color: &str,
+        pfp: Option<Option<String>>,
+    ) -> bool {
+        if let Some(p) = self.personas.iter_mut().find(|p| p.id == id) {
+            let clean_name = name.trim();
+            if !clean_name.is_empty() {
+                p.name = clean_name.to_string();
+            }
+            p.color = PersonaColor::from_str_name(color).name().to_string();
+            if let Some(new_pfp) = pfp {
+                p.pfp = new_pfp.filter(|s| s.starts_with("data:image/") || s.starts_with("http"));
+            }
+            self.save();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn delete_persona(&mut self, id: &str) -> Result<(), &'static str> {
+        if self.personas.len() <= 1 {
+            return Err("Cannot delete the last persona");
+        }
+        if let Some(pos) = self.personas.iter().position(|p| p.id == id) {
+            self.personas.remove(pos);
+            if self.active_persona_id == id {
+                self.active_persona_id = self.personas[0].id.clone();
+            }
+            let bg_p = self.bg_path(id);
+            let strip_p = self.strip_path(id);
+            let _ = std::fs::remove_file(bg_p);
+            let _ = std::fs::remove_file(strip_p);
+            self.bg_cache.remove(id);
+            self.strip_cache.remove(id);
+            self.save();
+            Ok(())
+        } else {
+            Err("Persona not found")
+        }
+    }
+
+    fn set_background(
+        &mut self,
+        id_or_brand: impl AsRef<str>,
+        data: Option<String>,
+        strip_png: Option<&str>,
+    ) {
+        let id = id_or_brand.as_ref().to_ascii_lowercase();
+        let bg_path = self.bg_path(&id);
+        let strip_path = self.strip_path(&id);
+        let clean = data
+            .map(|s| s.trim().to_owned())
+            .filter(|s| s.starts_with("data:image/") || s.starts_with("https://") || s.starts_with("http://"));
+
+        if let Some(bg) = clean {
+            if let Some(p) = bg_path.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = std::fs::write(&bg_path, &bg);
+            let strip_pm = if let Some(b64) = strip_png.map(str::trim).filter(|s| !s.is_empty()) {
+                let raw = b64.strip_prefix("data:image/png;base64,").unwrap_or(b64);
+                if let Some(bytes) = favicons::base64_decode(raw)
+                    && let Ok(pm) = Pixmap::decode_png(&bytes)
+                {
+                    let _ = std::fs::write(&strip_path, &bytes);
+                    Some(pm)
+                } else {
+                    None
+                }
+            } else {
+                let _ = std::fs::remove_file(&strip_path);
+                None
+            };
+            self.bg_cache.insert(id.clone(), Some(bg));
+            self.strip_cache.insert(id, strip_pm);
+        } else {
+            let _ = std::fs::remove_file(&bg_path);
+            let _ = std::fs::remove_file(&strip_path);
+            self.bg_cache.insert(id.clone(), None);
+            self.strip_cache.insert(id, None);
+        }
+    }
+
     fn is_bookmarked(&self, url: &str) -> bool {
-        !url.is_empty() && self.bookmarks.iter().any(|b| b.url == url)
+        !url.is_empty() && self.active_bookmarks().iter().any(|b| b.url == url)
     }
 
     fn toggle_bookmark(&mut self, title: &str, url: &str) -> bool {
         if url.is_empty() || url.starts_with("about:") || url.starts_with("data:") {
             return false;
         }
-        if let Some(pos) = self.bookmarks.iter().position(|b| b.url == url) {
-            self.bookmarks.remove(pos);
+        let bms = &mut self.active_persona_mut().bookmarks;
+        if let Some(pos) = bms.iter().position(|b| b.url == url) {
+            bms.remove(pos);
             self.save();
             false
         } else {
@@ -645,9 +1204,9 @@ impl Prefs {
             } else {
                 clean.chars().take(60).collect()
             };
-            self.bookmarks.insert(0, Bookmark { title: t, url: url.to_owned() });
-            if self.bookmarks.len() > 100 {
-                self.bookmarks.truncate(100);
+            bms.insert(0, Bookmark { title: t, url: url.to_owned() });
+            if bms.len() > 100 {
+                bms.truncate(100);
             }
             self.save();
             true
@@ -655,14 +1214,20 @@ impl Prefs {
     }
 
     fn remove_bookmark(&mut self, url: &str) -> bool {
-        let before = self.bookmarks.len();
-        self.bookmarks.retain(|b| b.url != url);
-        if self.bookmarks.len() != before {
+        let bms = &mut self.active_persona_mut().bookmarks;
+        let before = bms.len();
+        bms.retain(|b| b.url != url);
+        if bms.len() != before {
             self.save();
             true
         } else {
             false
         }
+    }
+
+    #[allow(dead_code)]
+    fn delete_bookmark(&mut self, url: &str) -> bool {
+        self.remove_bookmark(url)
     }
 }
 
@@ -714,10 +1279,36 @@ struct Tab {
     thumb: Option<Pixmap>,
 }
 
+static LOGO_DATA_URI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("data:image/png;base64,{}", base64_encode(include_bytes!("ui/logo_64.png")))
+});
+
+#[derive(Serialize)]
+struct PersonaDto<'a> {
+    id: &'a str,
+    name: &'a str,
+    color: &'a str,
+    color_hex: &'a str,
+    pfp: Option<&'a str>,
+    is_active: bool,
+    bookmark_count: usize,
+}
+
 #[derive(Serialize)]
 struct NewTabState<'a> {
     brand: Brand,
+    personas: Vec<PersonaDto<'a>>,
+    active_persona_id: &'a str,
+    persona_name: &'a str,
+    persona_color: &'a str,
+    persona_color_hex: &'a str,
+    persona_pfp: Option<&'a str>,
     bookmarks: &'a [Bookmark],
+    history: &'a [HistoryEntry],
+    background: Option<&'a str>,
+    logo: &'a str,
+    can_create: bool,
+    can_delete: bool,
 }
 
 struct Devtools {
@@ -737,7 +1328,6 @@ struct Browser {
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
     surface_size: (u32, u32),
     frame: Pixmap,
-    window_title: String,
     /// When the toolbar next needs a frame (animation or timer); `None` when idle.
     next_frame: Option<Instant>,
     pacer: pacer::Pacer,
@@ -771,6 +1361,9 @@ struct Browser {
     suggestions: Vec<Suggestion>,
     devtools: Devtools,
     clipboard: Option<arboard::Clipboard>,
+    fullscreen: bool,
+    html_fullscreen: bool,
+    last_title: String,
 }
 
 impl Browser {
@@ -779,11 +1372,15 @@ impl Browser {
     }
 
     fn top_bar_height(&self) -> f64 {
-        CHROME_HEIGHT
+        if self.fullscreen {
+            0.0
+        } else {
+            CHROME_HEIGHT
+        }
     }
 
     fn devtools_width(&self) -> f64 {
-        if !self.devtools.open || self.devtools.view.is_none() {
+        if self.fullscreen || !self.devtools.open || self.devtools.view.is_none() {
             return 0.0;
         }
         let w = self.logical_size().width;
@@ -806,11 +1403,11 @@ impl Browser {
     }
 
     fn newtab_color(&self) -> Rgba {
-        match (self.dark, self.prefs.brand) {
-            (true, Brand::Uzaki) => (24, 29, 44, 255),
-            (false, Brand::Uzaki) => (237, 240, 247, 255),
-            (true, Brand::Cederic) => (29, 30, 34, 255),
-            (false, Brand::Cederic) => (244, 244, 246, 255),
+        let (strip, toolbar, _) = self.prefs.active_color().surface_tints(self.dark);
+        if self.dark {
+            (strip.0, strip.1, strip.2, 255)
+        } else {
+            (toolbar.0, toolbar.1, toolbar.2, 255)
         }
     }
 
@@ -820,7 +1417,9 @@ impl Browser {
         self.next_id += 1;
         let bounds = self.content_bounds();
         let bg = self.newtab_color();
-        let brand_key = if self.prefs.brand == Brand::Uzaki { "uzaki" } else { "cederic" };
+        let brand_key = if self.prefs.active_color() == PersonaColor::Slate { "uzaki" } else { "cederic" };
+        let persona_name = self.prefs.active_name().to_string();
+        let persona_color_hex = self.prefs.active_color().hex_code();
 
         let p_title = self.proxy.clone();
         let p_load = self.proxy.clone();
@@ -831,8 +1430,10 @@ impl Browser {
         let mut builder = WebViewBuilder::new_with_web_context(&mut self.context)
             .with_bounds(bounds)
             .with_visible(false)
+            .with_user_agent(USER_AGENT)
+            .with_initialization_script(STEALTH_SCRIPT)
             .with_initialization_script(format!(
-                "Object.defineProperty(window, '__cedericTab', {{ value: {id} }}); window.__cedericBrand = {brand_key:?};"
+                "if (window === window.top && location.hostname === 'search.brave.com') {{ window.__cedericBrand = {brand_key:?}; window.__cedericBrandName = {persona_name:?}; window.__cedericBrandColor = {persona_color_hex:?}; }}"
             ))
             .with_initialization_script(SHORTCUT_SCRIPT)
             .with_initialization_script(BRAND_SCRIPT)
@@ -841,8 +1442,14 @@ impl Browser {
             .with_devtools(true)
             .with_hotkeys_zoom(true)
             .with_general_autofill_enabled(false)
-            .with_background_throttling(BackgroundThrottlingPolicy::Suspend)
-            .with_permission_handler(|_kind| PermissionResponse::Deny)
+            .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
+            .with_permission_handler(|kind| match kind {
+                PermissionKind::Microphone
+                | PermissionKind::Camera
+                | PermissionKind::Geolocation
+                | PermissionKind::Notifications => PermissionResponse::Deny,
+                _ => PermissionResponse::Allow,
+            })
             .with_navigation_handler(move |nav_url| {
                 if let Some(https_url) = input::upgrade_to_https(&nav_url) {
                     let _ = p_nav.send_event(UserEvent::UpgradeHttps(id, https_url));
@@ -866,6 +1473,10 @@ impl Browser {
                     let _ = p_ipc.send_event(UserEvent::PipState(id, true));
                 } else if body == "pip_off" {
                     let _ = p_ipc.send_event(UserEvent::PipState(id, false));
+                } else if body == "fs_on" {
+                    let _ = p_ipc.send_event(UserEvent::FullscreenState(id, true));
+                } else if body == "fs_off" {
+                    let _ = p_ipc.send_event(UserEvent::FullscreenState(id, false));
                 } else if let Some(s) = Shortcut::parse(body) {
                     let _ = p_ipc.send_event(UserEvent::Shortcut(s));
                 } else if let Ok(cmd) = serde_json::from_str::<NewTabCmd>(body) {
@@ -933,6 +1544,9 @@ impl Browser {
         if idx >= self.tabs.len() {
             return;
         }
+        if idx == self.active && self.html_fullscreen {
+            self.set_fullscreen(false, true);
+        }
         let was_active = idx == self.active;
         if self.tabs.len() == 1 {
             // Last tab: open the replacement first so the window is never empty.
@@ -998,6 +1612,9 @@ impl Browser {
 
     fn switch_to(&mut self, idx: usize) {
         if idx < self.tabs.len() && idx != self.active {
+            if self.html_fullscreen {
+                self.set_fullscreen(false, true);
+            }
             let previous = self.tabs[self.active].id;
             self.active = idx;
             self.show_active();
@@ -1009,9 +1626,9 @@ impl Browser {
     /// bare window never shows through for a frame.
     fn hide_tab(&self, id: TabId) {
         if let Some(t) = self.index_of(id).map(|i| &self.tabs[i]) {
-            if t.pip {
-                // Keep a tab with active Picture-in-Picture alive and decoding frames while
-                // parked outside the visible client area, so switching tabs never freezes PiP.
+            if t.pip || t.url.contains("youtube.com") || t.url.contains("youtu.be") {
+                // Keep a tab with active Picture-in-Picture or YouTube playback alive while
+                // parked outside the visible client area, so switching tabs never drops video/audio.
                 let _ = t.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             } else {
                 let _ = t.view.set_visible(false);
@@ -1027,7 +1644,7 @@ impl Browser {
             let _ = tab.view.set_bounds(bounds);
             let _ = tab.view.set_visible(true);
             if tab.is_newtab {
-                Self::push_newtab_state(&tab.view, &self.prefs);
+                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
             } else {
                 let _ = tab.view.focus();
             }
@@ -1077,10 +1694,36 @@ impl Browser {
         }
     }
 
-    fn push_newtab_state(view: &WebView, prefs: &Prefs) {
+    fn push_newtab_state(view: &WebView, prefs: &Prefs, history: &HistoryStore) {
+        let active = prefs.active_persona();
+        let color = active.parsed_color();
+        let personas = prefs
+            .personas
+            .iter()
+            .map(|p| PersonaDto {
+                id: &p.id,
+                name: &p.name,
+                color: &p.color,
+                color_hex: p.parsed_color().hex_code(),
+                pfp: p.pfp.as_deref(),
+                is_active: p.id == prefs.active_persona_id,
+                bookmark_count: p.bookmarks.len(),
+            })
+            .collect();
         let state = NewTabState {
-            brand: prefs.brand,
-            bookmarks: &prefs.bookmarks,
+            brand: prefs.brand(),
+            personas,
+            active_persona_id: &prefs.active_persona_id,
+            persona_name: &active.name,
+            persona_color: color.name(),
+            persona_color_hex: color.hex_code(),
+            persona_pfp: active.pfp.as_deref(),
+            bookmarks: prefs.active_bookmarks(),
+            history: history.entries(),
+            background: prefs.background(),
+            logo: LOGO_DATA_URI.as_str(),
+            can_create: prefs.personas.len() < 5,
+            can_delete: prefs.personas.len() > 1,
         };
         if let Ok(json) = serde_json::to_string(&state) {
             let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
@@ -1089,7 +1732,10 @@ impl Browser {
 
     fn sync_ui(&mut self) {
         let Some(tab) = self.active_tab() else { return };
-        let brand = self.prefs.brand;
+        let brand = self.prefs.brand();
+        let color = self.prefs.active_color();
+        let badge_letter = self.prefs.active_badge_letter();
+        let active_name = self.prefs.active_name().to_string();
         let model = toolbar::Model {
             tabs: self
                 .tabs
@@ -1103,7 +1749,7 @@ impl Browser {
                 })
                 .collect(),
             active: tab.id,
-            url: display_url(&tab.url, brand),
+            url: display_url(&tab.url, &active_name),
             can_back: tab.can_back,
             can_forward: tab.can_forward,
             loading: tab.loading,
@@ -1112,13 +1758,17 @@ impl Browser {
             pip: self.tabs.iter().any(|t| t.pip),
             bookmarked: self.prefs.is_bookmarked(&tab.url),
             brand,
+            color,
+            badge_letter,
         };
-        let brand_name = brand.name();
-        let title = if tab.title.is_empty() { brand_name } else { &tab.title };
-        let full_title = format!("{title} - {brand_name}");
-        if self.window_title != full_title {
+        if tab.is_newtab {
+            Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+        }
+        let title = if tab.title.is_empty() { &active_name } else { &tab.title };
+        let full_title = format!("{title} - {active_name}");
+        if self.last_title != full_title {
             self.window.set_title(&full_title);
-            self.window_title = full_title;
+            self.last_title = full_title;
         }
         self.toolbar.set_model(model);
         for url in self.toolbar.take_icon_requests() {
@@ -1210,10 +1860,12 @@ impl Browser {
         let active = self.active_tab().map(|t| t.id) == Some(id);
         if !active
             && let Some(cur) = self.active_tab()
+            && !cur.url.contains("youtube.com")
+            && !cur.url.contains("youtu.be")
         {
             let _ = self.thumbs_tx.send(thumbs::Request::Capture(cur.id));
         }
-        let shown = display_url(&tab.url, self.prefs.brand);
+        let shown = display_url(&tab.url, self.prefs.active_name());
         let card = Card {
             title: if tab.title.is_empty() { "New Tab".into() } else { tab.title.clone() },
             host: host_of(&shown).unwrap_or_default().to_owned(),
@@ -1300,13 +1952,13 @@ impl Browser {
     fn sync_all_newtabs(&self) {
         for tab in &self.tabs {
             if tab.is_newtab {
-                Self::push_newtab_state(&tab.view, &self.prefs);
+                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
             }
         }
         if let Some(spare) = &self.spare
             && spare.is_newtab
         {
-            Self::push_newtab_state(&spare.view, &self.prefs);
+            Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
         }
     }
 
@@ -1330,11 +1982,11 @@ impl Browser {
         );
         items.push(MenuItem::sep());
 
-        if self.prefs.bookmarks.is_empty() {
+        if self.prefs.active_bookmarks().is_empty() {
             items.push(MenuItem::new("No saved bookmarks yet", MenuAction::ToggleBookmark).enabled(false));
         } else {
-            for b in self.prefs.bookmarks.iter().take(MAX) {
-                let shown = display_url(&b.url, self.prefs.brand);
+            for b in self.prefs.active_bookmarks().iter().take(MAX) {
+                let shown = display_url(&b.url, self.prefs.active_name());
                 let host = host_of(&shown).unwrap_or_default().to_owned();
                 items.push(
                     MenuItem::new(b.title.clone(), MenuAction::OpenUrl(b.url.clone())).hint(host),
@@ -1351,30 +2003,80 @@ impl Browser {
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
-    /// Theme & persona dropdown under the palette button: switch between Cederic (Orange) and Uzaki (Slate Blue).
+    /// Theme & persona dropdown under the palette button: switch between personas, create new,
+    /// or choose / clear a custom background image.
     fn theme_menu(&mut self, right: f64, y: f64) {
-        let cur = self.prefs.brand;
-        let c_check = if cur == Brand::Cederic { "✓  Cederic (Orange)" } else { "   Cederic (Orange)" };
-        let u_check = if cur == Brand::Uzaki { "✓  Uzaki (Slate Blue)" } else { "   Uzaki (Slate Blue)" };
-        let items = vec![
-            MenuItem::new(c_check, MenuAction::SetBrand(Brand::Cederic)).hint("Default"),
-            MenuItem::new(u_check, MenuAction::SetBrand(Brand::Uzaki)).hint("Slate Blue"),
-        ];
-        self.show_menu(items, (right - 248.0).max(0.0), y);
+        let active_id = self.prefs.active_id().to_string();
+        let mut items = Vec::new();
+        for p in &self.prefs.personas {
+            let is_cur = p.id == active_id;
+            let mark = if is_cur { "✓  " } else { "   " };
+            let label = format!("{mark}{}", p.name);
+            let hint = p.parsed_color().label();
+            items.push(MenuItem::new(label, MenuAction::SelectPersona(p.id.clone())).hint(hint));
+        }
+        if self.prefs.personas.len() < 5 {
+            items.push(MenuItem::new("+ Create New Persona…", MenuAction::OpenNewPersona));
+        }
+        items.push(MenuItem::new("Manage Personas…", MenuAction::OpenManagePersonas));
+        items.push(MenuItem::sep());
+        let cur_name = self.prefs.active_name().to_string();
+        let has_bg = self.prefs.background().is_some();
+        let bg_label = if has_bg {
+            format!("Change {cur_name} background image…")
+        } else {
+            format!("Set {cur_name} background image…")
+        };
+        let rm_label = format!("Remove {cur_name} background image");
+        items.push(MenuItem::new(bg_label, MenuAction::ChooseBackground));
+        items.push(MenuItem::new(rm_label, MenuAction::ClearBackground).enabled(has_bg));
+        self.show_menu(items, (right - 260.0).max(0.0), y);
     }
 
-    fn set_brand(&mut self, brand: Brand) {
-        if self.prefs.brand == brand {
+    fn apply_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
+        let active_id = self.prefs.active_id().to_string();
+        self.prefs.set_background(&active_id, data, strip_png);
+        self.toolbar.set_background(self.prefs.bg_strip());
+        self.sync_all_newtabs();
+        self.sync_ui();
+    }
+
+    fn choose_background(&mut self) {
+        let js = "document.dispatchEvent(new CustomEvent('cederic:act', { detail: { cmd: 'pick_bg' } }))";
+        self.with_active(|v| v.evaluate_script(js));
+    }
+
+    fn open_persona_editor(&mut self, id: Option<&str>) {
+        let script = match id {
+            Some(i) => format!("window.__personaOpenEditor && window.__personaOpenEditor({i:?});"),
+            None => "window.__personaOpenEditor && window.__personaOpenEditor(null);".to_string(),
+        };
+        let is_newtab = self.tabs.get(self.active).is_some_and(|t| t.is_newtab);
+        if is_newtab {
+            self.with_active(|v| v.evaluate_script(&script));
+        } else {
+            let _ = self.open_tab(None, None, true);
+            self.with_active(|v| v.evaluate_script(&script));
+        }
+    }
+
+    fn set_persona(&mut self, id: &str) {
+        if !self.prefs.set_active_persona(id) {
             return;
         }
-        self.prefs.brand = brand;
-        self.prefs.save();
-        self.toolbar.set_theme(self.dark, brand);
-        self.popups.set_theme(self.dark, brand);
+        let persona = self.prefs.active_persona().clone();
+        let color = persona.parsed_color();
+        let letter = persona.badge_letter();
+
+        self.toolbar.set_persona_theme(self.dark, color, &letter);
+        self.toolbar.set_background(self.prefs.bg_strip());
+        self.popups.set_persona_theme(self.dark, color);
+
         let bg = self.newtab_color();
-        let brand_key = if brand == Brand::Uzaki { "uzaki" } else { "cederic" };
+        let brand_key = if color == PersonaColor::Slate { "uzaki" } else { "cederic" };
         let js = format!(
-            "window.__cedericBrand = {brand_key:?}; window.__cedericSetBrand && window.__cedericSetBrand({brand_key:?});"
+            "window.__cedericBrand = {:?}; window.__cedericBrandName = {:?}; window.__cedericBrandColor = {:?}; window.__cedericSetBrand && window.__cedericSetBrand({:?});",
+            brand_key, persona.name, color.hex_code(), brand_key
         );
         for tab in &mut self.tabs {
             if tab.newtab_bg {
@@ -1383,9 +2085,9 @@ impl Browser {
             if host_of(&tab.url) == Some(REAL_SEARCH_HOST) {
                 tab.title = tab
                     .title
-                    .replace("Brave", brand.name())
-                    .replace("Cederic", brand.name())
-                    .replace("Uzaki", brand.name());
+                    .replace("Brave", &persona.name)
+                    .replace("Cederic", &persona.name)
+                    .replace("Uzaki", &persona.name);
             }
             let _ = tab.view.evaluate_script(&js);
         }
@@ -1397,6 +2099,23 @@ impl Browser {
         }
         self.sync_all_newtabs();
         self.sync_ui();
+        self.redraw();
+    }
+
+    fn set_brand(&mut self, brand: Brand) {
+        let target_id = match brand {
+            Brand::Cederic => "cederic",
+            Brand::Uzaki => "uzaki",
+        };
+        if self.prefs.personas.iter().any(|p| p.id == target_id) {
+            self.set_persona(target_id);
+        } else {
+            let color = PersonaColor::from(brand);
+            let active_id = self.prefs.active_id().to_string();
+            let cur_name = self.prefs.active_name().to_string();
+            self.prefs.update_persona(&active_id, &cur_name, color.name(), None);
+            self.set_persona(&active_id);
+        }
     }
 
     fn page_menu(&mut self, id: TabId, r: ContextRequest) {
@@ -1409,7 +2128,8 @@ impl Browser {
         }
         if !r.image.is_empty() {
             items.push(MenuItem::new("Open image in new tab", MenuAction::OpenBackground(r.image.clone())));
-            items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image)));
+            items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image.clone())));
+            items.push(MenuItem::new("Set image as background", MenuAction::SetBackgroundUrl(r.image)));
             items.push(MenuItem::sep());
         }
         if r.video || r.pip || tab.pip {
@@ -1435,6 +2155,8 @@ impl Browser {
         items.push(MenuItem::sep());
         items.push(MenuItem::new("View page source", MenuAction::ViewSource).enabled(web));
         items.push(MenuItem::new("Inspect", MenuAction::Inspect).hint("F12"));
+        let fs_label = if self.fullscreen { "Exit Full Screen" } else { "Full Screen" };
+        items.push(MenuItem::new(fs_label, MenuAction::ToggleFullscreen).hint("F11"));
 
         // Page coordinates are CSS pixels of the (possibly zoomed) page.
         let zoom = r.dpr / self.window.scale_factor();
@@ -1508,6 +2230,22 @@ impl Browser {
                 }
             }
             MenuAction::SetBrand(brand) => self.set_brand(brand),
+            MenuAction::SelectPersona(id) => self.set_persona(&id),
+            MenuAction::OpenNewPersona => self.open_persona_editor(None),
+            MenuAction::OpenManagePersonas => {
+                let id = self.prefs.active_id().to_string();
+                self.open_persona_editor(Some(&id));
+            }
+            MenuAction::ChooseBackground => self.choose_background(),
+            MenuAction::SetBackgroundUrl(url) => {
+                self.apply_background(Some(url.clone()), None);
+                if let Ok(u) = serde_json::to_string(&url) {
+                    let js = format!("document.dispatchEvent(new CustomEvent('cederic:act', {{ detail: {{ cmd: 'apply_bg', url: {u} }} }}))");
+                    self.with_active(|v| v.evaluate_script(&js));
+                }
+            }
+            MenuAction::ClearBackground => self.apply_background(None, None),
+            MenuAction::ToggleFullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
         }
     }
 
@@ -1559,7 +2297,34 @@ impl Browser {
         self.popups.hide(PopupKind::Suggest);
     }
 
-    // ---------- Picture-in-Picture & DevTools ----------
+    // ---------- Fullscreen, Picture-in-Picture & DevTools ----------
+
+    fn toggle_fullscreen(&mut self) {
+        let next = !self.fullscreen;
+        self.set_fullscreen(next, false);
+    }
+
+    fn set_fullscreen(&mut self, on: bool, is_html: bool) {
+        if self.fullscreen == on {
+            return;
+        }
+        self.fullscreen = on;
+        self.html_fullscreen = on && is_html;
+        if on {
+            self.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        } else {
+            self.window.set_fullscreen(None);
+            if !is_html {
+                let js = "if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document).catch(() => {}); }";
+                self.with_active(|v| v.evaluate_script(js));
+            }
+        }
+        self.close_menu();
+        self.close_suggest();
+        self.hide_preview();
+        self.layout();
+        self.sync_ui();
+    }
 
     fn toggle_pip(&mut self, target: Option<TabId>, prefer_ctx: bool) {
         let id = target.or_else(|| {
@@ -1577,12 +2342,8 @@ impl Browser {
             let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             let _ = self.tabs[i].view.set_visible(true);
         }
-        let js = format!("window.__cedericTogglePip && window.__cedericTogglePip({prefer_ctx})");
-        if devtools::port(&self.data_dir).is_some() {
-            let _ = self.thumbs_tx.send(thumbs::Request::EvalGesture(id, js));
-        } else {
-            let _ = self.tabs[i].view.evaluate_script(&js);
-        }
+        let js = format!("document.dispatchEvent(new CustomEvent('cederic:act', {{ detail: {{ cmd: 'pip', preferCtx: {prefer_ctx} }} }}))");
+        let _ = self.tabs[i].view.evaluate_script(&js);
     }
 
     fn toggle_devtools(&mut self) {
@@ -1655,6 +2416,7 @@ impl Browser {
                     .with_background_color(if self.dark { (36, 36, 36, 255) } else { (255, 255, 255, 255) })
                     .with_initialization_script(DEVTOOLS_SCRIPT)
                     .with_additional_browser_args(BROWSER_ARGS)
+                    .with_user_agent(USER_AGENT)
                     .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
                     .with_ipc_handler(move |req| {
                         if req.body() == "devtools" {
@@ -1718,7 +2480,12 @@ impl Browser {
             ChromeCmd::TabHoverEnd => self.hide_preview(),
             ChromeCmd::Tip { text, x, y } => self.show_tip(text, x, y),
             ChromeCmd::TipEnd => self.hide_preview(),
-            ChromeCmd::Dismiss => self.close_menu(),
+            ChromeCmd::Dismiss => {
+                if self.fullscreen {
+                    self.set_fullscreen(false, false);
+                }
+                self.close_menu();
+            }
             ChromeCmd::Query { text, x, y, w } => self.query(text, x, y, w),
             ChromeCmd::SuggestSelect { index } => {
                 self.popups.select(PopupKind::Suggest, index);
@@ -1746,6 +2513,7 @@ impl Browser {
             ChromeCmd::ToggleBookmark => self.toggle_bookmark(),
             ChromeCmd::BookmarksMenu { x, y } => self.bookmarks_menu(x, y),
             ChromeCmd::ThemeMenu { x, y } => self.theme_menu(x, y),
+            ChromeCmd::ToggleFullscreen => self.toggle_fullscreen(),
         }
     }
 
@@ -1783,7 +2551,17 @@ impl Browser {
             Shortcut::Back => self.handle_chrome(ChromeCmd::Back),
             Shortcut::Forward => self.handle_chrome(ChromeCmd::Forward),
             Shortcut::Devtools => self.toggle_devtools(),
+            Shortcut::Fullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
+            Shortcut::Escape => {
+                if self.fullscreen {
+                    self.set_fullscreen(false, false);
+                }
+                self.close_menu();
+                self.toolbar.blur_address();
+                self.window.request_redraw();
+            }
             Shortcut::Dismiss => {
+                // A click or focus in the page: close menus and stop editing the address bar.
                 // A click or Escape in the page: close menus and stop editing the address bar.
                 let active = self.popups.is_open(PopupKind::Menu) || self.toolbar.is_editing();
                 self.close_menu();
@@ -1802,11 +2580,17 @@ impl Browser {
     }
 
     fn handle_newtab(&mut self, id: TabId, cmd: NewTabCmd) {
+        if let NewTabCmd::SetBackground { data, strip } = cmd {
+            let d = (!data.trim().is_empty()).then_some(data);
+            let s = (!strip.trim().is_empty()).then_some(strip);
+            self.apply_background(d, s.as_deref());
+            return;
+        }
         if let Some(spare) = &self.spare
             && spare.id == id
         {
             if matches!(cmd, NewTabCmd::Ready) {
-                Self::push_newtab_state(&spare.view, &self.prefs);
+                Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
             }
             return;
         }
@@ -1816,7 +2600,7 @@ impl Browser {
         }
         match cmd {
             NewTabCmd::Ready => {
-                Self::push_newtab_state(&self.tabs[i].view, &self.prefs);
+                Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history);
                 self.ensure_chrome_focus();
             }
             NewTabCmd::AutoKey { key } => {
@@ -1852,7 +2636,30 @@ impl Browser {
                     self.sync_ui();
                 }
             }
+            NewTabCmd::SelectPersona { id } => self.set_persona(&id),
+            NewTabCmd::CreatePersona { name, color, pfp } => {
+                if let Ok(nid) = self.prefs.create_persona(&name, &color, pfp) {
+                    self.set_persona(&nid);
+                }
+            }
+            NewTabCmd::UpdatePersona { id, name, color, pfp } => {
+                if self.prefs.update_persona(&id, &name, &color, Some(pfp)) {
+                    if id == self.prefs.active_persona_id {
+                        self.set_persona(&id);
+                    } else {
+                        self.sync_all_newtabs();
+                        self.sync_ui();
+                    }
+                }
+            }
+            NewTabCmd::DeletePersona { id } => {
+                if self.prefs.delete_persona(&id).is_ok() {
+                    let active_id = self.prefs.active_id().to_string();
+                    self.set_persona(&active_id);
+                }
+            }
             NewTabCmd::SetBrand { brand } => self.set_brand(brand),
+            NewTabCmd::SetBackground { .. } => {}
         }
     }
 
@@ -1907,6 +2714,11 @@ impl Browser {
                     self.sync_ui();
                 }
             }
+            UserEvent::FullscreenState(id, on) => {
+                if self.active_tab().map(|t| t.id) == Some(id) {
+                    self.set_fullscreen(on, true);
+                }
+            }
             UserEvent::UpgradeHttps(id, https_url) => {
                 self.https_upgrades += 1;
                 if let Some((query, engine)) = input::extract_search(&https_url) {
@@ -1954,7 +2766,7 @@ impl Browser {
                     return;
                 }
                 if let Some(i) = self.index_of(id) {
-                    let brand_name = self.prefs.brand.name();
+                    let brand_name = self.prefs.active_name();
                     let t = &mut self.tabs[i];
                     t.title = if host_of(&t.url) == Some(REAL_SEARCH_HOST) {
                         title
@@ -2005,6 +2817,15 @@ impl Browser {
                 let is_newtab = tab.is_newtab;
                 let view_ref = &tab.view;
                 if !started {
+                    if !tab.url.contains("youtube.com") && !tab.url.contains("youtu.be") {
+                        let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
+                    }
+                    let proxy = self.proxy.clone();
+                    let _ = tab.view.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
+                        if let Some(icon) = parse_favicon(&res) {
+                            let _ = proxy.send_event(UserEvent::Favicon(id, icon));
+                        }
+                    });
                     if !is_newtab {
                         let proxy = self.proxy.clone();
                         let _ = view_ref.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
@@ -2065,8 +2886,10 @@ impl Browser {
             WindowEvent::CloseRequested => self.quit = true,
             WindowEvent::ThemeChanged(theme) => {
                 self.dark = theme == Theme::Dark;
-                self.toolbar.set_theme(self.dark, self.prefs.brand);
-                self.popups.set_theme(self.dark, self.prefs.brand);
+                let color = self.prefs.active_color();
+                let letter = self.prefs.active_badge_letter();
+                self.toolbar.set_persona_theme(self.dark, color, &letter);
+                self.popups.set_persona_theme(self.dark, color);
                 let bg = self.newtab_color();
                 for tab in &self.tabs {
                     if tab.newtab_bg {
@@ -2083,7 +2906,7 @@ impl Browser {
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f64>(self.window.scale_factor());
                 self.mouse = (p.x, p.y);
-                if p.y < CHROME_HEIGHT || self.toolbar.captures_mouse() {
+                if !self.fullscreen && (p.y < CHROME_HEIGHT || self.toolbar.captures_mouse()) {
                     let icon = self.toolbar.mouse_move(p.x as f32, p.y as f32);
                     self.set_cursor(icon);
                     self.devtools.hover = false;
@@ -2098,18 +2921,20 @@ impl Browser {
                 self.window.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
-                match state {
-                    ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
-                    ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => {
-                        self.toolbar.mouse_up(button, x, y)
+                if !self.fullscreen {
+                    let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
+                    match state {
+                        ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
+                        ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => {
+                            self.toolbar.mouse_up(button, x, y)
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                    if button == MouseButton::Left {
+                        self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
+                    }
+                    self.window.request_redraw();
                 }
-                if button == MouseButton::Left {
-                    self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
-                }
-                self.window.request_redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => {
@@ -2147,6 +2972,9 @@ impl Browser {
     /// pane) is put on screen: the rest of the window is covered by page windows, and painting
     /// under them would flicker.
     fn redraw(&mut self) {
+        if self.fullscreen {
+            return;
+        }
         let now = Instant::now();
         self.next_frame = self.toolbar.tick(now);
         self.flush_toolbar();
@@ -2161,11 +2989,12 @@ impl Browser {
         self.toolbar.render(&mut self.frame);
         let dt = self.devtools_width();
         let logical_w = self.logical_size().width;
-        if self.surface_size != (w.get(), h.get()) {
+        let (w_u32, h_u32) = (w.get(), h.get());
+        if self.surface_size != (w_u32, h_u32) {
             if self.surface.resize(w, h).is_err() {
                 return;
             }
-            self.surface_size = (w.get(), h.get());
+            self.surface_size = (w_u32, h_u32);
         }
         let Ok(mut buf) = self.surface.buffer_mut() else { return };
         let width = w.get() as usize;
@@ -2178,12 +3007,8 @@ impl Browser {
             // The bare strip between page and DevTools is the splitter.
             let x0 = ((logical_w - dt - SPLITTER) * scale).floor().max(0.0) as u32;
             let gap = ((SPLITTER * scale).ceil() as u32 + 1).min(w.get().saturating_sub(x0));
-            let color = match (self.dark, self.prefs.brand) {
-                (true, Brand::Uzaki) => 0x131722,
-                (false, Brand::Uzaki) => 0xd9deec,
-                (true, Brand::Cederic) => 0x18191d,
-                (false, Brand::Cederic) => 0xdfe1e6,
-            };
+            let (strip, _, _) = self.prefs.active_color().surface_tints(self.dark);
+            let color = ((strip.0 as u32) << 16) | ((strip.1 as u32) << 8) | (strip.2 as u32);
             for row in bar_h as usize..h.get() as usize {
                 buf[row * width + x0 as usize..row * width + (x0 + gap) as usize].fill(color);
             }
@@ -2206,14 +3031,27 @@ fn parse_favicon(json: &str) -> Option<String> {
     (ok && url.len() < 64 * 1024).then_some(url)
 }
 
-/// The address-bar text for `url`; Brave Search is shown as Cederic's (or Uzaki's) own search host.
-fn display_url(url: &str, brand: Brand) -> String {
+fn search_host_for_persona(name: &str) -> String {
+    let slug: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if slug.is_empty() {
+        "search.persona.com".into()
+    } else {
+        format!("search.{slug}.com")
+    }
+}
+
+/// The address-bar text for `url`; Brave Search is shown as Persona's own search host.
+fn display_url(url: &str, brand: impl AsRef<str>) -> String {
     if url.starts_with("about:") || url.starts_with("data:") {
         return String::new();
     }
     match url.split_once("://") {
         Some((scheme, rest)) if host_of(url) == Some(REAL_SEARCH_HOST) => {
-            let shown_host = brand.search_host();
+            let shown_host = search_host_for_persona(brand.as_ref());
             format!("{scheme}://{shown_host}{}", &rest[REAL_SEARCH_HOST.len()..])
         }
         _ => url.to_owned(),
@@ -2222,9 +3060,18 @@ fn display_url(url: &str, brand: Brand) -> String {
 
 /// Maps the displayed search host back to the real one when the user edits and submits it.
 fn unmask(input: &str) -> String {
-    input
+    let mut res = input
         .replace(Brand::Cederic.search_host(), REAL_SEARCH_HOST)
         .replace(Brand::Uzaki.search_host(), REAL_SEARCH_HOST)
+        .replace("search.persona.com", REAL_SEARCH_HOST);
+    if let Some((scheme, rest)) = res.split_once("://")
+        && let Some((host, path_and_query)) = rest.split_once('/')
+        && host.starts_with("search.")
+        && host.ends_with(".com")
+    {
+        res = format!("{scheme}://{REAL_SEARCH_HOST}/{path_and_query}");
+    }
+    res
 }
 
 fn host_of(url: &str) -> Option<&str> {
@@ -2237,17 +3084,51 @@ fn data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Cederic")
 }
 
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 0x3F) as usize] as char);
+        out.push(T[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn load_app_icon() -> Option<WinIcon> {
+    let pm = Pixmap::decode_png(include_bytes!("ui/logo_64.png")).ok()?;
+    let (w, h) = (pm.width(), pm.height());
+    let mut rgba = pm.data().to_vec();
+    for p in rgba.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        if a > 0 && a < 255 {
+            p[0] = ((p[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+            p[1] = ((p[1] as u32 * 255 + a / 2) / a).min(255) as u8;
+            p[2] = ((p[2] as u32 * 255 + a / 2) / a).min(255) as u8;
+        }
+    }
+    WinIcon::from_rgba(rgba, w, h).ok()
+}
+
 fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
     let dir = data_dir();
     let prefs = Prefs::open(&dir);
-    let brand = prefs.brand;
+    let brand = prefs.brand();
+    let color = prefs.active_color();
+    let letter = prefs.active_badge_letter();
 
     let window = Rc::new(
         WindowBuilder::new()
-        .with_title(brand.name())
+        .with_title("Persona")
+        .with_window_icon(load_app_icon())
         .with_decorations(false)
         .with_undecorated_shadow(true)
         .with_inner_size(LogicalSize::new(1280.0, 820.0))
@@ -2266,11 +3147,14 @@ fn main() -> wry::Result<()> {
 
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
-    let toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
+    let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32);
+    toolbar.set_persona_theme(dark, color, &letter);
+    toolbar.set_background(prefs.bg_strip());
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
-    let popups = Popups::new(&event_loop, &window, dark, brand);
+    let mut popups = Popups::new(&event_loop, &window, dark, brand);
+    popups.set_persona_theme(dark, color);
 
     let p_thumb = proxy.clone();
     let thumbs_tx = thumbs::spawn(dir.clone(), move |tab, img| {
@@ -2300,7 +3184,6 @@ fn main() -> wry::Result<()> {
         surface,
         surface_size: (0, 0),
         frame: Pixmap::new(1, 1).expect("1x1 pixmap"),
-        window_title: String::new(),
         next_frame: None,
         pacer,
         mouse: (-1.0, -1.0),
@@ -2330,6 +3213,9 @@ fn main() -> wry::Result<()> {
         suggestions: Vec::new(),
         devtools: Devtools { view: None, open: false, width: 520.0, tab: None, dragging: false, hover: false, seq: 0 },
         clipboard: None,
+        fullscreen: false,
+        html_fullscreen: false,
+        last_title: String::new(),
     };
     let start = std::env::args().nth(1).and_then(|a| {
         let resolved = input::resolve_with_info(&unmask(&a))?;
@@ -2407,22 +3293,33 @@ mod tests {
                 .as_nanos()
         ));
         let mut prefs = Prefs::open(&dir);
-        assert_eq!(prefs.brand, Brand::Cederic);
-        assert!(prefs.bookmarks.is_empty());
+        assert_eq!(prefs.brand(), Brand::Cederic);
+        assert!(prefs.bookmarks().is_empty());
 
         assert!(prefs.toggle_bookmark("Rust Lang", "https://www.rust-lang.org/"));
         assert!(prefs.is_bookmarked("https://www.rust-lang.org/"));
-        prefs.brand = Brand::Uzaki;
-        prefs.save();
+
+        // Switch to Uzaki: bookmarks are isolated per persona!
+        prefs.set_brand(Brand::Uzaki);
+        assert_eq!(prefs.brand(), Brand::Uzaki);
+        assert!(prefs.bookmarks().is_empty());
+        assert!(!prefs.is_bookmarked("https://www.rust-lang.org/"));
+
+        // Bookmark in Uzaki
+        assert!(prefs.toggle_bookmark("Uzaki Site", "https://example.com/uzaki"));
+        assert!(prefs.is_bookmarked("https://example.com/uzaki"));
+
+        // Switch back to Cederic: Cederic still has its bookmark, not Uzaki's
+        prefs.set_brand(Brand::Cederic);
+        assert_eq!(prefs.bookmarks().len(), 1);
+        assert_eq!(prefs.bookmarks()[0].title, "Rust Lang");
+        assert!(prefs.is_bookmarked("https://www.rust-lang.org/"));
+        assert!(!prefs.is_bookmarked("https://example.com/uzaki"));
 
         let reloaded = Prefs::open(&dir);
-        assert_eq!(reloaded.brand, Brand::Uzaki);
-        assert_eq!(reloaded.bookmarks.len(), 1);
-        assert_eq!(reloaded.bookmarks[0].title, "Rust Lang");
-
-        let mut reloaded = reloaded;
-        assert!(!reloaded.toggle_bookmark("Rust Lang", "https://www.rust-lang.org/"));
-        assert!(!reloaded.is_bookmarked("https://www.rust-lang.org/"));
+        assert_eq!(reloaded.brand(), Brand::Cederic);
+        assert_eq!(reloaded.bookmarks().len(), 1);
+        assert_eq!(reloaded.bookmarks()[0].title, "Rust Lang");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2432,5 +3329,117 @@ mod tests {
         assert!(matches!(Shortcut::parse("pip"), Some(Shortcut::Pip)));
         assert!(matches!(Shortcut::parse("bookmark"), Some(Shortcut::Bookmark)));
         assert!(matches!(Shortcut::parse("bookmarks"), Some(Shortcut::Bookmarks)));
+        assert!(matches!(Shortcut::parse("fullscreen"), Some(Shortcut::Fullscreen)));
+        assert!(matches!(Shortcut::parse("escape"), Some(Shortcut::Escape)));
+    }
+
+    #[test]
+    fn prefs_per_persona_custom_background() {
+        let dir = std::env::temp_dir().join(format!(
+            "cederic_bg_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut prefs = Prefs::open(&dir);
+        assert_eq!(prefs.brand(), Brand::Cederic);
+        assert_eq!(prefs.background(), None);
+
+        // Set Cederic background
+        prefs.set_background(Brand::Cederic, Some("https://example.com/cederic.jpg".into()), None);
+        assert_eq!(prefs.background(), Some("https://example.com/cederic.jpg"));
+
+        // Switch to Uzaki: should not have a background yet
+        prefs.set_brand(Brand::Uzaki);
+        assert_eq!(prefs.background(), None);
+
+        // Set Uzaki background
+        prefs.set_background(Brand::Uzaki, Some("https://example.com/uzaki.png".into()), None);
+        assert_eq!(prefs.background(), Some("https://example.com/uzaki.png"));
+
+        // Switch back to Cederic: should still have Cederic background
+        prefs.set_brand(Brand::Cederic);
+        assert_eq!(prefs.background(), Some("https://example.com/cederic.jpg"));
+
+        // Reload prefs from disk: both backgrounds must be preserved
+        let reloaded = Prefs::open(&dir);
+        assert_eq!(reloaded.background_for(Brand::Cederic), Some("https://example.com/cederic.jpg"));
+        assert_eq!(reloaded.background_for(Brand::Uzaki), Some("https://example.com/uzaki.png"));
+
+        // Clear Uzaki background: Cederic must remain untouched
+        let mut reloaded = reloaded;
+        reloaded.set_background(Brand::Uzaki, None, None);
+        assert_eq!(reloaded.background_for(Brand::Uzaki), None);
+        assert_eq!(reloaded.background_for(Brand::Cederic), Some("https://example.com/cederic.jpg"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefs_persona_creation_limits_and_deletion() {
+        let dir = std::env::temp_dir().join(format!(
+            "persona_mgmt_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut prefs = Prefs::open(&dir);
+        // Initially 2 base personas: Cederic and Uzaki
+        assert_eq!(prefs.personas.len(), 2);
+        assert_eq!(prefs.personas[0].name, "Cederic");
+        assert_eq!(prefs.personas[1].name, "Uzaki");
+
+        // Create 3rd, 4th, 5th persona
+        let p3 = prefs.create_persona("Work", "emerald", Some("data:image/png;base64,abc".into())).unwrap();
+        let p4 = prefs.create_persona("Gaming", "violet", None).unwrap();
+        let p5 = prefs.create_persona("Secret", "ruby", None).unwrap();
+        assert_eq!(prefs.personas.len(), 5);
+
+        // Max 5 personas enforced: creating a 6th must fail
+        let p6_err = prefs.create_persona("Overflow", "cyan", None);
+        assert!(p6_err.is_err());
+        assert_eq!(prefs.personas.len(), 5);
+
+        // Active persona should be p5
+        assert_eq!(prefs.active_id(), &p5);
+        assert_eq!(prefs.active_name(), "Secret");
+        assert_eq!(prefs.active_color(), PersonaColor::Ruby);
+
+        // Edit p3
+        assert!(prefs.update_persona(&p3, "Work & Code", "cyan", Some(None)));
+        let p3_prof = prefs.personas.iter().find(|p| p.id == p3).unwrap();
+        assert_eq!(p3_prof.name, "Work & Code");
+        assert_eq!(p3_prof.color, "cyan");
+        assert_eq!(p3_prof.pfp, None);
+
+        // User can delete base personas if they want!
+        assert!(prefs.delete_persona("cederic").is_ok());
+        assert_eq!(prefs.personas.len(), 4);
+        assert!(!prefs.personas.iter().any(|p| p.id == "cederic"));
+
+        assert!(prefs.delete_persona("uzaki").is_ok());
+        assert_eq!(prefs.personas.len(), 3);
+        assert!(!prefs.personas.iter().any(|p| p.id == "uzaki"));
+
+        // Delete down to 1 persona
+        assert!(prefs.delete_persona(&p4).is_ok());
+        assert!(prefs.delete_persona(&p5).is_ok());
+        assert_eq!(prefs.personas.len(), 1);
+
+        // Cannot delete the only remaining persona!
+        let last_id = prefs.personas[0].id.clone();
+        let del_err = prefs.delete_persona(&last_id);
+        assert!(del_err.is_err());
+        assert_eq!(prefs.personas.len(), 1);
+
+        // Persistence check
+        let reloaded = Prefs::open(&dir);
+        assert_eq!(reloaded.personas.len(), 1);
+        assert_eq!(reloaded.personas[0].name, "Work & Code");
+        assert_eq!(reloaded.personas[0].color, "cyan");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

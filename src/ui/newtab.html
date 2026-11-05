@@ -6,42 +6,137 @@
 <link rel="dns-prefetch" href="https://search.brave.com">
 <link rel="preconnect" href="https://search.brave.com" crossorigin>
 <style>
-  :root { --bg: #1d1e22; --fg: #ececf0; --dim: #8d909a; --field: #2a2b31; --border: #383a42; --accent: #ff6a3d;
-    --ease: cubic-bezier(.2, .8, .2, 1); }
-  :root[data-brand="uzaki"] { --bg: #181d2c; --fg: #eceff7; --dim: #8e98b4; --field: #232a3f; --border: #323c59; --accent: #7366e6; }
+  :root {
+    --bg: #1d1e22; --fg: #ececf0; --dim: #8d909a; --faint: #5d606a;
+    --field: #2a2b31; --border: #383a42; --accent: #ff6a3d; --card: #25262c;
+    --ease: cubic-bezier(.2, .8, .2, 1);
+  }
   @media (prefers-color-scheme: light) {
-    :root { --bg: #f4f4f6; --fg: #1d1e22; --dim: #6b6f78; --field: #fff; --border: #d4d6dc; --accent: #ff6a3d; }
-    :root[data-brand="uzaki"] { --bg: #edf0f7; --fg: #181d2c; --dim: #5b6580; --field: #fff; --border: #cbd3e6; --accent: #6a5acd; }
+    :root {
+      --bg: #f4f4f6; --fg: #1d1e22; --dim: #6b6f78; --faint: #9fa2ab;
+      --field: #ffffff; --border: #d4d6dc; --accent: #ff6a3d; --card: #ffffff;
+    }
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); overflow: hidden;
-    font: 15px "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; transition: background-color .2s, color .2s; }
-  body::before { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .55;
+    font: 14px "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; transition: background-color .2s, color .2s; }
+  body::before { content: ""; position: fixed; inset: -20%; pointer-events: none; opacity: .55;
     background: radial-gradient(40% 35% at 30% 20%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 70%),
+      radial-gradient(35% 30% at 75% 75%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 70%);
+    animation: drift 18s ease-in-out infinite alternate;
+    will-change: transform; transform: translateZ(0); }
+  @keyframes drift { to { transform: translate(4%, -3%) scale(1.08); } }
+  #bg { position: fixed; inset: 0; z-index: 0; background-size: cover; background-position: center; background-repeat: no-repeat;
+    opacity: 0; transition: opacity .3s var(--ease); pointer-events: none;
+    will-change: opacity; transform: translateZ(0); }
+  #bg::after { content: ""; position: absolute; inset: 0;
+    background: radial-gradient(circle at center, rgba(10, 12, 18, .18) 0%, rgba(10, 12, 18, .54) 100%); }
+  :root[data-has-bg="1"] #bg { opacity: 1; }
+  :root[data-has-bg="1"] body::before { opacity: 0; }
+  :root[data-has-bg="1"] h1 { color: #f6f7fb; text-shadow: 0 4px 24px rgba(0, 0, 0, .55); }
+  :root[data-has-bg="1"] p { color: rgba(240, 242, 248, .85); text-shadow: 0 2px 10px rgba(0, 0, 0, .6); }
+  :root[data-has-bg="1"] kbd { border-color: rgba(255, 255, 255, .28); background: rgba(15, 17, 24, .45); color: #f6f7fb; }
+  :root[data-has-bg="1"] input,
+  :root[data-has-bg="1"] .bm,
+  :root[data-has-bg="1"] .top-pill { background: color-mix(in srgb, var(--field) 76%, transparent);
+    backdrop-filter: blur(16px) saturate(1.25); -webkit-backdrop-filter: blur(16px) saturate(1.25); }
+  body.drag-over::after { content: "Drop image to set browser background"; position: fixed; inset: 14px; z-index: 10;
+    border: 2px dashed var(--accent); border-radius: 18px; background: color-mix(in srgb, var(--bg) 72%, transparent);
+    backdrop-filter: blur(8px); display: grid; place-items: center; color: var(--fg);
+    font: 600 18px "Segoe UI Variable Display", "Segoe UI", system-ui; pointer-events: none; }
+  #top-bar { position: fixed; top: 18px; right: 20px; z-index: 20; display: inline-flex; align-items: center; gap: 8px; }
+  .top-pill { display: inline-flex; align-items: center; gap: 7px; height: 34px; padding: 0 13px; border-radius: 17px;
+    border: 1px solid var(--border); background: var(--field); color: var(--dim);
+    font: 12.5px "Segoe UI Variable Text", "Segoe UI", system-ui; cursor: pointer; user-select: none;
       radial-gradient(35% 30% at 75% 75%, rgba(120, 90, 255, .18), transparent 70%); }
   #theme-btn { position: fixed; top: 18px; right: 20px; z-index: 2; display: inline-flex; align-items: center; gap: 8px;
     height: 34px; padding: 0 14px; border-radius: 17px; border: 1px solid var(--border); background: var(--field);
     color: var(--dim); font: 12.5px "Segoe UI Variable Text", "Segoe UI", system-ui; cursor: pointer;
     transition: border-color .2s, color .2s, transform .2s var(--ease); }
-  #theme-btn:hover { border-color: var(--accent); color: var(--fg); transform: translateY(-1px); }
-  #theme-btn .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
-  main { position: relative; min-height: 100%; display: grid; place-content: center; justify-items: center;
+  .top-pill:hover { border-color: var(--accent); color: var(--fg); transform: translateY(-1px); }
+  .top-pill svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+  #bg-clear { display: none; width: 34px; padding: 0; justify-content: center; font-size: 16px; line-height: 1; }
+  :root[data-has-bg="1"] #bg-clear { display: inline-flex; }
+
+  /* Persona pill & avatars */
+  .avatar-sm { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #fff; background: var(--accent); overflow: hidden; flex: none; border: 1px solid var(--border); }
+  .avatar-sm img { width: 100%; height: 100%; object-fit: cover; }
+  .avatar-md { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-size: 14px; font-weight: 700; color: #fff; background: var(--accent); overflow: hidden; flex: none; border: 1.5px solid var(--border); }
+  .avatar-md img { width: 100%; height: 100%; object-fit: cover; }
+  .avatar-lg { width: 68px; height: 68px; border-radius: 50%; display: grid; place-items: center; font-size: 26px; font-weight: 700; color: #fff; background: var(--accent); overflow: hidden; flex: none; border: 2.5px solid var(--border); transition: border-color .2s, transform .2s; }
+  .avatar-lg img { width: 100%; height: 100%; object-fit: cover; }
+
+  /* Persona Dropdown Menu */
+  #persona-dropdown { position: fixed; top: 60px; right: 20px; width: 290px; z-index: 30; background: color-mix(in srgb, var(--card) 94%, transparent); backdrop-filter: blur(20px); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 16px 40px rgba(0,0,0,0.4); padding: 10px; display: none; flex-direction: column; gap: 6px; animation: popIn .18s var(--ease); }
+  #persona-dropdown.open { display: flex; }
+  @keyframes popIn { from { opacity: 0; transform: translateY(-8px) scale(.97); } to { opacity: 1; transform: none; } }
+  .menu-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 6px 8px; border-bottom: 1px solid var(--border); font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--dim); }
+  .menu-head .add-btn { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: 12px; background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); font-size: 11.5px; font-weight: 600; cursor: pointer; transition: background .15s, transform .15s; }
+  .menu-head .add-btn:hover { background: color-mix(in srgb, var(--accent) 26%, transparent); transform: translateY(-1px); }
+  .menu-list { display: flex; flex-direction: column; gap: 3px; max-height: 280px; overflow-y: auto; }
+  .p-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 10px; cursor: pointer; transition: background .15s; user-select: none; }
+  .p-item:hover { background: color-mix(in srgb, var(--field) 80%, transparent); }
+  .p-item.active { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+  .p-item .p-info { flex: 1; min-width: 0; display: flex; flex-direction: column; text-align: left; }
+  .p-item .p-name { font-size: 13.5px; font-weight: 600; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .p-item .p-sub { font-size: 11px; color: var(--dim); }
+  .p-item .p-actions { display: none; align-items: center; gap: 4px; }
+  .p-item:hover .p-actions { display: flex; }
+  .p-action-btn { width: 24px; height: 24px; border-radius: 6px; border: 0; background: transparent; color: var(--dim); display: grid; place-items: center; cursor: pointer; padding: 0; transition: color .15s, background .15s; }
+  .p-action-btn:hover { color: var(--fg); background: rgba(128,128,128,.2); }
+  .p-action-btn.del-btn:hover { color: #ff4d4f; background: rgba(255, 77, 79, .15); }
+  .p-check { color: var(--accent); font-weight: 700; font-size: 14px; margin-left: 4px; }
+
+  /* Modal Backdrop & Dialog */
+  #modal-backdrop { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.65); backdrop-filter: blur(8px); display: none; place-items: center; padding: 20px; animation: fadeIn .2s var(--ease); }
+  #modal-backdrop.open { display: grid; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .modal-box { width: min(430px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 24px 60px rgba(0,0,0,.5); padding: 24px; display: flex; flex-direction: column; gap: 20px; text-align: left; animation: scaleUp .22s var(--ease); }
+  @keyframes scaleUp { from { opacity: 0; transform: scale(.94); } to { opacity: 1; transform: scale(1); } }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; }
+  .modal-head h2 { margin: 0; font-size: 20px; font-weight: 700; }
+  .modal-close { width: 28px; height: 28px; border-radius: 50%; border: 0; background: transparent; color: var(--dim); font-size: 18px; cursor: pointer; display: grid; place-items: center; transition: background .15s, color .15s; }
+  .modal-close:hover { background: rgba(128,128,128,.2); color: var(--fg); }
+  .pfp-row { display: flex; align-items: center; gap: 18px; }
+  .pfp-btns { display: flex; flex-direction: column; gap: 8px; }
+  .btn-subtle { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 14px; border-radius: 16px; border: 1px solid var(--border); background: var(--field); color: var(--fg); font-size: 12px; cursor: pointer; user-select: none; transition: border-color .15s, background .15s; }
+  .btn-subtle:hover { border-color: var(--accent); }
+  .input-group { display: flex; flex-direction: column; gap: 7px; }
+  .input-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--dim); }
+  .text-input { width: 100%; height: 42px; padding: 0 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--field); color: var(--fg); font: inherit; outline: none; transition: border-color .18s; }
+  .text-input:focus { border-color: var(--accent); }
+  .swatches { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .swatch { height: 38px; border-radius: 9px; border: 2.5px solid transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 13px; font-weight: 700; transition: transform .15s, border-color .15s; }
+  .swatch:hover { transform: scale(1.05); }
+  .swatch.selected { border-color: #fff; box-shadow: 0 0 0 2px var(--card), 0 0 0 4px var(--fg); }
+  .modal-actions { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
+  .btn-danger { height: 34px; padding: 0 14px; border-radius: 10px; border: 1px solid rgba(255, 77, 79, .3); background: rgba(255, 77, 79, .1); color: #ff4d4f; font-size: 12.5px; font-weight: 600; cursor: pointer; transition: background .15s; }
+  .btn-danger:hover { background: rgba(255, 77, 79, .22); }
+  .modal-right-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .btn-primary { height: 34px; padding: 0 18px; border-radius: 10px; border: 0; background: var(--accent); color: #fff; font-size: 12.5px; font-weight: 600; cursor: pointer; transition: opacity .15s, transform .15s; }
+  .btn-primary:hover { opacity: .92; transform: translateY(-1px); }
+
+  /* Hero & search */
+  main { position: relative; z-index: 1; min-height: 100%; display: grid; place-content: center; justify-items: center;
     gap: 24px; padding: 16px; text-align: center; }
   main > * { animation: rise .55s var(--ease) both; }
   main > :nth-child(2) { animation-delay: .06s; }
   main > :nth-child(3) { animation-delay: .10s; }
   main > :nth-child(4) { animation-delay: .14s; }
   @keyframes rise { from { opacity: 0; transform: translateY(14px) scale(.98); } }
+  .hero { display: inline-flex; align-items: center; gap: 14px; }
+  #app-logo { width: 54px; height: 54px; border-radius: 16px; object-fit: cover; display: none;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .28); border: 2px solid var(--border); }
   h1 { margin: 0; font: 650 48px "Segoe UI Variable Display", "Segoe UI", system-ui; letter-spacing: -1.5px; }
   h1 span { color: var(--accent); }
   form { position: relative; width: min(640px, calc(100vw - 32px)); }
   form svg { position: absolute; left: 20px; top: 50%; translate: 0 -50%; width: 18px; height: 18px;
     fill: none; stroke: var(--dim); stroke-width: 2; stroke-linecap: round; transition: stroke .2s; }
-  input { width: 100%; height: 54px; padding: 0 22px 0 52px; border: 1px solid var(--border); border-radius: 27px;
+  input#q { width: 100%; height: 54px; padding: 0 22px 0 52px; border: 1px solid var(--border); border-radius: 27px;
     background: var(--field); color: var(--fg); font: inherit; outline: none;
     box-shadow: 0 8px 30px rgba(0,0,0,.18);
     transition: border-color .2s, box-shadow .3s var(--ease), transform .3s var(--ease); }
-  input:focus { border-color: var(--accent); transform: translateY(-1px);
+  input#q:focus { border-color: var(--accent); transform: translateY(-1px);
     box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent), 0 12px 40px rgba(0,0,0,.25); }
   form:focus-within svg { stroke: var(--accent); }
   #bms { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; max-width: min(680px, calc(100vw - 32px)); }
@@ -62,35 +157,492 @@
 </style>
 </head>
 <body>
-<button id="theme-btn" type="button" title="Switch between Cederic and Uzaki theme"><span class="dot"></span><span id="theme-lbl">Theme: Cederic</span></button>
+<div id="bg"></div>
+
+<!-- Top Actions Bar -->
+<div id="top-bar">
+  <label id="bg-btn" class="top-pill" for="bg-file" title="Choose a background image from your computer (or drag &amp; drop an image anywhere)">
+    <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="M21 15l-4.5-4.5a1.5 1.5 0 0 0-2.1 0L6 19"/></svg>
+    <span id="bg-lbl">Background</span>
+  </label>
+  <input id="bg-file" type="file" accept="image/*" hidden>
+  <button id="bg-clear" class="top-pill" type="button" title="Remove background image">×</button>
+
+  <button id="persona-btn" class="top-pill" type="button" title="Manage and switch Personas">
+    <div id="persona-btn-avatar" class="avatar-sm"></div>
+    <span id="persona-btn-name">Persona</span>
+    <svg viewBox="0 0 24 24" style="width:12px;height:12px"><path d="M6 9l6 6 6-6"/></svg>
+  </button>
+</div>
+
+<!-- Persona Dropdown -->
+<div id="persona-dropdown">
+  <div class="menu-head">
+    <span>Personas (<span id="persona-count">2</span>/5)</span>
+    <button id="btn-add-persona" class="add-btn" type="button" title="Create a new persona">+ New</button>
+  </div>
+  <div id="persona-list" class="menu-list"></div>
+</div>
+
+<!-- Persona Editor Modal -->
+<div id="modal-backdrop">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2 id="modal-title">Create Persona</h2>
+      <button id="modal-close-x" class="modal-close" type="button">×</button>
+    </div>
+
+    <!-- PFP row -->
+    <div class="pfp-row">
+      <div id="modal-pfp-preview" class="avatar-lg"></div>
+      <div class="pfp-btns">
+        <label for="pfp-file-input" class="btn-subtle">
+          <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          Upload Photo
+        </label>
+        <input id="pfp-file-input" type="file" accept="image/*" hidden>
+        <button id="pfp-remove-btn" class="btn-subtle" type="button">Remove Photo</button>
+      </div>
+    </div>
+
+    <!-- Name input -->
+    <div class="input-group">
+      <label class="input-label" for="modal-name-input">Persona Name</label>
+      <input id="modal-name-input" class="text-input" type="text" maxlength="24" placeholder="e.g. Work, Gaming, Cederic">
+    </div>
+
+    <!-- Color swatches -->
+    <div class="input-group">
+      <label class="input-label">Theme Color</label>
+      <div id="swatches-grid" class="swatches"></div>
+    </div>
+
+    <!-- Actions -->
+    <div class="modal-actions">
+      <button id="modal-delete-btn" class="btn-danger" type="button">Delete Persona</button>
+      <div class="modal-right-actions">
+        <button id="modal-cancel-btn" class="btn-subtle" type="button">Cancel</button>
+        <button id="modal-save-btn" class="btn-primary" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <main>
-  <h1 id="brand"><b id="brand-name" style="font-weight:inherit">Cederic</b><span>.</span></h1>
+  <div class="hero">
+    <img id="app-logo" alt="Persona">
+    <h1 id="brand"><b id="brand-name" style="font-weight:inherit">Persona</b><span>.</span></h1>
+  </div>
   <form id="f">
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
     <input id="q" placeholder="Search the web" autocomplete="off">
   </form>
   <div id="bms"></div>
-  <p><kbd>Ctrl T</kbd> new tab &nbsp; <kbd>Ctrl L</kbd> address bar &nbsp; <kbd>Ctrl D</kbd> bookmark &nbsp; <kbd>Ctrl B</kbd> bookmarks &nbsp; <kbd>Ctrl H</kbd> history &nbsp; <kbd>Alt P</kbd> PiP &nbsp; <kbd>F12</kbd> dev tools</p>
+  <p><kbd>Ctrl T</kbd> new tab &nbsp; <kbd>Ctrl L</kbd> address bar &nbsp; <kbd>Ctrl D</kbd> bookmark &nbsp; <kbd>Ctrl B</kbd> bookmarks &nbsp; <kbd>Ctrl H</kbd> history &nbsp; <kbd>Alt P</kbd> PiP &nbsp; <kbd>F11</kbd> fullscreen &nbsp; <kbd>F12</kbd> dev tools</p>
 </main>
+
 <script>
-  const send = (o) => window.ipc.postMessage(JSON.stringify(o));
-  let curBrand = 'cederic';
+  const COLOR_PALETTE = [
+    { name: 'orange',  label: 'Orange',      hex: '#ff6a3d' },
+    { name: 'slate',   label: 'Slate Blue',  hex: '#7366e6' },
+    { name: 'emerald', label: 'Emerald',     hex: '#10b981' },
+    { name: 'ruby',    label: 'Ruby Red',    hex: '#ef4444' },
+    { name: 'violet',  label: 'Violet',      hex: '#8b5cf6' },
+    { name: 'rose',    label: 'Rose Pink',   hex: '#f43f5e' },
+    { name: 'cyan',    label: 'Cyan Blue',   hex: '#06b6d4' },
+    { name: 'amber',   label: 'Amber Gold',  hex: '#f59e0b' },
+  ];
+
+  const send = (o) => {
+    const s = JSON.stringify(o);
+    if (typeof window.__cedericSendIpc === 'function') window.__cedericSendIpc(s);
+    else if (window.ipc) window.ipc.postMessage(s);
+  };
+
+  let curState = null;
+  let curBg = '';
+  let curEditorMode = 'create'; // 'create' or 'edit'
+  let curEditorId = '';
+  let curEditorColor = 'orange';
+  let curEditorPfp = null; // data URL or null
+
+  const makeStripPng = (img) => {
+    try {
+      const sc = document.createElement('canvas');
+      sc.width = 640; sc.height = 84;
+      const sx = sc.getContext('2d');
+      const iw = img.naturalWidth || img.width || 640;
+      const ih = img.naturalHeight || img.height || 360;
+      const scale = Math.max(sc.width / iw, sc.height / ih);
+      const dw = iw * scale, dh = ih * scale;
+      sx.filter = 'blur(3px)';
+      sx.drawImage(img, (sc.width - dw) / 2, (sc.height - dh) * 0.2, dw, dh);
+      return sc.toDataURL('image/png');
+    } catch (_) {
+      return '';
+    }
+  };
+
+  const applyDataUrl = (rawUrl, keepRaw) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      let data = rawUrl;
+      if (!keepRaw) {
+        try {
+          const maxW = 1920, maxH = 1080;
+          let w = img.naturalWidth || 1920, h = img.naturalHeight || 1080;
+          const r = Math.min(1, maxW / w, maxH / h);
+          w = Math.max(1, Math.round(w * r));
+          h = Math.max(1, Math.round(h * r));
+          const c = document.createElement('canvas');
+          c.width = w; c.height = h;
+          c.getContext('2d').drawImage(img, 0, 0, w, h);
+          data = c.toDataURL('image/jpeg', 0.88);
+        } catch (_) {}
+      }
+      const strip = makeStripPng(img);
+      send({ nt: 'set_background', data, strip });
+    };
+    img.onerror = () => {
+      if (rawUrl) send({ nt: 'set_background', data: rawUrl, strip: '' });
+    };
+    img.src = rawUrl;
+  };
+
+  const handleBgFile = (file) => {
+    if (!file || !file.type.startsWith('image/')) return;
+    const reader = new FileReader();
+    const keepGif = file.type === 'image/gif' && file.size <= 4 * 1024 * 1024;
+    reader.onload = () => {
+      if (typeof reader.result === 'string') applyDataUrl(reader.result, keepGif);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handlePfpFile = (file) => {
+    if (!file || !file.type.startsWith('image/')) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const raw = reader.result;
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const size = 128;
+          const c = document.createElement('canvas');
+          c.width = size; c.height = size;
+          const ctx = c.getContext('2d');
+          const iw = img.naturalWidth || 128, ih = img.naturalHeight || 128;
+          const minDim = Math.min(iw, ih);
+          const sx = (iw - minDim) / 2, sy = (ih - minDim) / 2;
+          ctx.drawImage(img, sx, sy, minDim, minDim, 0, 0, size, size);
+          curEditorPfp = c.toDataURL('image/jpeg', 0.9);
+        } catch (_) {
+          curEditorPfp = raw;
+        }
+        updateModalPreview();
+      };
+      img.src = raw;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Avatar helper
+  const renderAvatarContent = (container, name, colorHex, pfpUrl) => {
+    container.textContent = '';
+    container.style.backgroundColor = colorHex || 'var(--accent)';
+    if (pfpUrl) {
+      const img = document.createElement('img');
+      img.src = pfpUrl;
+      img.alt = name;
+      container.append(img);
+    } else {
+      const initial = (name || 'P').trim().charAt(0).toUpperCase();
+      container.textContent = initial;
+    }
+  };
+
+  // Dropdown management
+  const toggleDropdown = (open) => {
+    const el = document.getElementById('persona-dropdown');
+    if (open === undefined) open = !el.classList.contains('open');
+    if (open) el.classList.add('open');
+    else el.classList.remove('open');
+  };
+
+  document.getElementById('persona-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleDropdown();
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#persona-dropdown') && !e.target.closest('#persona-btn')) {
+      toggleDropdown(false);
+    }
+  });
+
+  // Color Swatches
+  const renderSwatches = () => {
+    const grid = document.getElementById('swatches-grid');
+    grid.textContent = '';
+    for (const c of COLOR_PALETTE) {
+      const sw = document.createElement('div');
+      sw.className = 'swatch' + (c.name === curEditorColor ? ' selected' : '');
+      sw.style.backgroundColor = c.hex;
+      sw.title = c.label;
+      sw.textContent = c.name === curEditorColor ? '✓' : '';
+      sw.onclick = () => {
+        curEditorColor = c.name;
+        renderSwatches();
+        updateModalPreview();
+      };
+      grid.append(sw);
+    }
+  };
+
+  const updateModalPreview = () => {
+    const preview = document.getElementById('modal-pfp-preview');
+    const name = document.getElementById('modal-name-input').value || 'Persona';
+    const cObj = COLOR_PALETTE.find(c => c.name === curEditorColor) || COLOR_PALETTE[0];
+    renderAvatarContent(preview, name, cObj.hex, curEditorPfp);
+    preview.style.borderColor = cObj.hex;
+  };
+
+  document.getElementById('modal-name-input').addEventListener('input', updateModalPreview);
+
+  // Modal open/close
+  const openEditorModal = (mode, personaId) => {
+    toggleDropdown(false);
+    curEditorMode = mode;
+    curEditorId = personaId || '';
+    const modal = document.getElementById('modal-backdrop');
+    const titleEl = document.getElementById('modal-title');
+    const nameInp = document.getElementById('modal-name-input');
+    const delBtn = document.getElementById('modal-delete-btn');
+
+    if (mode === 'edit') {
+      const p = curState && curState.personas.find(x => x.id === personaId);
+      titleEl.textContent = 'Edit Persona';
+      nameInp.value = p ? p.name : '';
+      curEditorColor = p ? p.color : 'orange';
+      curEditorPfp = p ? p.pfp : null;
+      delBtn.style.display = (curState && curState.can_delete) ? 'block' : 'none';
+    } else {
+      titleEl.textContent = 'Create New Persona';
+      const num = (curState && curState.personas) ? curState.personas.length + 1 : 1;
+      nameInp.value = `Persona ${num}`;
+      curEditorColor = COLOR_PALETTE[num % COLOR_PALETTE.length].name;
+      curEditorPfp = null;
+      delBtn.style.display = 'none';
+    }
+    renderSwatches();
+    updateModalPreview();
+    modal.classList.add('open');
+    setTimeout(() => nameInp.focus(), 50);
+  };
+
+  const closeModal = () => {
+    document.getElementById('modal-backdrop').classList.remove('open');
+  };
+
+  document.getElementById('modal-close-x').onclick = closeModal;
+  document.getElementById('modal-cancel-btn').onclick = closeModal;
+  document.getElementById('modal-backdrop').onclick = (e) => {
+    if (e.target === document.getElementById('modal-backdrop')) closeModal();
+  };
+
+  document.getElementById('btn-add-persona').onclick = () => openEditorModal('create');
+
+  document.getElementById('pfp-file-input').addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) handlePfpFile(f);
+    e.target.value = '';
+  });
+
+  document.getElementById('pfp-remove-btn').onclick = () => {
+    curEditorPfp = null;
+    updateModalPreview();
+  };
+
+  document.getElementById('modal-save-btn').onclick = () => {
+    const name = document.getElementById('modal-name-input').value.trim() || 'Persona';
+    if (curEditorMode === 'create') {
+      send({ nt: 'create_persona', name, color: curEditorColor, pfp: curEditorPfp });
+    } else {
+      send({ nt: 'update_persona', id: curEditorId, name, color: curEditorColor, pfp: curEditorPfp });
+    }
+    closeModal();
+  };
+
+  document.getElementById('modal-delete-btn').onclick = () => {
+    if (confirm(`Delete persona "${document.getElementById('modal-name-input').value}"?`)) {
+      send({ nt: 'delete_persona', id: curEditorId });
+      closeModal();
+    }
+  };
+
+  // Background pick / clear
+  window.__cedericOpenBgPicker = () => document.getElementById('bg-file').click();
+  window.__cedericApplyBgUrl = (url) => applyDataUrl(url, false);
+  window.__personaOpenEditor = (id) => {
+    if (id) openEditorModal('edit', id);
+    else openEditorModal('create');
+  };
+
+  document.getElementById('bg-file').addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) handleBgFile(f);
+    e.target.value = '';
+  });
+  document.getElementById('bg-clear').addEventListener('click', () => {
+    send({ nt: 'set_background', data: '', strip: '' });
+  });
+
+  // Drag & drop background
+  window.addEventListener('dragover', (e) => {
+    if (e.dataTransfer && [...e.dataTransfer.items].some((i) => i.kind === 'file')) {
+      e.preventDefault();
+      document.body.classList.add('drag-over');
+    }
+  });
+  window.addEventListener('dragleave', (e) => {
+    if (!e.relatedTarget || e.relatedTarget === document.documentElement) {
+      document.body.classList.remove('drag-over');
+    }
+  });
+  window.addEventListener('drop', (e) => {
+    document.body.classList.remove('drag-over');
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f && f.type.startsWith('image/')) {
+      e.preventDefault();
+      handleBgFile(f);
+    }
+  });
+
+  // Search form
   document.getElementById('f').addEventListener('submit', (e) => {
     e.preventDefault();
     const q = document.getElementById('q').value.trim();
     if (q) send({ nt: 'search', input: q });
   });
-  document.getElementById('theme-btn').addEventListener('click', () => {
-    send({ nt: 'set_brand', brand: curBrand === 'uzaki' ? 'cederic' : 'uzaki' });
-  });
+
+  // renderNewTab
   window.renderNewTab = (s) => {
-    curBrand = s.brand || 'cederic';
-    document.documentElement.dataset.brand = curBrand;
-    const name = curBrand === 'uzaki' ? 'Uzaki' : 'Cederic';
-    document.getElementById('brand-name').textContent = name;
-    document.getElementById('theme-lbl').textContent = curBrand === 'uzaki' ? 'Theme: Uzaki (Slate Blue)' : 'Theme: Cederic';
+    curState = s;
+    const personaName = s.persona_name || 'Persona';
+    const accentHex = s.persona_color_hex || '#ff6a3d';
+
+    document.documentElement.style.setProperty('--accent', accentHex);
+    document.documentElement.dataset.persona = s.active_persona_id || 'cederic';
+
+    // Top pill updates
+    document.getElementById('persona-btn-name').textContent = `Persona: ${personaName}`;
+    renderAvatarContent(document.getElementById('persona-btn-avatar'), personaName, accentHex, s.persona_pfp);
+
+    // Dropdown list
+    const pCount = (s.personas || []).length;
+    document.getElementById('persona-count').textContent = pCount;
+    document.getElementById('btn-add-persona').style.display = s.can_create ? 'inline-flex' : 'none';
+
+    const listEl = document.getElementById('persona-list');
+    listEl.textContent = '';
+    for (const p of (s.personas || [])) {
+      const item = document.createElement('div');
+      item.className = 'p-item' + (p.is_active ? ' active' : '');
+
+      const av = document.createElement('div');
+      av.className = 'avatar-md';
+      renderAvatarContent(av, p.name, p.color_hex, p.pfp);
+
+      const info = document.createElement('div');
+      info.className = 'p-info';
+      const name = document.createElement('span');
+      name.className = 'p-name';
+      name.textContent = p.name;
+      const sub = document.createElement('span');
+      sub.className = 'p-sub';
+      const cObj = COLOR_PALETTE.find(c => c.name === p.color) || { label: p.color };
+      sub.textContent = `${cObj.label} • ${p.bookmark_count} bookmark${p.bookmark_count === 1 ? '' : 's'}`;
+      info.append(name, sub);
+
+      const actions = document.createElement('div');
+      actions.className = 'p-actions';
+
+      const editBtn = document.createElement('button');
+      editBtn.className = 'p-action-btn';
+      editBtn.type = 'button';
+      editBtn.title = 'Edit Persona';
+      editBtn.innerHTML = '<svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
+      editBtn.onclick = (e) => {
+        e.stopPropagation();
+        openEditorModal('edit', p.id);
+      };
+      actions.append(editBtn);
+
+      if (s.can_delete) {
+        const delBtn = document.createElement('button');
+        delBtn.className = 'p-action-btn del-btn';
+        delBtn.type = 'button';
+        delBtn.title = 'Delete Persona';
+        delBtn.innerHTML = '<svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+        delBtn.onclick = (e) => {
+          e.stopPropagation();
+          if (confirm(`Delete persona "${p.name}"?`)) {
+            send({ nt: 'delete_persona', id: p.id });
+          }
+        };
+        actions.append(delBtn);
+      }
+
+      item.onclick = () => {
+        if (!p.is_active) {
+          send({ nt: 'select_persona', id: p.id });
+          toggleDropdown(false);
+        }
+      };
+
+      item.append(av, info, actions);
+      if (p.is_active) {
+        const chk = document.createElement('span');
+        chk.className = 'p-check';
+        chk.textContent = '✓';
+        item.append(chk);
+      }
+      listEl.append(item);
+    }
+
+    // Hero title and logo
+    document.getElementById('brand-name').textContent = personaName;
+    const logoEl = document.getElementById('app-logo');
+    if (s.persona_pfp) {
+      logoEl.src = s.persona_pfp;
+      logoEl.style.display = 'block';
+    } else if (s.logo) {
+      logoEl.src = s.logo;
+      logoEl.style.display = 'block';
+    }
+
+    // Wallpaper
+    const bg = s.background || '';
+    if (bg !== curBg) {
+      curBg = bg;
+      const bgEl = document.getElementById('bg');
+      bgEl.style.backgroundImage = bg ? `url(${JSON.stringify(bg)})` : '';
+    }
+    document.getElementById('bg-btn').title = `Choose a ${personaName} background image from your computer`;
+    document.getElementById('bg-clear').title = `Remove ${personaName} background image`;
+    if (bg) {
+      document.documentElement.dataset.hasBg = '1';
+      document.getElementById('bg-lbl').textContent = `Change ${personaName} Background`;
+    } else {
+      delete document.documentElement.dataset.hasBg;
+      document.getElementById('bg-lbl').textContent = `${personaName} Background`;
+    }
+
+    // Bookmarks isolated to this Persona
     const box = document.getElementById('bms');
     box.textContent = '';
+    const frag = document.createDocumentFragment();
     for (const b of (s.bookmarks || [])) {
       if (window.__cedericPreconnect) window.__cedericPreconnect(b.url);
       const el = document.createElement('div');
@@ -110,9 +662,11 @@
       del.onclick = (e) => { e.stopPropagation(); send({ nt: 'delete_bookmark', url: b.url }); };
       el.onclick = () => send({ nt: 'open_bookmark', url: b.url });
       el.append(star, lbl, del);
-      box.append(el);
+      frag.append(el);
     }
+    box.append(frag);
   };
+
   send({ nt: 'ready' });
 </script>
 </body>
