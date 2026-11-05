@@ -20,9 +20,9 @@ use tao::{
     platform::windows::{WindowBuilderExtWindows, WindowExtWindows},
     window::{Window, WindowBuilder, WindowId},
 };
-use tiny_skia::Pixmap;
+use tiny_skia::{FillRule, Mask, Paint, Pixmap, PixmapPaint, Stroke, Transform};
 
-use crate::gfx::{Brand, Canvas, Fonts, Icon, PersonaColor, Rgba, Theme, attrs, text_width};
+use crate::gfx::{Brand, Canvas, Fonts, Icon, PersonaColor, Rgba, Theme, attrs, rrect_path, text_width};
 
 /// Where hidden popups wait. Physical pixels: a logical position this far out would be scaled past
 /// what Windows accepts at high DPI, and the window would land at the screen's top-left instead.
@@ -36,6 +36,46 @@ const SHOT_H: f32 = 158.0;
 const CARD_TEXT_H: f32 = 62.0;
 const TIP_H: f32 = 28.0;
 const TIP_FONT: f32 = 12.5;
+
+/// Space around a popup's card for its drop shadow (left, top, right, bottom), in logical pixels.
+/// The shadow falls downward, so the top margin is small: tooltips and the suggestion list sit
+/// just under the control they belong to.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Margins {
+    l: f32,
+    t: f32,
+    r: f32,
+    b: f32,
+}
+
+const NO_MARGIN: Margins = Margins { l: 0.0, t: 0.0, r: 0.0, b: 0.0 };
+
+/// Rounded, shadowed popups need a transparent window. `PERSONA_FLAT_POPUPS=1` falls back to plain
+/// opaque rectangles, for systems where window transparency is not available.
+fn rounded_popups() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PERSONA_FLAT_POPUPS").is_none_or(|v| v.is_empty() || v == "0"))
+}
+
+fn margins(kind: Kind) -> Margins {
+    if !rounded_popups() {
+        return NO_MARGIN;
+    }
+    match kind {
+        Kind::Tip => Margins { l: 8.0, t: 3.0, r: 8.0, b: 11.0 },
+        _ => Margins { l: 14.0, t: 6.0, r: 14.0, b: 20.0 },
+    }
+}
+
+fn corner_radius(kind: Kind) -> f32 {
+    if !rounded_popups() {
+        return 0.0;
+    }
+    match kind {
+        Kind::Tip => 6.0,
+        _ => 10.0,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -101,7 +141,10 @@ pub struct Popup {
     pub window: Rc<Window>,
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
     surface_size: (u32, u32),
+    /// The whole window: shadow, rounded card and border.
     pm: Pixmap,
+    /// The card's content at its own size, before it is clipped to the rounded shape.
+    card: Pixmap,
     open: bool,
     /// Where to move the window once it has been repainted at its new size.
     pending_pos: Option<LogicalPosition<f64>>,
@@ -148,7 +191,7 @@ impl Popups {
         self.theme = Theme::for_persona(dark, color);
         let c = self.theme.card;
         for p in [&self.menu, &self.suggest, &self.preview, &self.tip] {
-            p.window.set_background_color(Some((c.0, c.1, c.2, 255)));
+            p.window.set_background_color(Some(window_bg(c)));
             if p.open {
                 p.window.request_redraw();
             }
@@ -199,11 +242,14 @@ impl Popups {
         p.v.content = content;
         p.v.size = (w, h);
         p.open = true;
+        // `pos` and `w`/`h` are the card's; the window adds room for the shadow around it.
+        let m = margins(kind);
+        let pos = LogicalPosition::new(pos.x - m.l as f64, pos.y - m.t as f64);
         if fresh {
             // Resizing exposes unpainted pixels. Keep the window off-screen while it is resized and
             // painted, and only then move it into place (`redraw` applies `pending_pos`).
             p.window.set_outer_position(PARKED);
-            p.window.set_inner_size(LogicalSize::new(w as f64, h as f64));
+            p.window.set_inner_size(LogicalSize::new((w + m.l + m.r) as f64, (h + m.t + m.b) as f64));
             p.pending_pos = Some(pos);
         } else {
             p.window.set_outer_position(pos);
@@ -247,8 +293,12 @@ impl Popups {
                 None
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let y = position.to_logical::<f32>(p.window.scale_factor()).y;
-                let hover = p.v.rows.iter().position(|r| r.enabled && y >= r.y && y < r.y + r.h);
+                let m = margins(kind);
+                let pt = position.to_logical::<f32>(p.window.scale_factor());
+                let (x, y) = (pt.x - m.l, pt.y - m.t);
+                // The shadow margin is part of the window but not of the card.
+                let inside = x >= 0.0 && x < p.v.size.0;
+                let hover = p.v.rows.iter().position(|r| inside && r.enabled && y >= r.y && y < r.y + r.h);
                 if hover != p.v.hover {
                     p.v.hover = hover;
                     if kind == Kind::Suggest
@@ -341,7 +391,13 @@ impl Popups {
             p.pm = pm;
         }
         let s = p.window.scale_factor() as f32;
-        draw(&mut p.v, &mut p.pm, fonts, &th, s);
+        let (cw, ch) = (((p.v.size.0 * s).round() as u32).max(1), ((p.v.size.1 * s).round() as u32).max(1));
+        if p.card.width() != cw || p.card.height() != ch {
+            let Some(pm) = Pixmap::new(cw, ch) else { return };
+            p.card = pm;
+        }
+        draw(&mut p.v, &mut p.card, fonts, &th, s);
+        compose(&p.card, &mut p.pm, margins(kind), corner_radius(kind), s, &th);
         let (w_u32, h_u32) = (w.get(), h.get());
         if p.surface_size != (w_u32, h_u32) {
             if p.surface.resize(w, h).is_err() {
@@ -350,8 +406,9 @@ impl Popups {
             p.surface_size = (w_u32, h_u32);
         }
         let Ok(mut buf) = p.surface.buffer_mut() else { return };
+        // Premultiplied 0xAARRGGBB: with a transparent window, the system blends by this alpha.
         for (d, px) in buf.iter_mut().zip(p.pm.data().chunks_exact(4)) {
-            *d = (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
+            *d = (px[3] as u32) << 24 | (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
         }
         let _ = buf.present();
         if let Some(pos) = p.pending_pos.take() {
@@ -369,7 +426,9 @@ impl Popup {
                 // reserves an unpainted strip on the left, right and bottom of the client area,
                 // which showed as black edges and stale content around every popup.
                 .with_undecorated_shadow(false)
-                .with_background_color((card.0, card.1, card.2, 255))
+                // Transparent so the rounded corners and the shadow can show what is behind them.
+                .with_transparent(rounded_popups())
+                .with_background_color(window_bg(card))
                 .with_resizable(false)
                 .with_visible(true)
                 .with_focused(false)
@@ -391,6 +450,7 @@ impl Popup {
             surface,
             surface_size: (0, 0),
             pm: Pixmap::new(1, 1).expect("1x1 pixmap"),
+            card: Pixmap::new(1, 1).expect("1x1 pixmap"),
             open: false,
             pending_pos: None,
             v: View {
@@ -551,11 +611,54 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
             }
         }
     }
-    // Own 1px border: the popups have no OS frame (the OS shadow frame left unpainted edges).
-    c.hairline_h(0.0, 0.0, w, th.border);
-    c.hairline_h(0.0, h - 1.0, w, th.border);
-    c.hairline_v(0.0, 0.0, h, th.border);
-    c.hairline_v(w - 1.0, 0.0, h, th.border);
+}
+
+/// Background the system paints before the first frame: transparent when popups are rounded.
+fn window_bg(card: Rgba) -> (u8, u8, u8, u8) {
+    if rounded_popups() { (0, 0, 0, 0) } else { (card.0, card.1, card.2, 255) }
+}
+
+/// Puts the card on the window pixmap: a soft drop shadow, the card clipped to a rounded
+/// rectangle, and a 1px border. Everything outside the card and its shadow stays transparent.
+fn compose(card: &Pixmap, out: &mut Pixmap, m: Margins, radius: f32, s: f32, th: &Theme) {
+    out.fill(tiny_skia::Color::TRANSPARENT);
+    let (x, y) = ((m.l * s).round(), (m.t * s).round());
+    let (w, h) = (card.width() as f32, card.height() as f32);
+    let r = radius * s;
+    if m != NO_MARGIN {
+        // No blur in tiny-skia: stack growing, fading rounded rectangles instead. The shadow sits
+        // a little low, as if lit from above.
+        let dark = th.fg.0 > 128;
+        // Equal-alpha layers growing outward stack into a smooth falloff away from the card.
+        let layers = 16;
+        let spread = ((m.b - 2.0) * s).max(1.0);
+        let drop = 2.0 * s;
+        let strength = if dark { 0.42 } else { 0.18 };
+        for i in 1..=layers {
+            let e = spread * i as f32 / layers as f32;
+            let alpha = strength / layers as f32;
+            if let Some(path) = rrect_path(x - e * 0.55, y - e * 0.3 + drop, w + e * 1.1, h + e * 0.8, [r + e * 0.6; 4]) {
+                let mut paint = Paint::default();
+                paint.set_color_rgba8(0, 0, 0, (alpha * 255.0).round().clamp(1.0, 255.0) as u8);
+                paint.anti_alias = true;
+                out.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+    }
+    let shape = rrect_path(x, y, w, h, [r; 4]);
+    let mut mask = Mask::new(out.width(), out.height());
+    if let (Some(path), Some(mask)) = (&shape, mask.as_mut()) {
+        mask.fill_path(path, FillRule::Winding, true, Transform::identity());
+    }
+    out.draw_pixmap(x as i32, y as i32, card.as_ref(), &PixmapPaint::default(), Transform::identity(), mask.as_ref());
+    // Border, inset half a pixel so the 1px line lands on whole pixels.
+    if let Some(path) = rrect_path(x + 0.5, y + 0.5, w - 1.0, h - 1.0, [(r - 0.5).max(0.0); 4]) {
+        let mut paint = Paint::default();
+        let b = th.border;
+        paint.set_color_rgba8(b.0, b.1, b.2, b.3);
+        paint.anti_alias = true;
+        out.stroke_path(&path, &paint, &Stroke { width: 1.0, ..Stroke::default() }, Transform::identity(), None);
+    }
 }
 
 #[cfg(test)]
@@ -608,7 +711,10 @@ mod tests {
             };
             let mut pm = Pixmap::new((w * s) as u32, (h * s) as u32).unwrap();
             draw(&mut v, &mut pm, &mut fonts, &th, s);
-            pm.save_png(dir.join(format!("{name}.png"))).unwrap();
+            let m = margins(Kind::Menu);
+            let mut out = Pixmap::new(((w + m.l + m.r) * s) as u32, ((h + m.t + m.b) * s) as u32).unwrap();
+            compose(&pm, &mut out, m, corner_radius(Kind::Menu), s, &th);
+            out.save_png(dir.join(format!("{name}.png"))).unwrap();
         }
     }
 
