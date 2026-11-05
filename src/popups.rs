@@ -34,16 +34,12 @@ const PAD: f32 = 5.0;
 pub const CARD_W: f32 = 280.0;
 const SHOT_H: f32 = 158.0;
 const CARD_TEXT_H: f32 = 62.0;
-/// Height of a toolbar tooltip.
-pub const TIP_H: f32 = 28.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Menu,
     Suggest,
     Preview,
-    /// Toolbar button tooltips; kept apart from the hover card so each keeps its own window.
-    Tip,
 }
 
 pub struct MenuEntry {
@@ -70,8 +66,6 @@ pub enum Content {
     Menu(Vec<MenuEntry>),
     Suggest { items: Vec<SuggestEntry>, query: String },
     Preview(Card),
-    /// One-line tooltip under a toolbar button.
-    Tip(String),
 }
 
 /// A row laid out for drawing and hit-testing.
@@ -120,7 +114,6 @@ pub struct Popups {
     pub menu: Popup,
     pub suggest: Popup,
     pub preview: Popup,
-    pub tip: Popup,
     last_frame: Instant,
 }
 
@@ -133,7 +126,6 @@ impl Popups {
             menu: make(Kind::Menu),
             suggest: make(Kind::Suggest),
             preview: make(Kind::Preview),
-            tip: make(Kind::Tip),
             theme,
             last_frame: Instant::now(),
         }
@@ -147,7 +139,7 @@ impl Popups {
     pub fn set_persona_theme(&mut self, dark: bool, color: PersonaColor) {
         self.theme = Theme::for_persona(dark, color);
         let c = self.theme.card;
-        for p in [&self.menu, &self.suggest, &self.preview, &self.tip] {
+        for p in [&self.menu, &self.suggest, &self.preview] {
             p.window.set_background_color(Some((c.0, c.1, c.2, 255)));
             if p.open {
                 p.window.request_redraw();
@@ -160,15 +152,7 @@ impl Popups {
             Kind::Menu => &mut self.menu,
             Kind::Suggest => &mut self.suggest,
             Kind::Preview => &mut self.preview,
-            Kind::Tip => &mut self.tip,
         }
-    }
-
-    /// Exact window width for a tooltip showing `text`.
-    pub fn tip_width(&mut self, text: &str) -> f32 {
-        let s = self.tip.window.scale_factor() as f32;
-        let b = self.fonts.line(text, 12.5, Weight::NORMAL, s);
-        (text_width(&b, s) + 22.0).ceil().max(48.0)
     }
 
     pub fn is_open(&self, kind: Kind) -> bool {
@@ -176,7 +160,6 @@ impl Popups {
             Kind::Menu => self.menu.open,
             Kind::Suggest => self.suggest.open,
             Kind::Preview => self.preview.open,
-            Kind::Tip => self.tip.open,
         }
     }
 
@@ -231,7 +214,7 @@ impl Popups {
     }
 
     pub fn owns(&self, id: WindowId) -> Option<Kind> {
-        [&self.menu, &self.suggest, &self.preview, &self.tip].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
+        [&self.menu, &self.suggest, &self.preview].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
     }
 
     /// Mouse input on a popup window. Returns a pick when a row was clicked.
@@ -288,7 +271,7 @@ impl Popups {
         self.last_frame = now;
         let k = 1.0 - (-dt * 30.0).exp();
         let mut busy = false;
-        for p in [&mut self.menu, &mut self.suggest, &mut self.preview, &mut self.tip] {
+        for p in [&mut self.menu, &mut self.suggest, &mut self.preview] {
             if !p.open {
                 continue;
             }
@@ -322,7 +305,6 @@ impl Popups {
             Kind::Menu => &mut self.menu,
             Kind::Suggest => &mut self.suggest,
             Kind::Preview => &mut self.preview,
-            Kind::Tip => &mut self.tip,
         };
         if !p.open {
             return;
@@ -441,11 +423,6 @@ fn layout(fonts: &mut Fonts, content: &Content, s: f32) -> (Vec<Row>, f32) {
             rows.push(Row { y: img_h, h: CARD_TEXT_H, label: Some(title), hint: Some(host), enabled: false });
             return (rows, img_h + CARD_TEXT_H);
         }
-        Content::Tip(text) => {
-            let label = fonts.line(text, 12.5, Weight::NORMAL, s);
-            rows.push(Row { y: 0.0, h: TIP_H, label: Some(label), hint: None, enabled: false });
-            return (rows, TIP_H);
-        }
     }
     (rows, y + PAD)
 }
@@ -507,14 +484,6 @@ fn draw(p: &mut View, pm: &mut Pixmap, fonts: &mut Fonts, th: &Theme, s: f32) {
                     && let Some(b) = &mut r.hint
                 {
                     c.text(fonts, b, w - PAD - 12.0 - hint_w, y + (r.h - 11.5 * 1.35) / 2.0, th.dim.with_alpha(a), w, 0.0);
-                }
-            }
-        }
-        Content::Tip(_) => {
-            if let Some(r) = p.rows.first_mut() {
-                let y = r.y + dy;
-                if let Some(b) = &mut r.label {
-                    c.text(fonts, b, 10.0, y + 5.5, th.fg.with_alpha(a), w - 10.0, 18.0);
                 }
             }
         }

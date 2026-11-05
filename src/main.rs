@@ -97,9 +97,12 @@ const STEALTH_SCRIPT: &str = r#"
 /// Every WebView sharing a data directory must use identical arguments.
 const BROWSER_ARGS: &str = "\
     --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,UserAgentClientHint \
-    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,BackForwardCache,ParallelDownloading,CanvasOopRasterization \
+    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,BackForwardCache,ParallelDownloading,CanvasOopRasterization,UseEcoQoSForBackgroundProcess \
     --disable-blink-features=AutomationControlled \
     --autoplay-policy=no-user-gesture-required \
+    --enable-quic \
+    --ssl-version-min=tls1.2 \
+    --disable-component-update \
     --enable-gpu-rasterization \
     --enable-zero-copy \
     --enable-accelerated-video-decode \
@@ -151,6 +154,36 @@ const SHORTCUT_SCRIPT: &str = r#"
     } catch (_) {}
   };
   window.__cedericPreconnect = preconnect;
+  // Toolbar tooltip, drawn here because the page covers the window area below the toolbar. A closed
+  // shadow root keeps page CSS out; it ignores the pointer and goes away on any page pointer move.
+  (() => {
+    let host = null, box = null;
+    const hide = () => { if (host) { host.remove(); host = box = null; } };
+    window.__cedericTip = (text, x, y, bg, fg, border) => {
+      if (text == null) return hide();
+      if (typeof text !== 'string' || text.length > 80) return;
+      const root = document.documentElement;
+      if (!root) return;
+      if (!host) {
+        host = document.createElement('div');
+        host.style.cssText = 'all:initial;position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none';
+        const sh = host.attachShadow({ mode: 'closed' });
+        box = document.createElement('div');
+        sh.appendChild(box);
+        root.appendChild(host);
+      }
+      const css = (v, d) => (typeof v === 'string' && /^rgb\(\d{1,3},\d{1,3},\d{1,3}\)$/.test(v)) ? v : d;
+      box.textContent = text;
+      box.style.cssText = 'position:fixed;white-space:nowrap;pointer-events:none;font:12.5px "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;padding:6px 10px;border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,.35);opacity:0;transition:opacity .12s;'
+        + 'background:' + css(bg, '#222') + ';color:' + css(fg, '#eee') + ';border:1px solid ' + css(border, '#444');
+      const w = box.offsetWidth;
+      box.style.left = Math.max(4, Math.min(x - w / 2, innerWidth - w - 4)) + 'px';
+      box.style.top = Math.max(0, Number(y) || 0) + 'px';
+      requestAnimationFrame(() => { if (box) box.style.opacity = '1'; });
+    };
+    window.addEventListener('pointermove', hide, true);
+    window.addEventListener('blur', hide);
+  })();
 
   const injectSpeculation = () => {
     if (location.protocol !== 'https:' && location.protocol !== 'http:') return;
@@ -1846,7 +1879,6 @@ impl Browser {
             })
             .collect();
         self.hide_preview();
-        self.hide_tip();
         let pos = self.to_screen(x, y);
         self.popups.show(PopupKind::Menu, Content::Menu(entries), pos, W as f32);
     }
@@ -1877,23 +1909,27 @@ impl Browser {
         self.popups.show(PopupKind::Preview, Content::Preview(card), pos, w as f32);
     }
 
-    /// One-line tooltip for a toolbar button; has its own popup window.
+    /// Tooltip under a toolbar button. Drawn by the page itself (see `__cedericTip` in
+    /// `SHORTCUT_SCRIPT`) instead of an extra OS window: the page already fills the area below the
+    /// toolbar, so there is nothing to resize, park or repaint. `cx` and `y` are window coordinates.
     fn show_tip(&mut self, text: String, cx: f64, y: f64) {
         if self.popups.is_open(PopupKind::Menu) {
             return;
         }
-        let w = self.popups.tip_width(&text) as f64;
-        let x = (cx - w / 2.0).clamp(4.0, (self.logical_size().width - w - 4.0).max(4.0));
-        let pos = self.to_screen(x, y);
-        self.popups.show(PopupKind::Tip, Content::Tip(text), pos, w as f32);
+        let top = self.top_bar_height();
+        let th = gfx::Theme::for_brand(self.dark, self.prefs.brand());
+        let css = |c: gfx::Rgba| format!("rgb({},{},{})", c.0, c.1, c.2);
+        let args = serde_json::json!([text, cx, (y - top).max(6.0), css(th.card), css(th.fg), css(th.border)]);
+        let js = format!("window.__cedericTip&&window.__cedericTip(...{args})");
+        self.with_active(|v| v.evaluate_script(&js));
+    }
+
+    fn hide_tip(&mut self) {
+        self.with_active(|v| v.evaluate_script("window.__cedericTip&&window.__cedericTip(null)"));
     }
 
     fn hide_preview(&mut self) {
         self.popups.hide(PopupKind::Preview);
-    }
-
-    fn hide_tip(&mut self) {
-        self.popups.hide(PopupKind::Tip);
     }
 
     fn tab_menu(&mut self, id: TabId, x: f64, y: f64) {
