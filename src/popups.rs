@@ -301,6 +301,11 @@ impl Popups {
                 return;
             }
             p.surface_size = (w_u32, h_u32);
+        if p.surface_size != (w.get(), h.get()) {
+            if p.surface.resize(w, h).is_err() {
+                return;
+            }
+            p.surface_size = (w.get(), h.get());
         }
         let Ok(mut buf) = p.surface.buffer_mut() else { return };
         for (d, px) in buf.iter_mut().zip(p.pm.data().chunks_exact(4)) {

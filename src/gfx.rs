@@ -275,30 +275,15 @@ impl Canvas<'_> {
     pub fn icon(&mut self, icon: Icon, x: f32, y: f32, size: f32, c: Rgba) {
         let grid = if matches!(icon, Icon::WinMin | Icon::WinMax | Icon::WinRestore | Icon::WinClose) { 10.0 } else { 24.0 };
         let k = size / grid;
-        let (paths, width) = icon_paths(icon);
+        let (strokes, fills, width) = cached_icon(icon);
+        let paint = c.paint();
         let st = Stroke { width: width * k, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
         let t = Transform::from_row(k, 0.0, 0.0, k, x, y).post_scale(self.s, self.s);
-        for p in paths.iter().flatten() {
-            if icon == Icon::StarFilled {
-                self.pm.fill_path(p, &c.paint(), FillRule::Winding, t, None);
-            }
-            self.pm.stroke_path(p, &c.paint(), &st, t, None);
+        for p in fills {
+            self.pm.fill_path(p, &paint, FillRule::Winding, t, None);
         }
-        if icon == Icon::Info {
-            // The dot of the "i".
-            if let Some(p) = PathBuilder::from_circle(12.0, 8.0, 1.2) {
-                self.pm.fill_path(&p, &c.paint(), FillRule::Winding, t, None);
-            }
-        } else if icon == Icon::Pip {
-            if let Some(p) = rrect_path(12.5, 12.5, 8.5, 6.5, [1.5; 4]) {
-                self.pm.fill_path(&p, &c.paint(), FillRule::Winding, t, None);
-            }
-        } else if icon == Icon::Palette {
-            for (cx, cy) in [(8.0, 10.5), (10.5, 7.5), (14.5, 7.5)] {
-                if let Some(p) = PathBuilder::from_circle(cx, cy, 1.1) {
-                    self.pm.fill_path(&p, &c.paint(), FillRule::Winding, t, None);
-                }
-            }
+        for p in strokes {
+            self.pm.stroke_path(p, &paint, &st, t, None);
         }
     }
 
@@ -328,10 +313,11 @@ impl Canvas<'_> {
     /// are dropped and the last `fade` logical pixels before it fade out.
     pub fn text(&mut self, fonts: &mut Fonts, buf: &mut Buffer, x: f32, y: f32, c: Rgba, clip_r: f32, fade: f32) {
         let (ox, oy) = ((x * self.s).round() as i32, (y * self.s).round() as i32);
-        let clip = (clip_r * self.s) as i32;
+        let (w, h) = (self.pm.width() as i32, self.pm.height() as i32);
+        let clip = ((clip_r * self.s) as i32).min(w);
+        let fade_start = clip - (fade * self.s).round() as i32;
         let fade_px = (fade * self.s).max(1.0);
         let color = TextColor::rgba(c.0, c.1, c.2, c.3);
-        let (w, h) = (self.pm.width() as i32, self.pm.height() as i32);
         let data = self.pm.data_mut();
         buf.draw(&mut fonts.system, &mut fonts.cache, color, |gx, gy, gw, gh, col| {
             if col.a() == 0 {
@@ -349,6 +335,27 @@ impl Canvas<'_> {
                     }
                     let fade_a = if fade > 0.0 { ((clip - px) as f32 / fade_px).clamp(0.0, 1.0) } else { 1.0 };
                     blend(data, row_offset + px as usize, cr, cg, cb, ca * fade_a);
+            let ca = col.a();
+            if ca == 0 {
+                return;
+            }
+            let y0 = (oy + gy).max(0);
+            let y1 = (oy + gy + gh as i32).min(h);
+            let x0 = (ox + gx).max(0);
+            let x1 = (ox + gx + gw as i32).min(clip);
+            if x0 >= x1 || y0 >= y1 {
+                return;
+            }
+            let (r, g, b) = (col.r(), col.g(), col.b());
+            for py in y0..y1 {
+                let row = (py * w) as usize;
+                for px in x0..x1 {
+                    let a = if fade > 0.0 && px > fade_start {
+                        (ca as f32 * ((clip - px) as f32 / fade_px).clamp(0.0, 1.0)) as u32
+                    } else {
+                        ca as u32
+                    };
+                    blend_u8(data, row + px as usize, r, g, b, a);
                 }
             }
         });
@@ -357,7 +364,7 @@ impl Canvas<'_> {
 
 /// Source-over blend of a cosmic-text color into premultiplied RGBA pixel `i`.
 pub fn blend_px(data: &mut [u8], i: usize, c: TextColor) {
-    blend(data, i, c.r(), c.g(), c.b(), c.a() as f32 / 255.0);
+    blend_u8(data, i, c.r(), c.g(), c.b(), c.a() as u32);
 }
 
 /// Source-over blend of a straight-alpha color into premultiplied RGBA pixel `i`.
@@ -380,6 +387,18 @@ fn blend(data: &mut [u8], i: usize, r: u8, g: u8, b: u8, a: f32) {
     p[1] = ((g as u32 * alpha + p[1] as u32 * inv) >> 8) as u8;
     p[2] = ((b as u32 * alpha + p[2] as u32 * inv) >> 8) as u8;
     p[3] = ((255u32 * alpha + p[3] as u32 * inv) >> 8) as u8;
+/// Fast integer source-over blend of straight-alpha `(r, g, b, a)` into premultiplied RGBA pixel `i`.
+#[inline(always)]
+fn blend_u8(data: &mut [u8], i: usize, r: u8, g: u8, b: u8, a: u32) {
+    if a == 0 {
+        return;
+    }
+    let p = &mut data[i * 4..i * 4 + 4];
+    let inv = 255 - a;
+    p[0] = ((r as u32 * a + p[0] as u32 * inv + 127) / 255) as u8;
+    p[1] = ((g as u32 * a + p[1] as u32 * inv + 127) / 255) as u8;
+    p[2] = ((b as u32 * a + p[2] as u32 * inv + 127) / 255) as u8;
+    p[3] = ((255 * a + p[3] as u32 * inv + 127) / 255) as u8;
 }
 
 pub fn rrect_path(x: f32, y: f32, w: f32, h: f32, r: [f32; 4]) -> Option<Path> {
@@ -450,6 +469,52 @@ fn rect_outline(x: f32, y: f32, w: f32, h: f32) -> Option<Path> {
     let mut pb = PathBuilder::new();
     pb.push_rect(Rect::from_xywh(x, y, w, h)?);
     pb.finish()
+}
+
+const ALL_ICONS: [Icon; 21] = [
+    Icon::Back,
+    Icon::Forward,
+    Icon::Reload,
+    Icon::Stop,
+    Icon::Close,
+    Icon::Plus,
+    Icon::Lock,
+    Icon::Info,
+    Icon::Search,
+    Icon::Globe,
+    Icon::Star,
+    Icon::StarFilled,
+    Icon::Bookmarks,
+    Icon::Pip,
+    Icon::Palette,
+    Icon::History,
+    Icon::Code,
+    Icon::WinMin,
+    Icon::WinMax,
+    Icon::WinRestore,
+    Icon::WinClose,
+];
+
+fn cached_icon(icon: Icon) -> (&'static [Path], &'static [Path], f32) {
+    static CACHE: std::sync::OnceLock<[(Vec<Path>, Vec<Path>, f32); 21]> = std::sync::OnceLock::new();
+    let entry = &CACHE.get_or_init(|| {
+        ALL_ICONS.map(|ic| {
+            let (raw_strokes, w) = icon_paths(ic);
+            let strokes: Vec<Path> = raw_strokes.into_iter().flatten().collect();
+            let fills: Vec<Path> = match ic {
+                Icon::StarFilled => strokes.clone(),
+                Icon::Info => PathBuilder::from_circle(12.0, 8.0, 1.2).into_iter().collect(),
+                Icon::Pip => rrect_path(12.5, 12.5, 8.5, 6.5, [1.5; 4]).into_iter().collect(),
+                Icon::Palette => [(8.0, 10.5), (10.5, 7.5), (14.5, 7.5)]
+                    .into_iter()
+                    .filter_map(|(cx, cy)| PathBuilder::from_circle(cx, cy, 1.1))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (strokes, fills, w)
+        })
+    })[icon as usize];
+    (&entry.0, &entry.1, entry.2)
 }
 
 /// Paths and stroke width (in grid units) for each icon.
@@ -555,14 +620,22 @@ pub const UI_FAMILY: &str = "Segoe UI";
 
 impl Fonts {
     pub fn load() -> Self {
-        let mut db = cosmic_text::fontdb::Database::new();
-        let dir = std::env::var_os("WINDIR").map_or_else(|| "C:\\Windows".into(), std::path::PathBuf::from).join("Fonts");
-        for f in [
-            "segoeui.ttf", "seguisb.ttf", "segoeuib.ttf", "seguisym.ttf", "seguiemj.ttf",
-            "msyh.ttc", "YuGothM.ttc", "malgun.ttf", "Nirmala.ttf", "ebrima.ttf", "tahoma.ttf",
-        ] {
-            let _ = db.load_font_file(dir.join(f));
-        }
+        static DB: std::sync::OnceLock<cosmic_text::fontdb::Database> = std::sync::OnceLock::new();
+        let db = DB
+            .get_or_init(|| {
+                let mut db = cosmic_text::fontdb::Database::new();
+                let dir = std::env::var_os("WINDIR")
+                    .map_or_else(|| "C:\\Windows".into(), std::path::PathBuf::from)
+                    .join("Fonts");
+                for f in [
+                    "segoeui.ttf", "seguisb.ttf", "segoeuib.ttf", "seguisym.ttf", "seguiemj.ttf",
+                    "msyh.ttc", "YuGothM.ttc", "malgun.ttf", "Nirmala.ttf", "ebrima.ttf", "tahoma.ttf",
+                ] {
+                    let _ = db.load_font_file(dir.join(f));
+                }
+                db
+            })
+            .clone();
         let locale = sys_locale().unwrap_or_else(|| "en-US".into());
         Self { system: FontSystem::new_with_locale_and_db(locale, db), cache: SwashCache::new() }
     }
