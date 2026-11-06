@@ -2318,6 +2318,7 @@ impl Browser {
     fn close_menu(&mut self) {
         self.menu_owner = None;
         self.sub_for = None;
+        self.toolbar.clear_pressed();
         self.popups.hide(PopupKind::Menu);
         self.popups.hide(PopupKind::Sub);
     }
@@ -2548,11 +2549,16 @@ impl Browser {
 
     /// Background… on the New Tab page or in the persona menu: a native file dialog.
     fn choose_background(&mut self) {
+        self.toolbar.clear_pressed();
+        self.home.mouse_left();
         let picked = rfd::FileDialog::new()
             .set_title("Choose a wallpaper")
             .add_filter("Images", &["png", "jpg", "jpeg"])
             .set_parent(&*self.window)
             .pick_file();
+        self.toolbar.clear_pressed();
+        self.home.mouse_left();
+        self.window.set_focus();
         let Some(path) = picked else { return };
         let img = std::fs::read(&path).ok().and_then(|b| favicons::decode_picture(&b));
         match img {
@@ -2968,12 +2974,8 @@ impl Browser {
         }
         let size = self.logical_size();
         let pos = self.to_screen(((size.width - w as f64) / 2.0).max(0.0), ((size.height - h as f64) / 2.0 - 20.0).max(0.0));
-        let was_open = self.popups.is_open(PopupKind::Modal);
         self.popups.show(PopupKind::Modal, content, pos, w);
-        if !was_open {
-            // The dialog window takes the keyboard, so typing goes straight to it.
-            self.popups.focus(PopupKind::Modal);
-        }
+        self.popups.focus(PopupKind::Modal);
     }
 
     /// Keeps an open dialog and the blur behind it in step with the window after it is resized,
@@ -3252,6 +3254,7 @@ impl Browser {
         self.persona_form = None;
         self.popups.hide(PopupKind::Modal);
         self.popups.hide(PopupKind::Scrim);
+        self.toolbar.clear_pressed();
         self.lock_chrome();
         if was_open {
             // The dialog had the keyboard: hand it back to the window and the page.
@@ -4381,6 +4384,15 @@ impl Browser {
                 }
                 _ => {}
             }
+            if kind == PopupKind::Scrim {
+                if let WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } = event {
+                    // Clicking outside on the backdrop dismisses any non-mandatory modal dialog.
+                    if !matches!(self.modal_kind, Some(ModalKind::Setup(_))) {
+                        self.hide_modal();
+                    }
+                }
+                return;
+            }
             if let Some(pick) = self.popups.window_event(kind, &event) {
                 self.handle_pick(pick);
             }
@@ -4512,26 +4524,25 @@ impl Browser {
         }
         let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
         match state {
-            ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
-            ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_up(button, x, y),
-            ElementState::Pressed if button == MouseButton::Left && !self.devtools.hover && self.in_panel(x as f64, y as f64).is_some() => {
-                let (px, py) = self.in_panel(x as f64, y as f64).unwrap_or_default();
-                self.close_menu();
-                let cmd = self.devtools.panel.click(px, py);
-                if self.devtools.panel.typing {
-                    // The console prompt takes the keyboard: away from the page, to this window.
-                    self.toolbar.blur_address();
-                    for t in &self.tabs {
-                        let _ = t.view.focus_parent();
+            ElementState::Pressed => {
+                if self.mouse.1 < CHROME_HEIGHT {
+                    self.toolbar.mouse_down(button, x, y);
+                } else if button == MouseButton::Left && !self.devtools.hover && self.in_panel(x as f64, y as f64).is_some() {
+                    let (px, py) = self.in_panel(x as f64, y as f64).unwrap_or_default();
+                    self.close_menu();
+                    let cmd = self.devtools.panel.click(px, py);
+                    if self.devtools.panel.typing {
+                        // The console prompt takes the keyboard: away from the page, to this window.
+                        self.toolbar.blur_address();
+                        for t in &self.tabs {
+                            let _ = t.view.focus_parent();
+                        }
+                        self.window.set_focus();
                     }
-                    self.window.set_focus();
-                }
-                self.panel_cmd(cmd);
-            }
-            _ if button == MouseButton::Left && self.home_active() && !self.devtools.hover && self.modal_kind.is_none() => {
-                let hy = y - self.top_bar_height() as f32;
-                let cmd = if state == ElementState::Pressed { self.home.mouse_down(x, hy) } else { self.home.mouse_up(x, hy) };
-                if state == ElementState::Pressed {
+                    self.panel_cmd(cmd);
+                } else if button == MouseButton::Left && self.home_active() && !self.devtools.hover && self.modal_kind.is_none() {
+                    let hy = y - self.top_bar_height() as f32;
+                    let cmd = self.home.mouse_down(x, hy);
                     self.devtools.panel.typing = false;
                     // A click on the page closes any open dropdown.
                     self.close_menu();
@@ -4539,9 +4550,24 @@ impl Browser {
                         // ...and, outside the search box, ends address editing.
                         self.toolbar.blur_address();
                     }
+                    if let Some(cmd) = cmd {
+                        self.home_cmd(cmd);
+                    }
                 }
-                if let Some(cmd) = cmd {
-                    self.home_cmd(cmd);
+            }
+            ElementState::Released => {
+                if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT {
+                    self.toolbar.mouse_up(button, x, y);
+                } else {
+                    self.toolbar.clear_pressed();
+                }
+                if button == MouseButton::Left && self.home_active() && !self.devtools.hover && self.modal_kind.is_none() {
+                    let hy = y - self.top_bar_height() as f32;
+                    if let Some(cmd) = self.home.mouse_up(x, hy) {
+                        self.home_cmd(cmd);
+                    }
+                } else {
+                    self.home.mouse_left();
                 }
             }
             _ => {}
@@ -4734,10 +4760,6 @@ impl Browser {
             }
         }
         let _ = buf.present_with_damage(&damage);
-        if home_painted && self.popups.is_open(PopupKind::Scrim) {
-            // The blur behind a dialog shows the New Tab page as it looks now.
-            self.show_scrim(false);
-        }
     }
 }
 
@@ -5501,5 +5523,32 @@ mod tests {
         assert!(!BROWSER_ARGS.contains("UseEcoQoSForBackgroundProcess"));
         assert!(!BROWSER_ARGS.contains("IntensiveWakeUpThrottling"));
         assert!(!BROWSER_ARGS.contains("--process-per-site"));
+    }
+
+    #[test]
+    fn mouse_clicks_do_not_freeze_input_or_trap_toolbar_pressed() {
+        let mut tb = Toolbar::new(true, 1.0, 1000.0);
+        // 1. Click menu button: cmds is queued, but captures_mouse must remain false (not stuck pressed)
+        let (mx, my) = tb.menu_anchor();
+        tb.mouse_down(MouseButton::Left, mx - 10.0, my - 20.0);
+        assert!(!tb.captures_mouse(), "Menu button press must not trap captures_mouse");
+        assert!(tb.cmds.iter().any(|c| matches!(c, ChromeCmd::MainMenu { .. })));
+        tb.cmds.clear();
+
+        // 2. Click theme button: cmds is queued, captures_mouse remains false
+        let (tx, ty) = tb.theme_anchor();
+        tb.mouse_down(MouseButton::Left, tx - 10.0, ty - 20.0);
+        assert!(!tb.captures_mouse(), "Theme button press must not trap captures_mouse");
+        assert!(tb.cmds.iter().any(|c| matches!(c, ChromeCmd::ThemeMenu { .. })));
+        tb.cmds.clear();
+
+        // 3. Click new tab button: cmds is queued, captures_mouse remains false
+        tb.mouse_down(MouseButton::Left, 10.0, 10.0);
+        tb.cmds.clear();
+        assert!(!tb.captures_mouse());
+
+        // 4. Test clear_pressed clears any dangling state
+        tb.clear_pressed();
+        assert!(!tb.captures_mouse());
     }
 }

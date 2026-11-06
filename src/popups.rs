@@ -711,6 +711,9 @@ impl Popups {
             if (p.window.inner_size().width, p.window.inner_size().height) != p.phys_size {
                 p.window.set_inner_size(PhysicalSize::new(p.phys_size.0, p.phys_size.1));
             }
+            if kind == Kind::Modal {
+                p.window.set_focus();
+            }
         }
     }
 }

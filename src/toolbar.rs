@@ -613,6 +613,12 @@ impl Toolbar {
         self.drag.is_some() || self.selecting || self.pressed.is_some()
     }
 
+    pub fn clear_pressed(&mut self) {
+        self.pressed = None;
+        self.drag = None;
+        self.selecting = false;
+    }
+
     /// True once after a pointer move that needs a repaint. Plain moves over nothing do not, which
     /// keeps the event loop free for clicks.
     pub fn set_locked(&mut self, on: bool, dim: bool) {
@@ -766,7 +772,6 @@ impl Toolbar {
         // Dropdown buttons open on press (no waiting for the release); pressing again closes
         // the dropdown (`main.rs` toggles it, so no Dismiss first).
         if button == MouseButton::Left && matches!(hit, Hit::Theme | Hit::Menu) {
-            self.pressed = Some(hit);
             let (x, y) = if hit == Hit::Theme { self.theme_anchor() } else { self.menu_anchor() };
             self.cmds.push(if hit == Hit::Theme { ChromeCmd::ThemeMenu { x: x as f64, y: y as f64 } } else { ChromeCmd::MainMenu { x: x as f64, y: y as f64 } });
             return;
