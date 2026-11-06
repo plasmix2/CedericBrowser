@@ -65,7 +65,10 @@ pub fn check_latest_release() -> Option<UpdateInfo> {
                 if let Ok(rel) = serde_json::from_str::<ReleaseInfo>(&body) {
                     if is_newer_version(&rel.tag_name, rel.name.as_deref()) {
                         if let Some(asset) = rel.assets.iter().find(|a| {
-                            a.name.eq_ignore_ascii_case("Persona.exe") || a.name.to_ascii_lowercase().ends_with(".exe")
+                            a.name.eq_ignore_ascii_case("Persona.zip")
+                                || a.name.to_ascii_lowercase().ends_with(".zip")
+                                || a.name.eq_ignore_ascii_case("Persona.exe")
+                                || a.name.to_ascii_lowercase().ends_with(".exe")
                         }) {
                             let display_version = rel.name.unwrap_or_else(|| rel.tag_name.clone());
                             return Some(UpdateInfo {
@@ -115,7 +118,7 @@ pub fn apply_update_and_restart(download_url: &str) -> Result<(), Box<dyn std::e
     let agent = make_agent().ok_or("failed to create http agent")?;
     let mut resp = agent.get(download_url).call()?;
     let bytes = resp.body_mut().read_to_vec()?;
-    if bytes.len() < 100_000 {
+    if bytes.len() < 50_000 {
         return Err("downloaded binary is too small or invalid".into());
     }
 
@@ -127,7 +130,56 @@ pub fn apply_update_and_restart(download_url: &str) -> Result<(), Box<dyn std::e
     let _ = std::fs::remove_file(&old_exe);
     let _ = std::fs::remove_file(&new_tmp);
 
-    std::fs::write(&new_tmp, &bytes)?;
+    let is_zip = download_url.to_ascii_lowercase().ends_with(".zip")
+        || bytes.starts_with(b"PK\x03\x04");
+
+    if is_zip {
+        let zip_path = exe_dir.join("persona_update.zip");
+        let unpack_dir = exe_dir.join("persona_unpack_tmp");
+        let _ = std::fs::remove_file(&zip_path);
+        let _ = std::fs::remove_dir_all(&unpack_dir);
+        std::fs::write(&zip_path, &bytes)?;
+        std::fs::create_dir_all(&unpack_dir)?;
+
+        let status = std::process::Command::new("tar")
+            .args(["-xf", zip_path.to_str().unwrap_or("persona_update.zip"), "-C", unpack_dir.to_str().unwrap_or(".")])
+            .status()?;
+        let _ = std::fs::remove_file(&zip_path);
+
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&unpack_dir);
+            return Err("failed to extract update zip".into());
+        }
+
+        let mut new_exe_path = None;
+        let mut dll_path = None;
+        if let Ok(entries) = std::fs::read_dir(&unpack_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.eq_ignore_ascii_case("Persona.exe") || name.to_ascii_lowercase().ends_with(".exe") {
+                    new_exe_path = Some(entry.path());
+                } else if name.eq_ignore_ascii_case("WebView2Loader.dll") {
+                    dll_path = Some(entry.path());
+                }
+            }
+        }
+
+        let Some(extracted_exe) = new_exe_path else {
+            let _ = std::fs::remove_dir_all(&unpack_dir);
+            return Err("update archive missing executable".into());
+        };
+
+        if let Some(extracted_dll) = dll_path {
+            let target_dll = exe_dir.join("WebView2Loader.dll");
+            let _ = std::fs::copy(extracted_dll, target_dll);
+        }
+
+        std::fs::copy(&extracted_exe, &new_tmp)?;
+        let _ = std::fs::remove_dir_all(&unpack_dir);
+    } else {
+        std::fs::write(&new_tmp, &bytes)?;
+    }
+
     std::fs::rename(&current_exe, &old_exe)?;
 
     if let Err(e) = std::fs::rename(&new_tmp, &current_exe) {

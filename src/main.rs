@@ -97,8 +97,8 @@ const STEALTH_SCRIPT: &str = r#"
 
 /// Every WebView sharing a data directory must use identical arguments.
 const BROWSER_ARGS: &str = "\
-    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,UserAgentClientHint \
-    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,BackForwardCache,ParallelDownloading,CanvasOopRasterization,PictureInPicture,PictureInPictureAPI,AutoPictureInPictureForVideoPlayback,BrowserInitiatedAutomaticPictureInPicture,MediaSessionEnterPictureInPicture \
+    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,UserAgentClientHint,CalculateNativeWinOcclusion \
+    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,BackForwardCache,ParallelDownloading,CanvasOopRasterization,PictureInPicture,PictureInPictureAPI,AutoPictureInPictureForVideoPlayback,BrowserInitiatedAutomaticPictureInPicture,MediaSessionEnterPictureInPicture,IntensiveWakeUpThrottling,HighEfficiencyModeAvailable \
     --disable-blink-features=AutomationControlled \
     --autoplay-policy=no-user-gesture-required \
     --enable-gpu-rasterization \
@@ -111,7 +111,14 @@ const BROWSER_ARGS: &str = "\
     --disable-client-side-phishing-detection \
     --disable-sync \
     --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
-    --enforce-webrtc-ip-permission-check";
+    --enforce-webrtc-ip-permission-check \
+    --renderer-process-limit=2 \
+    --process-per-site \
+    --js-flags=--max-old-space-size=256 \
+    --disk-cache-size=104857600 \
+    --media-cache-size=52428800 \
+    --disable-gpu-shader-disk-cache \
+    --disable-component-update";
 
 /// Keyboard shortcuts, the context menu, speculative link preconnect/prefetch, and Wi-Fi form
 /// encryption guard for content pages. Untrusted web content can only trigger the fixed `Shortcut`
@@ -1525,7 +1532,7 @@ impl Browser {
             .with_devtools(true)
             .with_hotkeys_zoom(true)
             .with_general_autofill_enabled(false)
-            .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
+            .with_background_throttling(BackgroundThrottlingPolicy::Throttle)
             .with_permission_handler(move |kind| match kind {
                 PermissionKind::Camera | PermissionKind::DisplayCapture => {
                     if cam.load(std::sync::atomic::Ordering::Relaxed) {
