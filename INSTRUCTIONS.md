@@ -86,7 +86,7 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 
 | Agent / Owner | Branch | Files Being Touched | Task Summary |
 |---|---|---|---|
-| *(none currently)* | — | — | — |
+| Claude | `claude/friendly-ptolemy-dzfqha` | `docs/ENGINE_2_0_PLAN.md`, `INSTRUCTIONS.md` (docs only) | Persona 2.0 in-house engine plan; no code changes yet. Phase 0 (`PageEngine` trait) will touch `src/main.rs` heavily: coordinate before starting. |
 
 ---
 
