@@ -139,6 +139,7 @@ impl HistoryStore {
     }
 
     /// Removes a single history entry by ID and updates the encrypted file.
+    #[cfg(test)]
     pub fn remove(&mut self, id: u64) -> bool {
         let len_before = self.entries.len();
         self.entries.retain(|e| e.id != id);

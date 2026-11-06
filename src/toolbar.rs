@@ -497,35 +497,6 @@ impl Toolbar {
         self.editing
     }
 
-    /// Feeds a keystroke forwarded from a New Tab (or while the address bar is active) straight
-    /// into the address bar editor so typing works immediately even before Win32 focus transfers.
-    pub fn auto_key(&mut self, key: &str) {
-        if self.locked {
-            return;
-        }
-        if !self.editing {
-            self.focus_address();
-        }
-        self.blink_from = Instant::now();
-        match key {
-            "Backspace" => {
-                self.ed.backspace(&mut self.buf, false);
-                self.query();
-            }
-            "Enter" => {
-                let input = self.text();
-                if !input.trim().is_empty() {
-                    self.blur_address();
-                    self.cmds.push(ChromeCmd::Navigate { input });
-                }
-            }
-            s if s.chars().count() == 1 => {
-                self.insert(s);
-            }
-            _ => {}
-        }
-    }
-
     pub fn blur_address(&mut self) {
         if self.editing {
             self.editing = false;

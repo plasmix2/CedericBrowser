@@ -48,6 +48,8 @@ const HERO_H: f32 = 160.0;
 const DOT: f32 = 30.0;
 /// Where the sliders' tracks start (their labels sit to the left).
 const SLIDER_X: f32 = 92.0;
+/// Width of the switches dialog (`Content::Modal`).
+pub const MODAL_W: f32 = 420.0;
 /// Radius of a slider's knob, which stays inside the track.
 const KNOB: f32 = 9.0;
 const MODAL_ROW: f32 = 56.0;
@@ -174,6 +176,9 @@ pub struct PersonaForm {
     /// The persona's picture, shown in the preview, if it has one (a loaded photo URL).
     pub avatar_url: Option<String>,
     pub can_delete: bool,
+    /// Labels of the two buttons on the right; an empty `cancel` hides that button.
+    pub cancel: String,
+    pub save: String,
 }
 
 pub struct Card {
@@ -190,11 +195,13 @@ pub enum Content {
     /// One-line tooltip under a toolbar button.
     Tip(String),
     /// A dialog: title, a line of explanation, one switch row per entry, then a Done button.
-    Modal { title: String, note: String, items: Vec<ToggleEntry> },
+    /// Rows: one per switch, then the finishing button (labelled `done`).
+    Modal { title: String, note: String, items: Vec<ToggleEntry>, done: String },
     /// The persona editor dialog. Rows: 0 = name field, 1..=8 = colors, 9 = Delete, 10 = Cancel, 11 = Save.
     Persona(PersonaForm),
-    /// A yes/no question. Rows: 0 = Cancel, 1 = the confirming button.
-    Confirm { title: String, note: String, ok: String },
+    /// A yes/no question. Rows: 0 = the cancelling button (hidden when `cancel` is empty), 1 = the
+    /// confirming one, drawn in the accent when `primary` and in red otherwise.
+    Confirm { title: String, note: String, ok: String, cancel: String, primary: bool },
     /// A blurred picture of the page (if there is one yet) and the height to cover, in logical px.
     Scrim { img: Option<Pixmap>, h: f32 },
 }
@@ -365,6 +372,10 @@ impl Popups {
                 }
             }
         }
+    }
+
+    pub fn image(&self, url: &str) -> Option<&Pixmap> {
+        self.images.get(url)
     }
 
     pub fn has_image(&self, url: &str) -> bool {
@@ -791,8 +802,14 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
                 rows.push(r);
             }
             let by = HERO_H + 210.0;
-            for (k, (x, w)) in [(22.0, 96.0), (FORM_W - 22.0 - 92.0 - 8.0 - 92.0, 92.0), (FORM_W - 22.0 - 92.0, 92.0)].into_iter().enumerate() {
-                let mut r = row(by, 36.0, Some(String::new()), None, k != 0 || f.can_delete);
+            let (cw, sw) = (button_w(&f.cancel), button_w(&f.save));
+            for (k, (x, w)) in [(22.0, 96.0), (FORM_W - 22.0 - sw - 8.0 - cw, cw), (FORM_W - 22.0 - sw, sw)].into_iter().enumerate() {
+                let on = match k {
+                    0 => f.can_delete,
+                    1 => !f.cancel.is_empty(),
+                    _ => true,
+                };
+                let mut r = row(by, 36.0, Some(String::new()), None, on);
                 (r.x, r.w) = (x, w);
                 rows.push(r);
             }
@@ -807,21 +824,27 @@ fn layout(content: &Content) -> (Vec<Row>, f32) {
             rows.push(r);
             return (rows, by + 36.0 + 22.0);
         }
-        Content::Confirm { .. } => {
-            for (x, w) in [(FORM_W - 22.0 - 92.0 - 8.0 - 92.0, 92.0), (FORM_W - 22.0 - 92.0, 92.0)] {
-                let mut r = row(94.0, 34.0, Some(String::new()), None, true);
+        Content::Confirm { ok, cancel, .. } => {
+            let ok_w = button_w(ok);
+            let cancel_w = button_w(cancel);
+            for (k, (x, w)) in [(FORM_W - 22.0 - ok_w - 8.0 - cancel_w, cancel_w), (FORM_W - 22.0 - ok_w, ok_w)].into_iter().enumerate() {
+                let mut r = row(94.0, 34.0, Some(String::new()), None, k == 1 || !cancel.is_empty());
                 (r.x, r.w) = (x, w);
                 rows.push(r);
             }
             return (rows, CONFIRM_H);
         }
-        Content::Modal { items, .. } => {
+        Content::Modal { items, done, .. } => {
             y = MODAL_HEAD;
             for it in items {
                 rows.push(row(y, MODAL_ROW, Some(it.label.clone()), Some(it.desc.clone()), true));
                 y += MODAL_ROW;
             }
-            rows.push(row(y, MODAL_FOOT, Some("Done".to_owned()), None, true));
+            let mut r = row(y, MODAL_FOOT, Some(String::new()), None, true);
+            // Only the button itself (bottom right) is clickable.
+            let bw = button_w(done);
+            (r.x, r.w) = (MODAL_W - 22.0 - bw, bw);
+            rows.push(r);
             return (rows, y + MODAL_FOOT);
         }
     }
@@ -1066,40 +1089,44 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
                 if f.can_delete && let Some(r) = p.rows.get(9) {
                     btn(c, r, "Delete", th.close.with_alpha(0.14), th.close, fade(9));
                 }
-                if let Some(r) = p.rows.get(10) {
-                    btn(c, r, "Cancel", th.field, th.fg, fade(10));
+                if !f.cancel.is_empty() && let Some(r) = p.rows.get(10) {
+                    btn(c, r, &f.cancel, th.field, th.fg, fade(10));
                 }
                 if let Some(r) = p.rows.get(11) {
-                    btn(c, r, "Save", accent, Rgba(255, 255, 255, 255), fade(11));
+                    btn(c, r, &f.save, accent, Rgba(255, 255, 255, 255), fade(11));
                 }
             }
-            Content::Confirm { title, note, ok } => {
+            Content::Confirm { title, note, ok, cancel, primary } => {
                 c.text(title, 22.0, 20.0, 17.0, Weight::SemiBold, th.fg.with_alpha(a), w - 22.0);
                 c.text(note, 22.0, 56.0, 12.5, Weight::Regular, th.dim.with_alpha(a), w - 22.0);
                 for (i, r) in p.rows.iter().enumerate() {
+                    if i == 0 && cancel.is_empty() {
+                        continue;
+                    }
                     let f = p.hover_fade.get(i).copied().unwrap_or(0.0);
-                    let (label, fill, fg) = if i == 0 { ("Cancel", th.field, th.fg) } else { (ok.as_str(), th.close, Rgba(255, 255, 255, 255)) };
+                    let strong = if *primary { th.accent } else { th.close };
+                    let (label, fill, fg) = if i == 0 { (cancel.as_str(), th.field, th.fg) } else { (ok.as_str(), strong, Rgba(255, 255, 255, 255)) };
                     c.rrect(r.x, r.y, r.w, r.h, 10.0, fill.mix(Rgba(255, 255, 255, 255), 0.12 * f).with_alpha(a));
                     let tw = c.text_width(label, 13.0, Weight::SemiBold);
                     let ty = r.y + (r.h - c.line_height(13.0, Weight::SemiBold)) / 2.0;
                     c.text(label, r.x + (r.w - tw) / 2.0, ty, 13.0, Weight::SemiBold, fg.with_alpha(a), w);
                 }
             }
-            Content::Modal { title, note, items } => {
+            Content::Modal { title, note, items, done } => {
                 c.text(title, 22.0, 20.0, 17.0, Weight::SemiBold, th.fg.with_alpha(a), w - 22.0);
                 c.text(note, 22.0, 46.0, 12.0, Weight::Regular, th.dim.with_alpha(a), w - 22.0);
                 for (i, r) in p.rows.iter().enumerate() {
                     let y = r.y + dy;
                     let f = p.hover_fade.get(i).copied().unwrap_or(0.0);
                     if i == items.len() {
-                        // Done button, bottom right.
-                        let (bw, bh) = (88.0, 34.0);
-                        let (bx, by) = (w - 22.0 - bw, y + (r.h - bh) / 2.0);
+                        // The finishing button, bottom right (its row is just the button).
+                        let (bw, bh) = (r.w, 34.0);
+                        let (bx, by) = (r.x, y + (r.h - bh) / 2.0);
                         let col = if p.pressed == Some(i) { th.accent.mix(Rgba(0, 0, 0, 255), 0.15) } else { th.accent.mix(Rgba(255, 255, 255, 255), 0.12 * f) };
                         c.rrect(bx, by, bw, bh, 10.0, col.with_alpha(a));
-                        let tw = c.text_width("Done", 13.0, Weight::SemiBold);
+                        let tw = c.text_width(done, 13.0, Weight::SemiBold);
                         let ty = by + (bh - c.line_height(13.0, Weight::SemiBold)) / 2.0;
-                        c.text("Done", bx + (bw - tw) / 2.0, ty, 13.0, Weight::SemiBold, Rgba(255, 255, 255, 255).with_alpha(a), w);
+                        c.text(done, bx + (bw - tw) / 2.0, ty, 13.0, Weight::SemiBold, Rgba(255, 255, 255, 255).with_alpha(a), w);
                         continue;
                     }
                     if f > 0.0 {
@@ -1157,6 +1184,11 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
 }
 
 /// The 0..1 position of `x` along row `i` if it is a slider.
+/// Width of a dialog button for `label`: room for the text at 13px semibold, at least 92.
+fn button_w(label: &str) -> f32 {
+    (label.chars().count() as f32 * 7.6 + 32.0).max(92.0)
+}
+
 fn slide_at(rows: &[Row], i: usize, x: f32) -> Option<Pick> {
     let r = rows.get(i).filter(|r| r.slider)?;
     // The knob's centre travels between KNOB from either end of the track.
@@ -1254,6 +1286,8 @@ mod tests {
                 color_names: vec![String::new(); 8],
                 avatar_url: None,
                 can_delete,
+                cancel: "Cancel".into(),
+                save: "Save".into(),
             })
         };
         let (rows, h) = layout(&form(false));
@@ -1272,7 +1306,7 @@ mod tests {
         assert_eq!(hit(rows[1].x + rows[1].w + 2.0, rows[1].y + 5.0), None);
         let (rows, _) = layout(&form(true));
         assert!(rows[9].enabled);
-        let (rows, h) = layout(&Content::Confirm { title: "t".into(), note: "n".into(), ok: "Delete".into() });
+        let (rows, h) = layout(&Content::Confirm { title: "t".into(), note: "n".into(), ok: "Delete".into(), cancel: "Cancel".into(), primary: false });
         assert_eq!(rows.len(), 2);
         assert!((h - CONFIRM_H).abs() < 0.5);
     }
@@ -1306,6 +1340,8 @@ mod tests {
             pulse: 0.3,
             avatar_url: None,
             can_delete: true,
+            cancel: "Cancel".into(),
+            save: "Save".into(),
         };
         let cases = [
             ("popup-menu", 248.0, Kind::Menu, Content::Menu(vec![
@@ -1340,9 +1376,11 @@ mod tests {
                 title: "Site permissions".into(),
                 note: "On: sites may use it without asking again. Off: the request is blocked.".into(),
                 items: vec![toggle("Camera & video", "Websites may use your webcam", true), toggle("Microphone & audio", "Websites may use your microphone", false), toggle("Notifications", "Sites may send desktop notifications", true), toggle("Location", "Websites may read your location", false)],
+                done: "Done".into(),
             }),
+            ("popup-setup-google", FORM_W, Kind::Modal, Content::Confirm { title: "Link your Google account".into(), note: "Signed in as Ada Lovelace (ada@example.com)".into(), ok: "Continue".into(), cancel: "Back".into(), primary: true }),
             ("popup-persona", FORM_W, Kind::Modal, Content::Persona(persona)),
-            ("popup-confirm", FORM_W, Kind::Modal, Content::Confirm { title: "Delete persona?".into(), note: "“Work” and its bookmarks will be removed.".into(), ok: "Delete".into() }),
+            ("popup-confirm", FORM_W, Kind::Modal, Content::Confirm { title: "Delete persona?".into(), note: "“Work” and its bookmarks will be removed.".into(), ok: "Delete".into(), cancel: "Cancel".into(), primary: false }),
         ];
         for (name, w, kind, content) in cases {
             let (rows, h) = layout(&content);

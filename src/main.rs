@@ -6,6 +6,7 @@ mod favicons;
 mod anvil;
 mod gfx;
 mod history;
+mod home;
 mod input;
 mod pacer;
 mod popups;
@@ -25,7 +26,7 @@ use std::{
 };
 
 use gfx::{Brand, Icon, PersonaColor};
-use history::{HistoryEntry, HistoryStore};
+use history::HistoryStore;
 use popups::{Card, Content, Kind as PopupKind, MenuEntry, Pick, Popups, SuggestEntry};
 use tiny_skia::Pixmap;
 use toolbar::{BRAND_ICON, Toolbar};
@@ -50,7 +51,9 @@ const CHROME_HEIGHT: f64 = toolbar::HEIGHT as f64;
 const SPLITTER: f64 = 5.0;
 const DEVTOOLS_MIN: f64 = 280.0;
 
-const NEWTAB_HTML: &str = include_str!("ui/newtab.html");
+/// What a tab showing the native New Tab page loads behind it: next to nothing, so a fresh tab
+/// costs little until it goes somewhere.
+const BLANK_HTML: &str = "<!doctype html><meta charset=utf-8><title>New Tab</title>";
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
@@ -602,7 +605,6 @@ type Rgba = (u8, u8, u8, u8);
 
 enum UserEvent {
     Shortcut(Shortcut),
-    NewTab(TabId, NewTabCmd),
     PageMenu(TabId, ContextRequest),
     /// A key pressed in a page while a Persona dialog is open (the page had the keyboard focus).
     ModalKey(TabId, FormKey),
@@ -614,6 +616,8 @@ enum UserEvent {
     Favicon(TabId, String),
     /// A favicon was fetched and decoded (or failed to) for the tab strip.
     IconLoaded(String, Option<Pixmap>),
+    /// A wallpaper picked from a web address finished downloading.
+    BackgroundLoaded(String, Option<Pixmap>),
     OpenInNewTab(String),
     Suggestions(suggest::Response),
     DevtoolsTarget { tab: TabId, old_title: String, url: Option<String> },
@@ -675,63 +679,6 @@ enum ChromeCmd {
     TipEnd,
     /// Ctrl+Shift+T: reopen the tab closed last.
     ReopenTab,
-}
-
-/// Messages from the built-in New Tab page (accepted only while `tab.is_newtab` is true).
-#[derive(Debug, Deserialize)]
-#[serde(tag = "nt", rename_all = "snake_case")]
-enum NewTabCmd {
-    Ready,
-    Search { input: String },
-    DeleteHistory { id: u64 },
-    ClearHistory,
-    OpenBookmark { url: String },
-    DeleteBookmark { url: String },
-    SetBrand { brand: Brand },
-    SelectPersona { id: String },
-    CreatePersona {
-        name: String,
-        color: String,
-        #[serde(default)]
-        pfp: Option<String>,
-    },
-    UpdatePersona {
-        id: String,
-        name: String,
-        color: String,
-        #[serde(default)]
-        pfp: Option<String>,
-    },
-    DeletePersona { id: String },
-    SetPermissions {
-        camera: bool,
-        notifications: bool,
-        microphone: bool,
-        #[serde(default)]
-        geolocation: bool,
-    },
-    SetBackground {
-        #[serde(default)]
-        data: String,
-        #[serde(default)]
-        strip: String,
-    },
-    AutoKey { key: String },
-    /// The first-run setup screen was completed (or skipped).
-    FinishSetup,
-    /// The Settings button: open the native site-permissions dialog.
-    OpenSettings,
-    /// Setup: open Google's sign-in page for the active persona.
-    LinkGoogle,
-    /// Setup: look for the signed-in Google account again.
-    CheckGoogle,
-    /// The persona dropdown's New / Edit buttons: open the native persona editor.
-    EditPersona {
-        #[serde(default)]
-        id: Option<String>,
-    },
-    /// The persona dropdown's Delete button: ask natively first.
-    AskDeletePersona { id: String },
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -1525,6 +1472,10 @@ enum ModalKind {
     Settings,
     Persona,
     ConfirmDelete(String),
+    /// A message with only an OK button.
+    Notice,
+    /// The first-run setup, at this step: 0 name and color, 1 Google, 2 permissions, 3 done.
+    Setup(u8),
 }
 
 /// The persona editor's state. The dialog window takes the keyboard; key presses that land on
@@ -1662,44 +1613,6 @@ struct Tab {
     thumb: Option<Pixmap>,
 }
 
-static LOGO_DATA_URI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!("data:image/png;base64,{}", base64_encode(include_bytes!("ui/logo_64.png")))
-});
-
-#[derive(Serialize)]
-struct PersonaDto<'a> {
-    id: &'a str,
-    name: &'a str,
-    color: &'a str,
-    color_hex: String,
-    pfp: Option<&'a str>,
-    is_active: bool,
-    bookmark_count: usize,
-}
-
-#[derive(Serialize)]
-struct NewTabState<'a> {
-    brand: Brand,
-    personas: Vec<PersonaDto<'a>>,
-    active_persona_id: &'a str,
-    persona_name: &'a str,
-    persona_color: &'a str,
-    persona_color_hex: String,
-    persona_pfp: Option<&'a str>,
-    bookmarks: &'a [Bookmark],
-    history: &'a [HistoryEntry],
-    background: Option<&'a str>,
-    logo: &'a str,
-    can_create: bool,
-    can_delete: bool,
-    allow_camera: bool,
-    allow_notifications: bool,
-    allow_microphone: bool,
-    allow_geolocation: bool,
-    setup_done: bool,
-    google: Option<(&'a str, &'a str)>,
-}
-
 struct Devtools {
     view: Option<WebView>,
     open: bool,
@@ -1744,6 +1657,13 @@ struct Browser {
     menu_actions: Vec<Option<MenuAction>>,
     modal_kind: Option<ModalKind>,
     persona_form: Option<PersonaFormState>,
+    /// The New Tab page, drawn natively under the toolbar while a New Tab is active.
+    home: home::Home,
+    /// Which wallpaper `home` was given (the saved data URL), to decode it only when it changes.
+    home_bg_key: Option<String>,
+    /// Setup's current step, and whether it is waiting for a Google sign-in in a tab.
+    setup_step: u8,
+    setup_linking: bool,
     /// URLs of recently closed tabs, newest last (Ctrl+Shift+T).
     closed_tabs: Vec<String>,
     /// Submenus of the open menu's rows, and the actions of the open submenu's rows.
@@ -1923,8 +1843,6 @@ impl Browser {
                     let _ = p_ipc.send_event(UserEvent::ModalKey(id, k));
                 } else if let Some(s) = Shortcut::parse(body) {
                     let _ = p_ipc.send_event(UserEvent::Shortcut(s));
-                } else if let Ok(cmd) = serde_json::from_str::<NewTabCmd>(body) {
-                    let _ = p_ipc.send_event(UserEvent::NewTab(id, cmd));
                 } else if let Some(r) = ContextRequest::parse(body) {
                     let _ = p_ipc.send_event(UserEvent::PageMenu(id, r));
                 }
@@ -1936,7 +1854,7 @@ impl Browser {
         builder = match url {
             Some(u) => builder.with_url(u),
             // Paint the new-tab page's own color from the first frame, so it never flashes white.
-            None => builder.with_html(NEWTAB_HTML).with_background_color(bg),
+            None => builder.with_html(BLANK_HTML).with_background_color(bg),
         };
         let view = builder.build_as_child(&self.window)?;
 
@@ -2111,12 +2029,14 @@ impl Browser {
     fn show_active(&mut self) {
         let bounds = self.content_bounds();
         let is_newtab = if let Some(tab) = self.tabs.get(self.active) {
-            let _ = tab.view.set_memory_usage_level(MemoryUsageLevel::Normal);
             let _ = tab.view.set_bounds(bounds);
-            let _ = tab.view.set_visible(true);
             if tab.is_newtab {
-                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+                // The New Tab page is drawn natively in the window; its blank WebView stays hidden
+                // (and light) until the tab goes somewhere.
+                let _ = tab.view.set_visible(false);
             } else {
+                let _ = tab.view.set_memory_usage_level(MemoryUsageLevel::Normal);
+                let _ = tab.view.set_visible(true);
                 let _ = tab.view.focus();
             }
             let _ = self.thumbs_tx.send(thumbs::Request::Active(Some(tab.id)));
@@ -2130,8 +2050,10 @@ impl Browser {
         }
         self.sync_ui();
         if is_newtab {
+            self.refresh_home();
             self.focus_address();
         }
+        self.maybe_setup();
         if self.devtools.open {
             self.attach_devtools();
         }
@@ -2162,48 +2084,6 @@ impl Browser {
                 let _ = spare.view.focus_parent();
             }
             self.window.set_focus();
-        }
-    }
-
-    fn push_newtab_state(view: &WebView, prefs: &Prefs, history: &HistoryStore) {
-        let active = prefs.active_persona();
-        let color = active.parsed_color();
-        let personas = prefs
-            .personas
-            .iter()
-            .map(|p| PersonaDto {
-                id: &p.id,
-                name: &p.name,
-                color: &p.color,
-                color_hex: p.parsed_color().hex_string(),
-                pfp: p.pfp.as_deref(),
-                is_active: p.id == prefs.active_persona_id,
-                bookmark_count: p.bookmarks.len(),
-            })
-            .collect();
-        let state = NewTabState {
-            brand: prefs.brand(),
-            personas,
-            active_persona_id: &prefs.active_persona_id,
-            persona_name: &active.name,
-            persona_color: color.name(),
-            persona_color_hex: color.hex_string(),
-            persona_pfp: active.pfp.as_deref(),
-            bookmarks: prefs.active_bookmarks(),
-            history: history.entries(),
-            background: prefs.background(),
-            logo: LOGO_DATA_URI.as_str(),
-            can_create: prefs.personas.len() < 5,
-            can_delete: prefs.personas.len() > 1,
-            allow_camera: prefs.permissions.camera,
-            allow_notifications: prefs.permissions.notifications,
-            allow_microphone: prefs.permissions.microphone,
-            allow_geolocation: prefs.permissions.geolocation,
-            setup_done: prefs.setup_done,
-            google: prefs.google_hint.as_ref().map(|(n, e)| (n.as_str(), e.as_str())),
-        };
-        if let Ok(json) = serde_json::to_string(&state) {
-            let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
         }
     }
 
@@ -2243,9 +2123,6 @@ impl Browser {
                 _ => self.prefs.active_persona().pfp.clone().unwrap_or_default(),
             },
         };
-        if tab.is_newtab {
-            Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
-        }
         let title = if tab.title.is_empty() { &active_name } else { &tab.title };
         // Pre-release builds name themselves (PERSONA_BUILD=<git hash> at compile time), so the
         // running exe can be told apart from the taskbar or Alt+Tab.
@@ -2294,8 +2171,8 @@ impl Browser {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.is_newtab = false;
             let _ = tab.view.load_url(&resolved.url);
-            let _ = tab.view.focus();
         }
+        self.reveal_active_page();
         self.close_suggest();
         self.history.record(&resolved.query, &resolved.url, resolved.engine, resolved.is_search);
         self.sync_ui();
@@ -2314,7 +2191,12 @@ impl Browser {
 
     /// Gives keyboard focus back to the page after a menu closes.
     fn refocus_page(&self) {
-        self.with_active(|v| v.focus());
+        if self.home_active() {
+            // The New Tab page is part of the window; its blank WebView must not take the keys.
+            self.window.set_focus();
+        } else {
+            self.with_active(|v| v.focus());
+        }
     }
 
     fn close_menu(&mut self) {
@@ -2475,20 +2357,123 @@ impl Browser {
             return;
         };
         self.prefs.toggle_bookmark(&title, &url);
-        self.sync_all_newtabs();
+        self.refresh_home();
         self.sync_ui();
     }
 
-    fn sync_all_newtabs(&self) {
-        for tab in &self.tabs {
-            if tab.is_newtab {
-                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+    /// Hands the New Tab page what it shows (persona, bookmarks, wallpaper) and repaints it.
+    fn refresh_home(&mut self) {
+        let p = self.prefs.active_persona();
+        let avatar = p.pfp.clone().or_else(|| self.google.as_ref().map(|g| g.photo.clone()).filter(|u| !u.is_empty()));
+        let data = home::HomeData {
+            persona: p.name.clone(),
+            letter: p.badge_letter(),
+            has_bg: self.prefs.background().is_some(),
+            tiles: self.prefs.active_bookmarks().iter().map(|b| home::Tile { title: b.title.clone(), url: b.url.clone() }).collect(),
+            avatar,
+        };
+        self.home.set_theme(self.dark, self.prefs.active_color());
+        self.home.set_data(data);
+        if let Some(u) = self.home.wants_image() {
+            match self.popups.image(u) {
+                Some(img) => {
+                    let (u, img) = (u.to_owned(), img.clone());
+                    self.home.image_loaded(&u, Some(&img));
+                }
+                None => {
+                    let _ = self.icons_tx.send(u.to_owned());
+                }
             }
         }
-        if let Some(spare) = &self.spare
-            && spare.is_newtab
-        {
-            Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
+        let key = self.prefs.background().map(str::to_owned);
+        if key != self.home_bg_key {
+            self.home_bg_key = key.clone();
+            let pic = key.as_deref().and_then(decode_data_image);
+            if pic.is_none()
+                && let Some(url) = key.filter(|k| k.starts_with("http"))
+            {
+                // A wallpaper saved as a web address: fetch it once and keep a copy.
+                self.fetch_background(url);
+            }
+            self.home.set_background(pic.map(|p| fit_within(&p, 2560, 1600)));
+        }
+        self.window.request_redraw();
+    }
+
+    /// Shows the active tab's page after it left the New Tab page.
+    fn reveal_active_page(&mut self) {
+        let bounds = self.content_bounds();
+        if let Some(tab) = self.tabs.get(self.active) {
+            let _ = tab.view.set_bounds(bounds);
+            let _ = tab.view.set_memory_usage_level(MemoryUsageLevel::Normal);
+            let _ = tab.view.set_visible(true);
+            let _ = tab.view.focus();
+        }
+        self.window.request_redraw();
+    }
+
+    /// Whether the active tab shows the native New Tab page.
+    fn home_active(&self) -> bool {
+        !self.fullscreen && self.active_tab().is_some_and(|t| t.is_newtab)
+    }
+
+    fn fetch_background(&self, url: String) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let img = favicons::fetch_picture(&url);
+            let _ = proxy.send_event(UserEvent::BackgroundLoaded(url, img));
+        });
+    }
+
+    /// Saves `img` as the active persona's wallpaper (as a PNG data URL, with the blurred strip the
+    /// tab strip shows). `from` is the web address it came from, if it is the one currently saved.
+    fn set_background_picture(&mut self, img: &Pixmap, from: Option<&str>) {
+        if from.is_some() && self.prefs.background() != from {
+            return;
+        }
+        let img = fit_within(img, 1920, 1080);
+        let Ok(png) = img.encode_png() else { return };
+        let data = format!("data:image/png;base64,{}", base64_encode(&png));
+        let strip = strip_picture(&img).and_then(|p| p.encode_png().ok()).map(|b| format!("data:image/png;base64,{}", base64_encode(&b)));
+        self.apply_background(Some(data), strip.as_deref());
+    }
+
+    /// Background… on the New Tab page or in the persona menu: a native file dialog.
+    fn choose_background(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Choose a background")
+            .add_filter("Images", &["png", "jpg", "jpeg"])
+            .set_parent(&*self.window)
+            .pick_file();
+        let Some(path) = picked else { return };
+        let img = std::fs::read(&path).ok().and_then(|b| favicons::decode_picture(&b));
+        match img {
+            Some(img) => self.set_background_picture(&img, None),
+            None => self.show_notice("That picture could not be opened", "Choose a PNG or JPEG image."),
+        }
+    }
+
+    /// A short native message with an OK button.
+    fn show_notice(&mut self, title: &str, note: &str) {
+        self.modal_kind = Some(ModalKind::Notice);
+        self.show_modal(Content::Confirm { title: title.into(), note: note.into(), ok: "OK".into(), cancel: String::new(), primary: true }, popups::FORM_W, popups::CONFIRM_H);
+    }
+
+    fn home_cmd(&mut self, cmd: home::HomeCmd) {
+        use home::HomeCmd;
+        match cmd {
+            HomeCmd::FocusSearch => self.focus_address(),
+            HomeCmd::Open(url) => self.navigate_active(&url),
+            HomeCmd::DeleteBookmark(url) => {
+                if self.prefs.remove_bookmark(&url) {
+                    self.refresh_home();
+                    self.sync_ui();
+                }
+            }
+            HomeCmd::Settings => self.show_settings(),
+            HomeCmd::ChooseBackground => self.choose_background(),
+            HomeCmd::ClearBackground => self.apply_background(None, None),
+            HomeCmd::PersonaMenu { x, y } => self.theme_menu(x as f64, y as f64 + self.top_bar_height()),
         }
     }
 
@@ -2619,16 +2604,21 @@ impl Browser {
         self.allow_microphone.store(microphone, std::sync::atomic::Ordering::Relaxed);
         self.allow_geolocation.store(geolocation, std::sync::atomic::Ordering::Relaxed);
         self.prefs.set_permissions(camera, notifications, microphone, geolocation);
-        self.sync_all_newtabs();
+        self.refresh_home();
     }
 
     /// The site-permissions dialog, drawn by the ANVL engine in its own popup window.
     fn show_settings(&mut self) {
-        const W: f32 = 420.0;
+        self.modal_kind = Some(ModalKind::Settings);
+        let content = self.permissions_content("Site permissions", "Done");
+        self.show_modal(content, popups::MODAL_W, 74.0 + 4.0 * 56.0 + 62.0);
+    }
+
+    fn permissions_content(&self, title: &str, done: &str) -> Content {
         let item = |label: &str, desc: &str, on: bool| popups::ToggleEntry { label: label.into(), desc: desc.into(), on };
         let perms = &self.prefs.permissions;
-        let content = Content::Modal {
-            title: "Site permissions".into(),
+        Content::Modal {
+            title: title.into(),
             note: "On: allowed without asking. Off: blocked.".into(),
             items: vec![
                 item("Camera & video", "Websites may use your webcam", perms.camera),
@@ -2636,9 +2626,135 @@ impl Browser {
                 item("Notifications", "Sites may send desktop notifications", perms.notifications),
                 item("Location", "Websites may read your location", perms.geolocation),
             ],
-        };
-        self.modal_kind = Some(ModalKind::Settings);
-        self.show_modal(content, W, 74.0 + 4.0 * 56.0 + 62.0);
+            done: done.into(),
+        }
+    }
+
+    /// Flips one site permission (row `index` of the switches dialog).
+    fn toggle_permission(&mut self, index: usize) {
+        let p = &self.prefs.permissions;
+        let (mut cam, mut mic, mut notif, mut geo) = (p.camera, p.microphone, p.notifications, p.geolocation);
+        match index {
+            0 => cam = !cam,
+            1 => mic = !mic,
+            2 => notif = !notif,
+            3 => geo = !geo,
+            _ => return,
+        }
+        self.set_permissions(cam, notif, mic, geo);
+    }
+
+    // ---------- first-run setup (native, mandatory) ----------
+
+    /// Shows setup when it still has to run and nothing else is in the way: not while another
+    /// dialog is open, and not while the user is signing in to Google in a tab.
+    fn maybe_setup(&mut self) {
+        if self.prefs.setup_done || self.modal_kind.is_some() {
+            return;
+        }
+        if self.setup_linking {
+            if self.google.is_none() && !self.home_active() {
+                return;
+            }
+            self.setup_linking = false;
+            self.lock_chrome();
+        }
+        let step = if self.google.is_some() { self.setup_step.max(1) } else { self.setup_step.min(1) };
+        self.show_setup(step);
+    }
+
+    fn show_setup(&mut self, step: u8) {
+        self.setup_step = step;
+        self.modal_kind = Some(ModalKind::Setup(step));
+        match step {
+            0 => {
+                if self.persona_form.is_none() {
+                    let p = self.prefs.active_persona().clone();
+                    // The default name is a placeholder: start empty so a real one is typed.
+                    let name = if p.name == "Persona" { String::new() } else { p.name.clone() };
+                    let n = name.chars().count();
+                    self.persona_form = Some(PersonaFormState { editing: Some(p.id.clone()), name, ed: anvil_ui::Editor::at_end(n), choice: ColorChoice::from_color(p.parsed_color()), pulse: 0.8 });
+                }
+                self.show_persona_form();
+            }
+            1 => {
+                let (note, ok) = match &self.google {
+                    Some(g) => (format!("Signed in as {} ({}).", g.name, g.email), "Continue"),
+                    None => ("Required. Sign in opens a tab; setup returns by itself.".to_owned(), "Link Google"),
+                };
+                let content = Content::Confirm { title: "Link your Google account".into(), note, ok: ok.into(), cancel: "Back".into(), primary: true };
+                self.show_modal(content, popups::FORM_W, popups::CONFIRM_H);
+            }
+            2 => {
+                let content = self.permissions_content("Site permissions", "Continue");
+                self.show_modal(content, popups::MODAL_W, 74.0 + 4.0 * 56.0 + 62.0);
+            }
+            _ => {
+                let content = Content::Confirm {
+                    title: "You're all set".into(),
+                    note: "Your persona is ready. Start typing to search.".into(),
+                    ok: "Start browsing".into(),
+                    cancel: "Back".into(),
+                    primary: true,
+                };
+                self.show_modal(content, popups::FORM_W, popups::CONFIRM_H);
+            }
+        }
+    }
+
+    fn setup_pick(&mut self, step: u8, index: usize) {
+        match (step, index) {
+            (0, 11) => self.setup_save_persona(),
+            (0, _) => self.persona_pick(index),
+            (1, 0) => self.show_setup(0),
+            (1, _) if self.google.is_some() => self.show_setup(2),
+            (1, _) => {
+                // Sign in in a tab; setup comes back by itself once the account shows up.
+                self.setup_linking = true;
+                self.hide_modal();
+                self.lock_chrome();
+                let _ = self.open_tab(Some(GOOGLE_SIGN_IN_URL.into()), None, true);
+            }
+            (2, i) if i < 4 => {
+                self.toggle_permission(i);
+                self.show_setup(2);
+            }
+            (2, _) => self.show_setup(3),
+            (_, 0) => self.show_setup(2),
+            _ => {
+                self.prefs.finish_setup();
+                self.setup_step = 0;
+                self.hide_modal();
+                self.lock_chrome();
+                self.refresh_home();
+                if self.home_active() {
+                    self.focus_address();
+                }
+            }
+        }
+    }
+
+    /// Setup's first step: keep the name and color, then go on to Google.
+    fn setup_save_persona(&mut self) {
+        let Some(f) = &self.persona_form else { return };
+        if f.name.trim().is_empty() {
+            // A name is required: flare the preview instead of moving on.
+            if let Some(f) = self.persona_form.as_mut() {
+                f.pulse = 1.0;
+            }
+            self.show_persona_form();
+            return;
+        }
+        let Some(f) = self.persona_form.take() else { return };
+        let id = f.editing.clone().unwrap_or_else(|| self.prefs.active_id().to_string());
+        let color = f.choice.persona_color().to_key();
+        if self.prefs.update_persona(&id, f.name.trim(), &color, None) {
+            self.toolbar.set_persona_theme(self.dark, f.choice.persona_color(), &f.name.trim().chars().next().map_or("P".into(), |c| c.to_uppercase().to_string()));
+            self.popups.set_persona_theme(self.dark, f.choice.persona_color());
+            self.refresh_home();
+            self.sync_ui();
+        }
+        self.show_setup(1);
     }
 
     /// Opens a dialog centred over the window, on top of the blurred page.
@@ -2674,7 +2790,8 @@ impl Browser {
             Some(ModalKind::Settings) => self.show_settings(),
             Some(ModalKind::Persona) => self.show_persona_form(),
             Some(ModalKind::ConfirmDelete(id)) => self.ask_delete_persona(&id),
-            None => {}
+            Some(ModalKind::Setup(step)) => self.show_setup(step),
+            Some(ModalKind::Notice) | None => {}
         }
     }
 
@@ -2692,6 +2809,7 @@ impl Browser {
     }
 
     fn show_persona_form(&mut self) {
+        let setup = matches!(self.modal_kind, Some(ModalKind::Setup(_)));
         let Some(f) = self.persona_form.as_mut() else { return };
         let pulse = std::mem::take(&mut f.pulse);
         let Some(f) = &self.persona_form else { return };
@@ -2700,7 +2818,7 @@ impl Browser {
             .map(|c| gfx::Rgba::hex(u32::from_str_radix(c.hex_string().trim_start_matches('#'), 16).unwrap_or(0xff6a3d)))
             .collect();
         let form = popups::PersonaForm {
-            title: if f.editing.is_some() { "Edit persona".into() } else { "New persona".into() },
+            title: if setup { "Welcome to Persona".into() } else if f.editing.is_some() { "Edit persona".into() } else { "New persona".into() },
             name: f.name.clone(),
             caret: f.ed.caret,
             selected: match f.choice {
@@ -2714,7 +2832,9 @@ impl Browser {
             colors,
             color_names: PersonaColor::ALL.iter().map(|c| c.label().to_string()).collect(),
             avatar_url: self.persona_form_avatar(f),
-            can_delete: f.editing.is_some() && self.prefs.personas.len() > 1,
+            can_delete: !setup && f.editing.is_some() && self.prefs.personas.len() > 1,
+            cancel: if setup { String::new() } else { "Cancel".into() },
+            save: if setup { "Continue".into() } else { "Save".into() },
         };
         self.show_modal(Content::Persona(form), popups::FORM_W, popups::PERSONA_H);
     }
@@ -2751,7 +2871,7 @@ impl Browser {
         let Some(p) = self.prefs.personas.iter().find(|p| p.id == id) else { return };
         let note = format!("“{}” and its bookmarks will be removed.", p.name);
         self.modal_kind = Some(ModalKind::ConfirmDelete(id.to_owned()));
-        self.show_modal(Content::Confirm { title: "Delete persona?".into(), note, ok: "Delete".into() }, popups::FORM_W, popups::CONFIRM_H);
+        self.show_modal(Content::Confirm { title: "Delete persona?".into(), note, ok: "Delete".into(), cancel: "Cancel".into(), primary: false }, popups::FORM_W, popups::CONFIRM_H);
     }
 
     /// Typing goes to the main window while a popup dialog is open; make sure the page does not
@@ -2796,15 +2916,30 @@ impl Browser {
 
     /// Applies a key to the open dialog: Escape closes any dialog, the rest edit the persona name.
     fn form_key(&mut self, key: FormKey) {
+        let setup = match self.modal_kind {
+            Some(ModalKind::Setup(step)) => Some(step),
+            _ => None,
+        };
         if key == FormKey::Escape {
+            // Setup cannot be dismissed.
+            if setup.is_none() {
+                self.hide_modal();
+            }
+            return;
+        }
+        if matches!(self.modal_kind, Some(ModalKind::Notice)) && key == FormKey::Enter {
             self.hide_modal();
             return;
         }
-        if !matches!(self.modal_kind, Some(ModalKind::Persona)) {
+        if !self.form_open() {
             return;
         }
         if key == FormKey::Enter {
-            self.save_persona_form();
+            if setup.is_some() {
+                self.setup_save_persona();
+            } else {
+                self.save_persona_form();
+            }
             return;
         }
         let Some(f) = self.persona_form.as_mut() else { return };
@@ -2848,7 +2983,7 @@ impl Browser {
                     if id == self.prefs.active_persona_id {
                         self.set_persona(&id);
                     } else {
-                        self.sync_all_newtabs();
+                        self.refresh_home();
                         self.sync_ui();
                     }
                 }
@@ -2877,7 +3012,9 @@ impl Browser {
     /// The chrome takes no input (except the window buttons) while setup runs or a dialog is open.
     fn lock_chrome(&mut self) {
         let modal = self.modal_kind.is_some();
-        self.toolbar.set_locked(modal || !self.prefs.setup_done, modal);
+        // While setup waits for a Google sign-in in a tab, that tab has to be usable.
+        let setup = !self.prefs.setup_done && !self.setup_linking;
+        self.toolbar.set_locked(modal || setup, modal);
         self.window.request_redraw();
     }
 
@@ -2901,7 +3038,8 @@ impl Browser {
             (wry::dpi::Position::Logical(p), wry::dpi::Size::Logical(s)) => (p.x as f32, p.y as f32 - top, s.width as f32, s.height as f32),
             _ => (0.0, 0.0, px.width as f32 / scale, area_h / scale),
         };
-        if let Some(thumb) = self.tabs.get(self.active).and_then(|t| t.thumb.as_ref()) {
+        let home = self.home_active().then_some(&self.home.frame).filter(|f| f.width() > 1);
+        if let Some(thumb) = home.or_else(|| self.tabs.get(self.active).and_then(|t| t.thumb.as_ref())) {
             let q = scale / 4.0; // logical px -> picture px
             let k = (cw * q / thumb.width() as f32).max(ch * q / thumb.height() as f32);
             let tw = thumb.width() as f32 * k;
@@ -2940,14 +3078,10 @@ impl Browser {
         let active_id = self.prefs.active_id().to_string();
         self.prefs.set_background(&active_id, data, strip_png);
         self.toolbar.set_background(self.prefs.bg_strip());
-        self.sync_all_newtabs();
+        self.refresh_home();
         self.sync_ui();
     }
 
-    fn choose_background(&mut self) {
-        let js = "document.dispatchEvent(new CustomEvent('cederic:act', { detail: { cmd: 'pick_bg' } }))";
-        self.with_active(|v| v.evaluate_script(js));
-    }
 
     /// Reads which Google account is signed in to the active persona's profile. Loads Google's
     /// account list in a hidden, throwaway WebView of that profile and reads the page text back
@@ -3031,8 +3165,11 @@ impl Browser {
                 }
             }
             self.google = account;
-            self.sync_all_newtabs();
+            self.refresh_home();
             self.sync_ui();
+            if self.setup_linking && self.google.is_some() {
+                self.maybe_setup();
+            }
         }
         if std::mem::take(&mut self.probe_again) {
             self.schedule_account_probe(Duration::from_millis(500));
@@ -3114,7 +3251,7 @@ impl Browser {
             self.reopen_tabs_in_profile();
             self.schedule_account_probe(Duration::from_millis(800));
         }
-        self.sync_all_newtabs();
+        self.refresh_home();
         self.sync_ui();
         self.redraw();
     }
@@ -3257,7 +3394,7 @@ impl Browser {
             MenuAction::ToggleBookmark => self.toggle_bookmark(),
             MenuAction::DeleteBookmark(url) => {
                 if self.prefs.remove_bookmark(&url) {
-                    self.sync_all_newtabs();
+                    self.refresh_home();
                     self.sync_ui();
                 }
             }
@@ -3270,11 +3407,9 @@ impl Browser {
             }
             MenuAction::ChooseBackground => self.choose_background(),
             MenuAction::SetBackgroundUrl(url) => {
-                self.apply_background(Some(url.clone()), None);
-                if let Ok(u) = serde_json::to_string(&url) {
-                    let js = format!("document.dispatchEvent(new CustomEvent('cederic:act', {{ detail: {{ cmd: 'apply_bg', url: {u} }} }}))");
-                    self.with_active(|v| v.evaluate_script(&js));
-                }
+                // Remember the address now (it shows at once wherever it loads) and keep a copy
+                // once it has downloaded.
+                self.apply_background(Some(url), None);
             }
             MenuAction::ClearBackground => self.apply_background(None, None),
             MenuAction::ToggleFullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
@@ -3506,7 +3641,7 @@ impl Browser {
             ChromeCmd::FocusChrome => {
                 self.ensure_chrome_focus();
             }
-            ChromeCmd::FocusPage => self.with_active(|v| v.focus()),
+            ChromeCmd::FocusPage => self.refocus_page(),
             ChromeCmd::MoveTab { id, to } => self.move_tab(id, to),
             ChromeCmd::TabMenu { id, x, y } => self.tab_menu(id, x, y),
             ChromeCmd::HistoryMenu { x, y } => self.history_menu(x, y),
@@ -3564,7 +3699,7 @@ impl Browser {
     fn handle_pick(&mut self, pick: Pick) {
         match pick {
             Pick::Slide(index, frac) => {
-                if matches!(self.modal_kind, Some(ModalKind::Persona))
+                if self.form_open()
                     && let Some(f) = self.persona_form.as_mut()
                 {
                     // Dragging a slider turns the choice into a custom color, starting from what was shown.
@@ -3613,38 +3748,15 @@ impl Browser {
             }
             Pick::Modal(index) => match &self.modal_kind {
                 Some(ModalKind::Persona) => match index {
-                    1..=8 => {
-                        if let Some(f) = self.persona_form.as_mut() {
-                            f.choice = ColorChoice::Preset(index - 1);
-                            f.pulse = 1.0;
-                        }
-                        self.preview_persona_color();
-                        self.show_persona_form();
-                    }
-                    14 => {
-                        // Shuffle: a random hue with a lively vibrancy.
-                        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |d| d.subsec_nanos());
-                        let hue = (n % 1000) as f32 / 1000.0;
-                        let sat = 0.55 + ((n / 1000) % 40) as f32 / 100.0;
-                        if let Some(f) = self.persona_form.as_mut() {
-                            f.choice = ColorChoice::Custom { hue, sat };
-                            f.pulse = 1.0;
-                        }
-                        self.preview_persona_color();
-                        self.show_persona_form();
-                    }
-                    9 => {
-                        let id = self.persona_form.as_ref().and_then(|f| f.editing.clone());
-                        if let Some(id) = id {
-                            self.persona_form = None;
-                            self.restore_chrome_theme();
-                            self.ask_delete_persona(&id);
-                        }
-                    }
                     10 => self.hide_modal(),
                     11 => self.save_persona_form(),
-                    _ => {}
+                    _ => self.persona_pick(index),
                 },
+                Some(ModalKind::Setup(step)) => {
+                    let step = *step;
+                    self.setup_pick(step, index);
+                }
+                Some(ModalKind::Notice) => self.hide_modal(),
                 Some(ModalKind::ConfirmDelete(id)) => {
                     let id = id.clone();
                     self.hide_modal();
@@ -3653,21 +3765,12 @@ impl Browser {
                         self.set_persona(&active_id);
                     }
                 }
-                _ => {
-                    let p = &self.prefs.permissions;
-                    let (mut cam, mut mic, mut notif, mut geo) = (p.camera, p.microphone, p.notifications, p.geolocation);
-                    match index {
-                        0 => cam = !cam,
-                        1 => mic = !mic,
-                        2 => notif = !notif,
-                        3 => geo = !geo,
-                        _ => {
-                            self.hide_modal();
-                            self.refocus_page();
-                            return;
-                        }
+                Some(ModalKind::Settings) | None => {
+                    if index >= 4 {
+                        self.hide_modal();
+                        return;
                     }
-                    self.set_permissions(cam, notif, mic, geo);
+                    self.toggle_permission(index);
                     self.show_settings();
                 }
             },
@@ -3678,6 +3781,45 @@ impl Browser {
                 }
             }
         }
+    }
+
+    /// A click in the persona editor (also setup's first step) on a color or the shuffle button.
+    fn persona_pick(&mut self, index: usize) {
+        match index {
+            1..=8 => {
+                if let Some(f) = self.persona_form.as_mut() {
+                    f.choice = ColorChoice::Preset(index - 1);
+                    f.pulse = 1.0;
+                }
+            }
+            14 => {
+                // Shuffle: a random hue with a lively vibrancy.
+                let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |d| d.subsec_nanos());
+                let hue = (n % 1000) as f32 / 1000.0;
+                let sat = 0.55 + ((n / 1000) % 40) as f32 / 100.0;
+                if let Some(f) = self.persona_form.as_mut() {
+                    f.choice = ColorChoice::Custom { hue, sat };
+                    f.pulse = 1.0;
+                }
+            }
+            9 if matches!(self.modal_kind, Some(ModalKind::Persona)) => {
+                let id = self.persona_form.as_ref().and_then(|f| f.editing.clone());
+                if let Some(id) = id {
+                    self.persona_form = None;
+                    self.restore_chrome_theme();
+                    self.ask_delete_persona(&id);
+                }
+                return;
+            }
+            _ => return,
+        }
+        self.preview_persona_color();
+        self.show_persona_form();
+    }
+
+    /// The persona editor is open (on its own or as setup's first step).
+    fn form_open(&self) -> bool {
+        matches!(self.modal_kind, Some(ModalKind::Persona | ModalKind::Setup(0))) && self.popups.is_open(PopupKind::Modal)
     }
 
     fn handle_shortcut(&mut self, s: Shortcut) {
@@ -3725,110 +3867,6 @@ impl Browser {
         }
     }
 
-    fn handle_newtab(&mut self, id: TabId, cmd: NewTabCmd) {
-        if let NewTabCmd::SetBackground { data, strip } = cmd {
-            let d = (!data.trim().is_empty()).then_some(data);
-            let s = (!strip.trim().is_empty()).then_some(strip);
-            self.apply_background(d, s.as_deref());
-            return;
-        }
-        if let Some(spare) = &self.spare
-            && spare.id == id
-        {
-            if matches!(cmd, NewTabCmd::Ready) {
-                Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
-            }
-            return;
-        }
-        let Some(i) = self.index_of(id) else { return };
-        if !self.tabs[i].is_newtab {
-            return;
-        }
-        match cmd {
-            NewTabCmd::Ready => {
-                Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history);
-                self.ensure_chrome_focus();
-            }
-            NewTabCmd::AutoKey { .. } if self.modal_kind.is_some() => {}
-            NewTabCmd::AutoKey { key } => {
-                if i != self.active {
-                    self.switch_to(i);
-                }
-                self.toolbar.auto_key(&key);
-                self.ensure_chrome_focus();
-                self.window.request_redraw();
-            }
-            NewTabCmd::Search { input } => {
-                if i != self.active {
-                    self.switch_to(i);
-                }
-                self.navigate_active(&input);
-            }
-            NewTabCmd::DeleteHistory { id: entry_id } => {
-                if self.history.remove(entry_id) {
-                    self.sync_all_newtabs();
-                    self.sync_ui();
-                }
-            }
-            NewTabCmd::ClearHistory => self.handle_chrome(ChromeCmd::ClearHistory),
-            NewTabCmd::OpenBookmark { url } => {
-                if i != self.active {
-                    self.switch_to(i);
-                }
-                self.navigate_active(&url);
-            }
-            NewTabCmd::DeleteBookmark { url } => {
-                if self.prefs.remove_bookmark(&url) {
-                    self.sync_all_newtabs();
-                    self.sync_ui();
-                }
-            }
-            NewTabCmd::SelectPersona { id } => self.set_persona(&id),
-            NewTabCmd::CreatePersona { name, color, pfp } => {
-                if let Ok(nid) = self.prefs.create_persona(&name, &color, pfp) {
-                    self.set_persona(&nid);
-                }
-            }
-            NewTabCmd::UpdatePersona { id, name, color, pfp } => {
-                if self.prefs.update_persona(&id, &name, &color, Some(pfp)) {
-                    if id == self.prefs.active_persona_id {
-                        self.set_persona(&id);
-                    } else {
-                        self.sync_all_newtabs();
-                        self.sync_ui();
-                    }
-                }
-            }
-            NewTabCmd::DeletePersona { id } => {
-                if self.prefs.delete_persona(&id).is_ok() {
-                    let active_id = self.prefs.active_id().to_string();
-                    self.set_persona(&active_id);
-                }
-            }
-            NewTabCmd::SetPermissions { camera, notifications, microphone, geolocation } => {
-                self.set_permissions(camera, notifications, microphone, geolocation);
-            }
-            NewTabCmd::SetBrand { brand } => self.set_brand(brand),
-            NewTabCmd::SetBackground { .. } => {}
-            NewTabCmd::OpenSettings => self.show_settings(),
-            NewTabCmd::LinkGoogle => {
-                let _ = self.open_tab(Some(GOOGLE_SIGN_IN_URL.into()), None, true);
-            }
-            NewTabCmd::CheckGoogle => self.schedule_account_probe(Duration::from_millis(100)),
-            NewTabCmd::EditPersona { id } => self.open_persona_editor(id.as_deref()),
-            NewTabCmd::AskDeletePersona { id } => self.ask_delete_persona(&id),
-            NewTabCmd::FinishSetup => {
-                // Setup is mandatory: it only finishes once a Google account is linked.
-                if self.google.is_none() {
-                    return;
-                }
-                self.prefs.finish_setup();
-                self.lock_chrome();
-                self.sync_all_newtabs();
-            }
-        }
-    }
-
     fn with_active(&self, f: impl FnOnce(&WebView) -> wry::Result<()>) {
         if let Some(t) = self.active_tab() {
             let _ = f(&t.view);
@@ -3838,7 +3876,6 @@ impl Browser {
     fn handle(&mut self, ev: UserEvent) {
         match ev {
             UserEvent::Shortcut(s) => self.handle_shortcut(s),
-            UserEvent::NewTab(id, cmd) => self.handle_newtab(id, cmd),
             UserEvent::PageMenu(id, r) => self.page_menu(id, r),
             UserEvent::ModalKey(id, key) => {
                 // Only the visible page, and only while a dialog is open.
@@ -3846,7 +3883,13 @@ impl Browser {
                     self.form_key(key);
                 }
             }
+            UserEvent::BackgroundLoaded(url, img) => {
+                if let Some(img) = img {
+                    self.set_background_picture(&img, Some(&url));
+                }
+            }
             UserEvent::IconLoaded(url, img) => {
+                self.home.image_loaded(&url, img.as_ref());
                 self.popups.image_loaded(url.clone(), img.clone());
                 self.toolbar.icon_loaded(url, img);
                 self.window.request_redraw();
@@ -3904,6 +3947,9 @@ impl Browser {
                 if let Some(i) = self.index_of(id) {
                     self.tabs[i].is_newtab = false;
                     let _ = self.tabs[i].view.load_url(&https_url);
+                    if i == self.active {
+                        self.reveal_active_page();
+                    }
                 }
                 self.sync_ui();
             }
@@ -3997,9 +4043,13 @@ impl Browser {
                 tab.loading = started;
                 tab.can_back = tab.view.can_go_back().unwrap_or(false);
                 tab.can_forward = tab.view.can_go_forward().unwrap_or(false);
-                if !url.is_empty() && !url.starts_with("about:") && !url.starts_with("data:") {
+                if tab.is_newtab && !url.is_empty() && !url.starts_with("about:") && !url.starts_with("data:") {
                     tab.is_newtab = false;
+                    if i == self.active {
+                        self.reveal_active_page();
+                    }
                 }
+                let tab = &mut self.tabs[i];
                 if started && tab.newtab_bg && url.starts_with("http") {
                     tab.newtab_bg = false;
                     let _ = tab.view.set_background_color((255, 255, 255, 255));
@@ -4056,7 +4106,7 @@ impl Browser {
                     self.modal_key(key);
                 }
                 WindowEvent::ReceivedImeText(text) => {
-                    if matches!(self.modal_kind, Some(ModalKind::Persona)) && self.popups.is_open(PopupKind::Modal) {
+                    if self.form_open() {
                         self.form_key(FormKey::Text(text.chars().filter(|c| !c.is_control()).collect()));
                     }
                 }
@@ -4106,6 +4156,7 @@ impl Browser {
                 let letter = self.prefs.active_badge_letter();
                 self.toolbar.set_persona_theme(self.dark, color, &letter);
                 self.popups.set_persona_theme(self.dark, color);
+                self.home.set_theme(self.dark, color);
                 let bg = self.newtab_color();
                 for tab in &self.tabs {
                     if tab.newtab_bg {
@@ -4134,10 +4185,18 @@ impl Browser {
                 } else {
                     self.toolbar.mouse_left();
                     self.on_cursor(p.x, p.y);
+                    if self.home_active() && !self.devtools.hover && !self.devtools.dragging {
+                        let icon = self.home.mouse_move(p.x as f32, (p.y - self.top_bar_height()) as f32);
+                        self.set_cursor(icon);
+                        if self.home.is_dirty() {
+                            self.window.request_redraw();
+                        }
+                    }
                 }
             }
             WindowEvent::CursorLeft { .. } => {
                 self.toolbar.mouse_left();
+                self.home.mouse_left();
                 self.window.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -4147,6 +4206,17 @@ impl Browser {
                         ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
                         ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => {
                             self.toolbar.mouse_up(button, x, y)
+                        }
+                        _ if button == MouseButton::Left && self.home_active() && !self.devtools.hover && self.modal_kind.is_none() => {
+                            let hy = y - self.top_bar_height() as f32;
+                            let cmd = if state == ElementState::Pressed { self.home.mouse_down(x, hy) } else { self.home.mouse_up(x, hy) };
+                            if cmd.is_none() && state == ElementState::Pressed && self.toolbar.is_editing() {
+                                // A click on the page outside the search box ends address editing.
+                                self.toolbar.blur_address();
+                            }
+                            if let Some(cmd) = cmd {
+                                self.home_cmd(cmd);
+                            }
                         }
                         _ => {}
                     }
@@ -4159,12 +4229,20 @@ impl Browser {
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => {
                 if !self.modal_key(&event) {
+                    // Typing on the New Tab page starts a search in the address bar.
+                    let typing = event.state == ElementState::Pressed
+                        && !self.mods.control_key()
+                        && !self.mods.alt_key()
+                        && event.text.is_some_and(|t| !t.chars().all(char::is_control));
+                    if typing && self.home_active() && !self.toolbar.is_editing() {
+                        self.focus_address();
+                    }
                     self.toolbar.key(&event, self.mods);
                 }
                 self.window.request_redraw();
             }
             WindowEvent::ReceivedImeText(text) => {
-                if matches!(self.modal_kind, Some(ModalKind::Persona)) && self.popups.is_open(PopupKind::Modal) {
+                if self.form_open() {
                     self.form_key(FormKey::Text(text.chars().filter(|c| !c.is_control()).collect()));
                 } else {
                     self.toolbar.ime(&text);
@@ -4222,6 +4300,8 @@ impl Browser {
             }
             self.surface_size = (w_u32, h_u32);
         }
+        let home = self.home_active();
+        let mut home_painted = false;
         let Ok(mut buf) = self.surface.buffer_mut() else { return };
         let width = w.get() as usize;
         let bar_px = width * bar_h as usize;
@@ -4229,6 +4309,26 @@ impl Browser {
             *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
         }
         let mut damage = vec![softbuffer::Rect { x: 0, y: 0, width: w, height: NonZeroU32::new(bar_h).unwrap_or(h) }];
+        if home && h.get() > bar_h {
+            // The New Tab page: drawn by ANVL only when it changed, copied in every frame.
+            let page_w = if dt > 0.0 { logical_w - dt - SPLITTER } else { logical_w };
+            let page_h = (h.get() - bar_h) as f64 / scale;
+            self.home.set_size(scale as f32, page_w.max(1.0) as f32, page_h as f32);
+            home_painted = self.home.render();
+            let pm = &self.home.frame;
+            let (pw, ph) = ((pm.width() as usize).min(width), (pm.height() as usize).min(h.get() as usize - bar_h as usize));
+            let data = pm.data();
+            for row in 0..ph {
+                let src = &data[row * pm.width() as usize * 4..][..pw * 4];
+                let dst = &mut buf[(bar_h as usize + row) * width..][..pw];
+                for (d, p) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                    *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+                }
+            }
+            if let (Some(gw), Some(gh)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) {
+                damage.push(softbuffer::Rect { x: 0, y: bar_h, width: gw, height: gh });
+            }
+        }
         if dt > 0.0 {
             // The bare strip between page and DevTools is the splitter.
             let x0 = ((logical_w - dt - SPLITTER) * scale).floor().max(0.0) as u32;
@@ -4243,7 +4343,44 @@ impl Browser {
             }
         }
         let _ = buf.present_with_damage(&damage);
+        if home_painted && self.popups.is_open(PopupKind::Scrim) {
+            // The blur behind a dialog shows the New Tab page as it looks now.
+            self.show_scrim(false);
+        }
     }
+}
+
+/// Decodes a `data:image/…;base64,` URL (PNG or JPEG).
+fn decode_data_image(url: &str) -> Option<Pixmap> {
+    let (meta, data) = url.strip_prefix("data:image/")?.split_once(',')?;
+    if !meta.ends_with(";base64") {
+        return None;
+    }
+    favicons::decode_picture(&favicons::base64_decode(data)?)
+}
+
+/// `img` scaled down (never up) to fit within `max_w` x `max_h`.
+fn fit_within(img: &Pixmap, max_w: u32, max_h: u32) -> Pixmap {
+    let k = (max_w as f32 / img.width() as f32).min(max_h as f32 / img.height() as f32);
+    if k >= 1.0 {
+        return img.clone();
+    }
+    let (w, h) = (((img.width() as f32 * k).round() as u32).max(1), ((img.height() as f32 * k).round() as u32).max(1));
+    let Some(mut out) = Pixmap::new(w, h) else { return img.clone() };
+    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
+    out.draw_pixmap(0, 0, img.as_ref(), &paint, tiny_skia::Transform::from_scale(k, k), None);
+    out
+}
+
+/// The blurred band of a wallpaper the tab strip shows: 640x84, cover-fitted, from the upper part.
+fn strip_picture(img: &Pixmap) -> Option<Pixmap> {
+    let (sw, sh) = (640.0, 84.0);
+    let mut out = Pixmap::new(sw as u32, sh as u32)?;
+    let k = (sw / img.width() as f32).max(sh / img.height() as f32);
+    let (dw, dh) = (img.width() as f32 * k, img.height() as f32 * k);
+    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+    out.draw_pixmap(0, 0, img.as_ref(), &paint, tiny_skia::Transform::from_row(k, 0.0, 0.0, k, (sw - dw) / 2.0, (sh - dh) * 0.2), None);
+    Some(anvil::blur_pixmap(&out, 2))
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
@@ -4399,6 +4536,7 @@ fn main() -> wry::Result<()> {
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
+    let home = home::Home::new(engine.clone(), dark, color);
     let mut popups = Popups::new(&event_loop, &window, dark, brand, engine);
     popups.set_persona_theme(dark, color);
 
@@ -4458,6 +4596,10 @@ fn main() -> wry::Result<()> {
         menu_actions: Vec::new(),
         modal_kind: None,
         persona_form: None,
+        home,
+        home_bg_key: None,
+        setup_step: 0,
+        setup_linking: false,
         closed_tabs: Vec::new(),
         menu_subs: Vec::new(),
         sub_actions: Vec::new(),

@@ -66,7 +66,7 @@ Note that building replaces `target/release/Persona.exe`, so any running Persona
 | `src/devtools.rs` | Finds tabs on the loopback DevTools port for the docked DevTools pane |
 | `src/thumbs.rs` | Tab snapshots for hover cards, over the same DevTools port |
 | `src/history.rs`, `src/crypto.rs` | Search history, encrypted on disk |
-| `src/ui/newtab.html` | New-tab page, including the first-run setup screen (`#setup`, shown while `setup_done` is false) |
+| `src/home.rs` | The New Tab page, drawn natively by ANVL into the window under the toolbar (`Home`, `HomeCmd`); first-run setup is a native dialog sequence (`ModalKind::Setup`) |
 
 ## Native UI: the ANVL SDK
 
