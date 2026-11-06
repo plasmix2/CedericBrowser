@@ -22,6 +22,8 @@ use crate::gfx::{Icon, Rgba};
 pub enum Weight {
     Regular,
     SemiBold,
+    /// Fixed-width (Fira Mono): code, logs, the DevTools.
+    Mono,
 }
 
 impl Weight {
@@ -29,6 +31,7 @@ impl Weight {
         match self {
             Weight::Regular => 400,
             Weight::SemiBold => 600,
+            Weight::Mono => 500,
         }
     }
 }
@@ -150,6 +153,9 @@ impl Engine {
 fn style(size: f32, weight: Weight, c: Color) -> TextStyle {
     let mut s = TextStyle::new(size, c);
     s.weight = weight.css();
+    if weight == Weight::Mono {
+        s.role = anvil_ui::text::FontRole::Mono;
+    }
     s
 }
 
@@ -461,11 +467,11 @@ struct IconDef {
     grid: f32,
 }
 
-const ALL_ICONS: [Icon; 36] = [
+const ALL_ICONS: [Icon; 37] = [
     Icon::Back, Icon::Forward, Icon::Reload, Icon::Stop, Icon::Close, Icon::Plus, Icon::Lock, Icon::Info,
     Icon::Search, Icon::Globe, Icon::Star, Icon::StarFilled, Icon::Bookmarks, Icon::Pip, Icon::History,
     Icon::Code, Icon::WinMin, Icon::WinMax, Icon::WinRestore, Icon::WinClose,
-    Icon::ExternalLink, Icon::Copy, Icon::Link, Icon::Photo, Icon::Printer, Icon::Maximize, Icon::UserCircle, Icon::Users, Icon::Settings, Icon::ChevronRight, Icon::Check, Icon::Logout, Icon::ShieldLock, Icon::Trash, Icon::Sparkles, Icon::Menu,
+    Icon::ExternalLink, Icon::Copy, Icon::Link, Icon::Photo, Icon::Printer, Icon::Maximize, Icon::UserCircle, Icon::Users, Icon::Settings, Icon::ChevronRight, Icon::Check, Icon::Logout, Icon::ShieldLock, Icon::Trash, Icon::Sparkles, Icon::Menu, Icon::Leaf,
 ];
 
 fn icon_def(icon: Icon) -> &'static IconDef {

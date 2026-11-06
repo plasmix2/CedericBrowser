@@ -63,7 +63,8 @@ Note that building replaces `target/release/Persona.exe`, so any running Persona
 | `src/favicons.rs` | Fetches and decodes tab favicons (PNG/ICO) for the native tab strip |
 | `src/input.rs` | Address-bar input → URL or search; HTTPS upgrades; search-query extraction |
 | `src/suggest.rs` | Search suggestions, fetched on a background thread |
-| `src/devtools.rs` | Finds tabs on the loopback DevTools port for the docked DevTools pane |
+| `src/devtools.rs` | Finds a tab's page target on the loopback debugging port (`find_page`) |
+| `src/inspector.rs` | Persona's own DevTools: a protocol worker hooked onto the page (console, network, DOM) and the ANVL `Panel` (Elements / Console / Network) drawn beside the page |
 | `src/thumbs.rs` | Tab snapshots for hover cards, over the same DevTools port |
 | `src/history.rs`, `src/crypto.rs` | Search history, encrypted on disk |
 | `src/home.rs` | The New Tab page, drawn natively by ANVL into the window under the toolbar (`Home`, `HomeCmd`); first-run setup is a native dialog sequence (`ModalKind::Setup`) |

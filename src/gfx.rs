@@ -460,6 +460,7 @@ pub enum Icon {
     Trash,
     Sparkles,
     Menu,
+    Leaf,
 }
 
 /// HSL (all 0..1) to a color.

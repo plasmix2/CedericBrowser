@@ -7,6 +7,7 @@ mod anvil;
 mod gfx;
 mod history;
 mod home;
+mod inspector;
 mod input;
 mod pacer;
 mod popups;
@@ -294,42 +295,29 @@ const SHORTCUT_SCRIPT: &str = r#"
     if (cmd) { e.preventDefault(); e.stopPropagation(); post(cmd); }
   }, true);
   // Popups never take focus, so a click or focus inside the page is what closes an open menu / address bar edit.
-  window.addEventListener('pointerdown', () => post('dismiss'), true);
-  window.addEventListener('focusin', () => post('dismiss'), true);
-    if (cmd) { e.preventDefault(); e.stopPropagation(); window.ipc.postMessage(cmd); return; }
-    if (!e.ctrlKey && !e.altKey && !e.metaKey && (location.protocol === 'about:' || location.protocol === 'data:')) {
-      const a = document.activeElement;
-      const inField = a && a.closest && a.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])');
-      if (!inField && (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Enter')) {
-        e.preventDefault(); e.stopPropagation();
-        window.ipc.postMessage(JSON.stringify({ nt: 'auto_key', key: e.key }));
-      }
-    }
-  }, true);
-  // Popups never take focus, so a click in the page is what closes an open menu.
   window.addEventListener('pointerdown', (e) => {
     const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
     if (a && a.href) preconnect(a.href);
-    window.ipc.postMessage('dismiss');
+    post('dismiss');
   }, true);
+  window.addEventListener('focusin', () => post('dismiss'), true);
 
   // Bubble phase: pages with their own context menu call preventDefault first and keep it.
-  // Editable fields keep the engine's menu so cut/paste/spellcheck work.
+  // Everything else gets Persona's menu (the engine's own menus are turned off), text fields too.
   window.addEventListener('contextmenu', (e) => {
     if (e.defaultPrevented) return;
     const t = e.target instanceof Element ? e.target : null;
-    if (t && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
+    const field = t && t.closest('input, textarea, [contenteditable]:not([contenteditable="false"])');
     e.preventDefault();
     const a = t && t.closest('a[href]'), img = t && t.closest('img');
-    ctxVideo = videoAt(e.clientX, e.clientY) || bestVideo(false);
-    post(JSON.stringify({
     ctxVideo = videoAt(e.clientX, e.clientY) || (document.querySelector('video') && bestVideo(false)) || null;
-    window.ipc.postMessage(JSON.stringify({
+    post(JSON.stringify({
       x: e.clientX, y: e.clientY, dpr: window.devicePixelRatio,
       link: a ? a.href : '', image: img ? (img.currentSrc || img.src) : '',
       selection: String(getSelection()).slice(0, 20000),
       video: !!ctxVideo,
       pip: !!document.pictureInPictureElement,
+      editable: !!field,
     }));
   });
 
@@ -347,72 +335,10 @@ const SHORTCUT_SCRIPT: &str = r#"
     }
   }, true);
 
-  const sendBg = (rawUrl, keepRaw) => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      let data = rawUrl;
-      if (!keepRaw) {
-        try {
-          const maxW = 1920, maxH = 1080;
-          let w = img.naturalWidth || 1920, h = img.naturalHeight || 1080;
-          const r = Math.min(1, maxW / w, maxH / h);
-          w = Math.max(1, Math.round(w * r));
-          h = Math.max(1, Math.round(h * r));
-          const c = document.createElement('canvas');
-          c.width = w; c.height = h;
-          c.getContext('2d').drawImage(img, 0, 0, w, h);
-          data = c.toDataURL('image/jpeg', 0.88);
-        } catch (_) {}
-      }
-      let strip = '';
-      try {
-        const sc = document.createElement('canvas');
-        sc.width = 640; sc.height = 84;
-        const sx = sc.getContext('2d');
-        const iw = img.naturalWidth || img.width || 640;
-        const ih = img.naturalHeight || img.height || 360;
-        const scale = Math.max(sc.width / iw, sc.height / ih);
-        const dw = iw * scale, dh = ih * scale;
-        sx.filter = 'blur(3px)';
-        sx.drawImage(img, (sc.width - dw) / 2, (sc.height - dh) * 0.2, dw, dh);
-        strip = sc.toDataURL('image/png');
-      } catch (_) {}
-      post(JSON.stringify({ nt: 'set_background', data, strip }));
-    };
-    img.onerror = () => {
-      if (rawUrl) post(JSON.stringify({ nt: 'set_background', data: rawUrl, strip: '' }));
-    };
-    img.src = rawUrl;
-  };
-  const openBgPicker = () => {
-    const existing = document.getElementById('bg-file');
-    if (existing) { existing.click(); return; }
-    const inp = document.createElement('input');
-    inp.type = 'file';
-    inp.accept = 'image/*';
-    inp.style.display = 'none';
-    inp.onchange = () => {
-      const f = inp.files && inp.files[0];
-      if (f && f.type.startsWith('image/')) {
-        const reader = new FileReader();
-        const keepGif = f.type === 'image/gif' && f.size <= 4 * 1024 * 1024;
-        reader.onload = () => {
-          if (typeof reader.result === 'string') sendBg(reader.result, keepGif);
-        };
-        reader.readAsDataURL(f);
-      }
-      inp.remove();
-    };
-    (document.body || document.documentElement).appendChild(inp);
-    inp.click();
-  };
   document.addEventListener('cederic:act', (e) => {
     const d = e.detail;
     if (!d) return;
     if (d.cmd === 'pip') togglePip(!!d.preferCtx);
-    else if (d.cmd === 'pick_bg') openBgPicker();
-    else if (d.cmd === 'apply_bg' && d.url) sendBg(d.url, false);
   });
 
   if (location.hostname === 'www.youtube.com' || location.hostname === 'm.youtube.com') {
@@ -582,12 +508,35 @@ const BRAND_SCRIPT: &str = r#"
 "#;
 
 /// DevTools pane: only the toggle shortcut is accepted.
-const DEVTOOLS_SCRIPT: &str = r#"
-window.addEventListener('keydown', (e) => {
-  if (e.key === 'F12' || ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'i')) {
-    e.preventDefault(); window.ipc.postMessage('devtools');
-  }
-}, true);
+/// Persona's scrollbars on every page (and frame): a slim rounded thumb that takes the persona's
+/// color on hover and while dragged, no arrow buttons, no track. Pages that style their own
+/// scrollbars keep theirs (their rules come later). `ACCENT` is replaced with the persona color;
+/// `window.__personaScrollbars(color)` changes it later.
+const SCROLLBAR_SCRIPT: &str = r#"
+(() => {
+  if (window.__personaScrollbars) return;
+  const css = (c) => `
+::-webkit-scrollbar { width: 12px; height: 12px; background: transparent; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+::-webkit-scrollbar-thumb { background-color: rgba(128, 128, 128, 0.42); border: 3px solid transparent; border-radius: 999px; background-clip: padding-box; min-height: 36px; min-width: 36px; }
+::-webkit-scrollbar-thumb:hover, ::-webkit-scrollbar-thumb:active { background-color: ${c}; }
+`;
+  let el = null;
+  let color = 'ACCENT';
+  const put = (c) => {
+    if (c) color = c;
+    const root = document.head || document.documentElement;
+    if (!root) return;
+    if (!el) { el = document.createElement('style'); el.id = '__persona_scrollbars'; }
+    el.textContent = css(color);
+    if (el.parentNode !== root) root.appendChild(el);
+  };
+  window.__personaScrollbars = put;
+  if (document.documentElement) put();
+  else new MutationObserver((_, o) => { if (document.documentElement) { o.disconnect(); put(); } }).observe(document, { childList: true });
+  document.addEventListener('DOMContentLoaded', () => put(), { once: true });
+})();
 "#;
 
 /// Finds the page's favicon; runs in the content page after it loads. The tab strip can decode
@@ -619,7 +568,9 @@ enum UserEvent {
     IconLoaded(String, Option<Pixmap>),
     OpenInNewTab(String),
     Suggestions(suggest::Response),
-    DevtoolsTarget { tab: TabId, old_title: String, url: Option<String> },
+    DevtoolsTarget { tab: TabId, old_title: String, target: Option<(u16, String)> },
+    /// What the DevTools worker saw on the page.
+    Inspector(inspector::Ev),
     /// Every few seconds: free idle GPU buffers, unload idle background tabs.
     Housekeep,
     /// Frame tick from the pacer while the UI animates.
@@ -743,6 +694,9 @@ struct ContextRequest {
     video: bool,
     #[serde(default)]
     pip: bool,
+    /// Right-clicked in a text field: offer cut / copy / paste / select all.
+    #[serde(default)]
+    editable: bool,
 }
 
 impl ContextRequest {
@@ -790,6 +744,11 @@ enum MenuAction {
     OpenManagePersonas,
     OpenNewTab,
     ReopenTab,
+    Cut(String),
+    Paste,
+    SelectAll,
+    ToggleMemorySaver,
+    SleepTabs,
     Pip,
     Devtools,
     ToggleFullscreen,
@@ -981,6 +940,9 @@ struct PrefsData {
     /// setup screen existed; those users already have personas and are treated as set up.
     #[serde(default)]
     setup_done: Option<bool>,
+    /// Memory saver: unload background tabs much sooner (`Browser::housekeep`).
+    #[serde(default)]
+    memory_saver: Option<bool>,
     /// Which version of the setup screen was completed. Raising `SETUP_VERSION` makes everyone,
     /// including profiles with saved data, go through setup once more.
     #[serde(default)]
@@ -997,6 +959,7 @@ struct Prefs {
     personas: Vec<PersonaProfile>,
     permissions: SitePermissions,
     setup_done: bool,
+    memory_saver: bool,
     /// The linked Google account's (name, email) for the setup screen; not saved.
     google_hint: Option<(String, String)>,
     bg_cache: HashMap<String, Option<String>>,
@@ -1086,6 +1049,7 @@ impl Prefs {
             personas,
             permissions,
             setup_done,
+            memory_saver: data.memory_saver.unwrap_or(false),
             google_hint: None,
             bg_cache,
             strip_cache,
@@ -1213,6 +1177,7 @@ impl Prefs {
             permissions: Some(self.permissions.clone()),
             setup_done: Some(self.setup_done),
             setup_version: self.setup_done.then_some(SETUP_VERSION),
+            memory_saver: Some(self.memory_saver),
         };
         if let Ok(json) = serde_json::to_string_pretty(&data) {
             let tmp = self.path.with_extension("json.tmp");
@@ -1651,11 +1616,6 @@ impl Page {
     fn clear_all_browsing_data(&self) -> wry::Result<()> {
         self.on(|v| v.clear_all_browsing_data())
     }
-    fn open_devtools(&self) {
-        if let Some(v) = &self.0 {
-            v.open_devtools();
-        }
-    }
 }
 
 struct Tab {
@@ -1678,7 +1638,9 @@ struct Tab {
 }
 
 struct Devtools {
-    view: Option<WebView>,
+    /// Persona's own DevTools panel (ANVL), and the worker that talks to the page.
+    panel: inspector::Panel,
+    tx: Sender<inspector::Cmd>,
     open: bool,
     width: f64,
     tab: Option<TabId>,
@@ -1782,7 +1744,7 @@ impl Browser {
     }
 
     fn devtools_width(&self) -> f64 {
-        if self.fullscreen || !self.devtools.open || self.devtools.view.is_none() {
+        if self.fullscreen || !self.devtools.open {
             return 0.0;
         }
         let w = self.logical_size().width;
@@ -1795,13 +1757,6 @@ impl Browser {
         let dt = self.devtools_width();
         let w = if dt > 0.0 { size.width - dt - SPLITTER } else { size.width };
         rect(0.0, top, w.max(0.0), (size.height - top).max(0.0))
-    }
-
-    fn devtools_bounds(&self) -> Rect {
-        let size = self.logical_size();
-        let top = self.top_bar_height();
-        let dt = self.devtools_width();
-        rect(size.width - dt, top, dt, (size.height - top).max(0.0))
     }
 
     fn newtab_color(&self) -> Rgba {
@@ -1867,8 +1822,11 @@ impl Browser {
             ))
             .with_initialization_script(SHORTCUT_SCRIPT)
             .with_initialization_script(BRAND_SCRIPT)
+            .with_initialization_script(SCROLLBAR_SCRIPT.replace("ACCENT", &persona_color_hex))
             .with_additional_browser_args(BROWSER_ARGS)
             .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
+            // No Edge menus: right-clicks get Persona's own menu (SHORTCUT_SCRIPT, `page_menu`).
+            .with_default_context_menus(false)
             .with_devtools(true)
             .with_hotkeys_zoom(true)
             .with_general_autofill_enabled(false)
@@ -1978,13 +1936,19 @@ impl Browser {
     fn housekeep(&mut self) {
         // Nothing drawn for a while: let the GPU engine drop its frame buffers. The next frame
         // makes the one it needs again in a few milliseconds.
-        if self.last_paint.elapsed() >= Duration::from_secs(5)
+        let saver = self.prefs.memory_saver;
+        if self.last_paint.elapsed() >= Duration::from_secs(if saver { 2 } else { 5 })
             && let Some(e) = &self.engine
         {
             e.trim(0);
         }
-        const IDLE: Duration = Duration::from_secs(5 * 60);
-        const MAX_LIVE: usize = 4;
+        // Memory saver: a background tab sleeps after a minute, and only one stays awake.
+        let (idle, max_live) = if saver { (Duration::from_secs(60), 1) } else { (Duration::from_secs(5 * 60), 4) };
+        self.unload_idle(idle, max_live);
+    }
+
+    /// Unloads background tabs unseen for `idle`, and the oldest beyond `max_live` loaded ones.
+    fn unload_idle(&mut self, idle: Duration, max_live: usize) {
         let now = Instant::now();
         if let Some(t) = self.tabs.get_mut(self.active) {
             t.last_seen = now;
@@ -2007,9 +1971,9 @@ impl Browser {
             .collect();
         // Oldest first: the idle ones, then any beyond the live budget.
         live.sort_by_key(|&(_, seen)| seen);
-        let over = live.len().saturating_sub(MAX_LIVE);
+        let over = live.len().saturating_sub(max_live);
         for (k, (i, seen)) in live.into_iter().enumerate() {
-            if k < over || now.duration_since(seen) >= IDLE {
+            if k < over || now.duration_since(seen) >= idle {
                 self.unload_tab(i);
             }
         }
@@ -2293,11 +2257,6 @@ impl Browser {
             } else if tab.pip {
                 let _ = tab.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             }
-        }
-        if let Some(v) = &self.devtools.view
-            && self.devtools.open
-        {
-            let _ = v.set_bounds(self.devtools_bounds());
         }
     }
 
@@ -2642,8 +2601,35 @@ impl Browser {
         items.push(MenuItem::new("Print…", MenuAction::Print).hint("Ctrl+P").icon(Icon::Printer).enabled(page));
         items.push(MenuItem::new(if self.devtools.open { "Close developer tools" } else { "Developer tools" }, MenuAction::Devtools).hint("F12").icon(Icon::Code));
         items.push(MenuItem::sep());
+        let mut memory = MenuItem::submenu("Memory", self.memory_items()).icon(Icon::Leaf);
+        if self.prefs.memory_saver {
+            memory.hint = Some("Saver on".into());
+        }
+        items.push(memory);
         items.push(MenuItem::new("Site permissions…", MenuAction::OpenSettings).icon(Icon::ShieldLock));
         self.show_menu(items, (right - 248.0).max(0.0), y);
+    }
+
+    /// The Memory submenu: the memory saver mode, how many tabs are loaded, and sleeping them now.
+    fn memory_items(&self) -> Vec<MenuItem> {
+        let n = self.tabs.len();
+        let loaded = self.tabs.iter().filter(|t| t.view.get().is_some()).count();
+        let saver = self.prefs.memory_saver;
+        let mut toggle = MenuItem::new("Memory saver", MenuAction::ToggleMemorySaver).hint(if saver { "On" } else { "Off" });
+        if saver {
+            toggle = toggle.icon(Icon::Check);
+        }
+        vec![
+            toggle,
+            MenuItem::new(
+                if saver { "Background tabs sleep after 1 minute" } else { "Background tabs sleep after 5 minutes" },
+                MenuAction::ToggleMemorySaver,
+            )
+            .enabled(false),
+            MenuItem::sep(),
+            MenuItem::new(format!("{loaded} of {n} tabs loaded"), MenuAction::SleepTabs).enabled(false),
+            MenuItem::new("Sleep background tabs now", MenuAction::SleepTabs).icon(Icon::Leaf).enabled(loaded > 1),
+        ]
     }
 
     /// Theme & persona dropdown under the palette button: switch between personas, create new,
@@ -3331,12 +3317,13 @@ impl Browser {
 
         self.toolbar.set_persona_theme(self.dark, color, &letter);
         self.popups.set_persona_theme(self.dark, color);
+        self.devtools.panel.set_theme(self.dark, color);
 
         let bg = self.newtab_color();
         let brand_key = if color == PersonaColor::Slate { "uzaki" } else { "cederic" };
         let js = format!(
-            "window.__cedericBrand = {:?}; window.__cedericBrandName = {:?}; window.__cedericBrandColor = {:?}; window.__cedericSetBrand && window.__cedericSetBrand({:?});",
-            brand_key, persona.name, color.hex_string(), brand_key
+            "window.__cedericBrand = {:?}; window.__cedericBrandName = {:?}; window.__cedericBrandColor = {:?}; window.__cedericSetBrand && window.__cedericSetBrand({:?}); window.__personaScrollbars && window.__personaScrollbars({:?});",
+            brand_key, persona.name, color.hex_string(), brand_key, color.hex_string()
         );
         for tab in &mut self.tabs {
             if tab.newtab_bg {
@@ -3396,6 +3383,22 @@ impl Browser {
             items.push(MenuItem::sep());
         }
         let sel = r.selection.trim();
+        if r.editable {
+            // Text fields: the usual editing commands (the engine's own menu is off).
+            let has = !sel.is_empty();
+            items.push(MenuItem::new("Cut", MenuAction::Cut(sel.to_owned())).hint("Ctrl+X").enabled(has));
+            items.push(MenuItem::new("Copy", MenuAction::Copy(sel.to_owned())).hint("Ctrl+C").icon(Icon::Copy).enabled(has));
+            items.push(MenuItem::new("Paste", MenuAction::Paste).hint("Ctrl+V"));
+            items.push(MenuItem::new("Select all", MenuAction::SelectAll).hint("Ctrl+A"));
+            let short: String = sel.chars().take(24).collect();
+            if has {
+                items.push(MenuItem::new(format!("Search for “{short}”"), MenuAction::SearchFor(sel.to_owned())).icon(Icon::Search));
+            }
+            let zoom = r.dpr / self.window.scale_factor();
+            let top = self.top_bar_height();
+            self.show_menu(items, r.x * zoom, top + r.y * zoom);
+            return;
+        }
         if !sel.is_empty() {
             let short: String = sel.chars().take(24).collect();
             let ell = if sel.chars().count() > 24 { "…" } else { "" };
@@ -3457,6 +3460,32 @@ impl Browser {
             MenuAction::OpenBackground(url) => {
                 let _ = self.open_tab(Some(url), Some(self.active + 1), false);
             }
+            MenuAction::Cut(text) => {
+                self.run_menu_action(MenuAction::Copy(text));
+                self.with_active(|v| v.evaluate_script("document.execCommand('delete')"));
+            }
+            MenuAction::Paste => {
+                if self.clipboard.is_none() {
+                    self.clipboard = arboard::Clipboard::new().ok();
+                }
+                let text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()).unwrap_or_default();
+                if let Ok(js) = serde_json::to_string(&text) {
+                    self.with_active(|v| v.evaluate_script(&format!("document.execCommand('insertText', false, {js})")));
+                }
+            }
+            MenuAction::ToggleMemorySaver => {
+                self.prefs.memory_saver = !self.prefs.memory_saver;
+                self.prefs.save();
+                self.housekeep();
+            }
+            MenuAction::SleepTabs => {
+                // Everything in the background that can sleep, now (video, PiP and loading tabs stay).
+                self.unload_idle(Duration::ZERO, 0);
+                if let Some(e) = &self.engine {
+                    e.trim(0);
+                }
+            }
+            MenuAction::SelectAll => self.with_active(|v| v.evaluate_script("document.execCommand('selectAll')")),
             MenuAction::Copy(text) => {
                 if self.clipboard.is_none() {
                     self.clipboard = arboard::Clipboard::new().ok();
@@ -3619,16 +3648,17 @@ impl Browser {
     fn toggle_devtools(&mut self) {
         self.devtools.open = !self.devtools.open;
         if self.devtools.open {
+            self.devtools.panel.reset("Connecting…");
             self.attach_devtools();
+            self.layout();
         } else {
-            if let Some(v) = &self.devtools.view {
-                let _ = v.set_visible(false);
-                let _ = v.load_url("about:blank");
-            }
+            let _ = self.devtools.tx.send(inspector::Cmd::Detach);
+            self.devtools.panel.release();
             self.devtools.tab = None;
             self.layout();
         }
         self.sync_ui();
+        self.window.request_redraw();
     }
 
     /// Points the DevTools pane at the active tab. The tab is found in the engine's target list
@@ -3638,6 +3668,14 @@ impl Browser {
         if self.devtools.tab == Some(id) {
             return;
         }
+        let _ = self.devtools.tx.send(inspector::Cmd::Detach);
+        self.devtools.tab = Some(id);
+        if self.active_tab().is_some_and(|t| t.view.get().is_none()) {
+            self.devtools.panel.reset("Open a page to inspect it.");
+            self.window.request_redraw();
+            return;
+        }
+        self.devtools.panel.reset("Connecting…");
         self.devtools.seq += 1;
         let marker = format!("{}cederic-{}-{}", devtools::MARKER, id, self.devtools.seq);
         let Ok(marker_js) = serde_json::to_string(&marker) else { return };
@@ -3648,13 +3686,13 @@ impl Browser {
         let _ = tab.view.evaluate_script_with_callback(&js, move |old_title| {
             let (dir, marker, proxy, page_url) = (dir.clone(), marker.clone(), proxy.clone(), page_url.clone());
             std::thread::spawn(move || {
-                let url = devtools::frontend_url(&dir, &marker, &page_url);
-                let _ = proxy.send_event(UserEvent::DevtoolsTarget { tab: id, old_title, url });
+                let target = devtools::find_page(&dir, &marker, &page_url);
+                let _ = proxy.send_event(UserEvent::DevtoolsTarget { tab: id, old_title, target });
             });
         });
     }
 
-    fn devtools_target(&mut self, tab_id: TabId, old_title: String, url: Option<String>) {
+    fn devtools_target(&mut self, tab_id: TabId, old_title: String, target: Option<(u16, String)>) {
         if let (Some(i), Ok(title)) = (self.index_of(tab_id), serde_json::from_str::<String>(&old_title))
             && let Ok(js) = serde_json::to_string(&title)
         {
@@ -3663,41 +3701,34 @@ impl Browser {
         if !self.devtools.open || self.active_tab().map(|t| t.id) != Some(tab_id) {
             return;
         }
-        let Some(url) = url else {
-            // Docking failed (e.g. the port is unavailable): fall back to the engine's window.
-            self.devtools.open = false;
-            if let Some(t) = self.active_tab() {
-                t.view.open_devtools();
+        match target {
+            Some((port, target)) => {
+                let _ = self.devtools.tx.send(inspector::Cmd::Attach { port, target });
             }
-            self.sync_ui();
-            return;
-        };
-        self.devtools.tab = Some(tab_id);
-        match &self.devtools.view {
-            Some(v) => {
-                let _ = v.load_url(&url);
-                let _ = v.set_visible(true);
-            }
-            None => {
-                let proxy = self.proxy.clone();
-                self.devtools.view = WebViewBuilder::new_with_web_context(&mut self.context)
-                    .with_bounds(rect(0.0, 0.0, 0.0, 0.0))
-                    .with_url(&url)
-                    .with_background_color(if self.dark { (36, 36, 36, 255) } else { (255, 255, 255, 255) })
-                    .with_initialization_script(DEVTOOLS_SCRIPT)
-                    .with_additional_browser_args(BROWSER_ARGS)
-                    .with_user_agent(USER_AGENT)
-                    .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
-                    .with_ipc_handler(move |req| {
-                        if req.body() == "devtools" {
-                            let _ = proxy.send_event(UserEvent::Shortcut(Shortcut::Devtools));
-                        }
-                    })
-                    .build_as_child(&self.window)
-                    .ok();
-            }
+            None => self.devtools.panel.reset("Could not connect to this page."),
         }
-        self.layout();
+        self.window.request_redraw();
+    }
+
+    /// The point in DevTools panel coordinates, when it is over the open panel.
+    fn in_panel(&self, x: f64, y: f64) -> Option<(f32, f32)> {
+        let dt = self.devtools_width();
+        let top = self.top_bar_height();
+        let edge = self.logical_size().width - dt;
+        (dt > 0.0 && x >= edge && y >= top).then(|| ((x - edge) as f32, (y - top) as f32))
+    }
+
+    fn panel_cmd(&mut self, cmd: Option<inspector::PanelCmd>) {
+        match cmd {
+            Some(inspector::PanelCmd::Close) => self.toggle_devtools(),
+            Some(inspector::PanelCmd::Send(c)) => {
+                let _ = self.devtools.tx.send(c);
+            }
+            None => {}
+        }
+        if self.devtools.panel.is_dirty() {
+            self.window.request_redraw();
+        }
     }
 
     /// Splitter between page and DevTools, handled on the bare window between the two WebViews.
@@ -4075,7 +4106,13 @@ impl Browser {
                     self.set_suggestions(res.items);
                 }
             }
-            UserEvent::DevtoolsTarget { tab, old_title, url } => self.devtools_target(tab, old_title, url),
+            UserEvent::DevtoolsTarget { tab, old_title, target } => self.devtools_target(tab, old_title, target),
+            UserEvent::Inspector(ev) => {
+                if self.devtools.open {
+                    self.devtools.panel.event(ev);
+                    self.window.request_redraw();
+                }
+            }
             UserEvent::Title(id, title) => {
                 // Our own temporary DevTools marker title; the real title is restored right after.
                 if title.contains(devtools::MARKER) {
@@ -4244,6 +4281,7 @@ impl Browser {
                 self.toolbar.set_persona_theme(self.dark, color, &letter);
                 self.popups.set_persona_theme(self.dark, color);
                 self.home.set_theme(self.dark, color);
+                self.devtools.panel.set_theme(self.dark, color);
                 let bg = self.newtab_color();
                 for tab in &self.tabs {
                     if tab.newtab_bg {
@@ -4299,7 +4337,21 @@ impl Browser {
         } else {
             self.toolbar.mouse_left();
             self.on_cursor(x, y);
-            if self.home_active() && !self.devtools.hover && !self.devtools.dragging {
+            if let Some((px, py)) = self.in_panel(x, y) {
+                if !self.devtools.hover && !self.devtools.dragging {
+                    let (icon, cmd) = self.devtools.panel.mouse_move(px, py);
+                    self.set_cursor(icon);
+                    self.panel_cmd(cmd);
+                }
+            } else if self.devtools.open
+                && let Some(cmd) = self.devtools.panel.mouse_left()
+            {
+                self.panel_cmd(Some(cmd));
+            }
+            if self.devtools.panel.is_dirty() && self.devtools.open {
+                self.window.request_redraw();
+            }
+            if self.home_active() && !self.devtools.hover && !self.devtools.dragging && self.in_panel(x, y).is_none() {
                 let icon = self.home.mouse_move(x as f32, (y - self.top_bar_height()) as f32);
                 self.set_cursor(icon);
                 if self.home.is_dirty() {
@@ -4317,10 +4369,25 @@ impl Browser {
         match state {
             ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
             ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_up(button, x, y),
+            ElementState::Pressed if button == MouseButton::Left && !self.devtools.hover && self.in_panel(x as f64, y as f64).is_some() => {
+                let (px, py) = self.in_panel(x as f64, y as f64).unwrap_or_default();
+                self.close_menu();
+                let cmd = self.devtools.panel.click(px, py);
+                if self.devtools.panel.typing {
+                    // The console prompt takes the keyboard: away from the page, to this window.
+                    self.toolbar.blur_address();
+                    for t in &self.tabs {
+                        let _ = t.view.focus_parent();
+                    }
+                    self.window.set_focus();
+                }
+                self.panel_cmd(cmd);
+            }
             _ if button == MouseButton::Left && self.home_active() && !self.devtools.hover && self.modal_kind.is_none() => {
                 let hy = y - self.top_bar_height() as f32;
                 let cmd = if state == ElementState::Pressed { self.home.mouse_down(x, hy) } else { self.home.mouse_up(x, hy) };
                 if state == ElementState::Pressed {
+                    self.devtools.panel.typing = false;
                     // A click on the page closes any open dropdown.
                     self.close_menu();
                     if cmd.is_none() && self.toolbar.is_editing() {
@@ -4343,6 +4410,26 @@ impl Browser {
     fn handle_window_rest(&mut self, event: WindowEvent) {
         match event {
             WindowEvent::ModifiersChanged(m) => self.mods = m,
+            WindowEvent::KeyboardInput { event, .. } if self.devtools.open && self.devtools.panel.typing && event.logical_key != Key::F12 => {
+                let cmd = self.devtools.panel.key(&event, self.mods);
+                self.panel_cmd(cmd);
+                self.window.request_redraw();
+            }
+            WindowEvent::ReceivedImeText(text) if self.devtools.open && self.devtools.panel.typing => {
+                self.devtools.panel.ime(&text);
+                self.window.request_redraw();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.in_panel(self.mouse.0, self.mouse.1).is_some() {
+                    let dy = match delta {
+                        tao::event::MouseScrollDelta::LineDelta(_, y) => y * 60.0,
+                        tao::event::MouseScrollDelta::PixelDelta(p) => (p.y / self.window.scale_factor()) as f32,
+                        _ => 0.0,
+                    };
+                    self.devtools.panel.wheel(dy);
+                    self.window.request_redraw();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if !self.modal_key(&event) {
                     // Typing on the New Tab page starts a search in the address bar.
@@ -4465,6 +4552,25 @@ impl Browser {
             }
             if let (Some(gw), Some(gh)) = (NonZeroU32::new(gap), NonZeroU32::new(h.get() - bar_h)) {
                 damage.push(softbuffer::Rect { x: x0, y: bar_h, width: gw, height: gh });
+            }
+            // Persona's DevTools panel, drawn by ANVL, right of the splitter.
+            let px0 = (((logical_w - dt) * scale).round() as usize).min(width);
+            let page_h = (h.get() - bar_h) as f64 / scale;
+            let panel = &mut self.devtools.panel;
+            panel.set_size(scale as f32, dt as f32, page_h as f32);
+            panel.render();
+            let pm = &panel.frame;
+            let (pw, ph) = ((pm.width() as usize).min(width - px0), (pm.height() as usize).min(h.get() as usize - bar_h as usize));
+            let data = pm.data();
+            for row in 0..ph {
+                let src = &data[row * pm.width() as usize * 4..][..pw * 4];
+                let dst = &mut buf[(bar_h as usize + row) * width + px0..][..pw];
+                for (d, p) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                    *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+                }
+            }
+            if let (Some(gw), Some(gh)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) {
+                damage.push(softbuffer::Rect { x: px0 as u32, y: bar_h, width: gw, height: gh });
             }
         }
         let _ = buf.present_with_damage(&damage);
@@ -4613,6 +4719,11 @@ fn main() -> wry::Result<()> {
 
     let home = home::Home::new(engine.clone(), dark, color);
     let gpu = engine.clone();
+    let gpu_panel = engine.clone();
+    let p_inspect = proxy.clone();
+    let inspector_tx = inspector::spawn(move |ev| {
+        let _ = p_inspect.send_event(UserEvent::Inspector(ev));
+    });
     let mut popups = Popups::new(&event_loop, &window, dark, brand, engine);
     popups.set_persona_theme(dark, color);
 
@@ -4695,7 +4806,16 @@ fn main() -> wry::Result<()> {
         suggest_query: String::new(),
         suggest_anchor: (0.0, 0.0, 0.0),
         suggestions: Vec::new(),
-        devtools: Devtools { view: None, open: false, width: 520.0, tab: None, dragging: false, hover: false, seq: 0 },
+        devtools: Devtools {
+            panel: inspector::Panel::new(gpu_panel, dark, color),
+            tx: inspector_tx,
+            open: false,
+            width: 520.0,
+            tab: None,
+            dragging: false,
+            hover: false,
+            seq: 0,
+        },
         clipboard: None,
         fullscreen: false,
         html_fullscreen: false,
@@ -4808,6 +4928,32 @@ mod tests {
         assert!(!again.setup_done);
         again.finish_setup();
         assert!(Prefs::open(&dir).setup_done);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every script injected into pages must parse: a syntax error anywhere drops the whole script
+    /// (a bad merge once took out the custom context menu, page shortcuts and dialog typing).
+    /// Checked with Node when it is installed (it is on GitHub's Windows runners).
+    #[test]
+    fn page_scripts_are_valid_javascript() {
+        let Ok(out) = std::process::Command::new("node").arg("--version").output() else { return };
+        if !out.status.success() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("persona-js-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, js) in [
+            ("stealth", STEALTH_SCRIPT.to_owned()),
+            ("shortcut", SHORTCUT_SCRIPT.to_owned()),
+            ("brand", BRAND_SCRIPT.to_owned()),
+            ("scrollbar", SCROLLBAR_SCRIPT.replace("ACCENT", "#ff6a3d")),
+            ("favicon", FAVICON_SCRIPT.to_owned()),
+        ] {
+            let path = dir.join(format!("{name}.js"));
+            std::fs::write(&path, js).unwrap();
+            let r = std::process::Command::new("node").arg("--check").arg(&path).output().unwrap();
+            assert!(r.status.success(), "{name}: {}", String::from_utf8_lossy(&r.stderr));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
