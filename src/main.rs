@@ -1482,11 +1482,10 @@ impl Browser {
     }
 
     fn newtab_color(&self) -> Rgba {
-        let (strip, toolbar, _) = self.prefs.active_color().surface_tints(self.dark);
         if self.dark {
-            (strip.0, strip.1, strip.2, 255)
+            (14, 16, 21, 255)
         } else {
-            (toolbar.0, toolbar.1, toolbar.2, 255)
+            (247, 248, 250, 255)
         }
     }
 
@@ -1526,6 +1525,7 @@ impl Browser {
             .with_hotkeys_zoom(true)
             .with_general_autofill_enabled(false)
             .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
+            .with_background_color(bg)
             .with_permission_handler(move |kind| match kind {
                 PermissionKind::Camera | PermissionKind::DisplayCapture => {
                     if cam.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1595,7 +1595,7 @@ impl Browser {
         builder = match url {
             Some(u) => builder.with_url(u),
             // Paint the new-tab page's own color from the first frame, so it never flashes white.
-            None => builder.with_html(NEWTAB_HTML).with_background_color(bg),
+            None => builder.with_html(NEWTAB_HTML),
         };
         let view = builder.build_as_child(&self.window)?;
 
@@ -1739,7 +1739,9 @@ impl Browser {
                 let _ = t.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             } else {
                 let _ = t.view.set_visible(false);
-                let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
+                if !t.is_newtab {
+                    let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
+                }
             }
         }
     }
@@ -2921,7 +2923,6 @@ impl Browser {
                 if self.spare.is_none()
                     && let Ok(spare) = self.build_tab(None)
                 {
-                    let _ = spare.view.set_memory_usage_level(MemoryUsageLevel::Low);
                     self.spare = Some(spare);
                     self.ensure_chrome_focus();
                 }
@@ -2973,7 +2974,7 @@ impl Browser {
                 }
                 if started && tab.newtab_bg && url.starts_with("http") {
                     tab.newtab_bg = false;
-                    let _ = tab.view.set_background_color((255, 255, 255, 255));
+                    let _ = tab.view.set_background_color(if self.dark { (24, 25, 29, 255) } else { (255, 255, 255, 255) });
                 }
                 if started && host_of(&url) != host_of(&tab.url) {
                     tab.favicon = if host_of(&url) == Some(REAL_SEARCH_HOST) {

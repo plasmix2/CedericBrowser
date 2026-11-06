@@ -6,6 +6,19 @@
 <title>New Tab</title>
 <link rel="dns-prefetch" href="https://search.brave.com">
 <link rel="preconnect" href="https://search.brave.com" crossorigin>
+<script>
+  try {
+    const cachedAccent = localStorage.getItem('persona_cached_accent');
+    if (cachedAccent) {
+      document.documentElement.style.setProperty('--accent', cachedAccent);
+    }
+    const cachedBg = localStorage.getItem('persona_cached_bg');
+    if (cachedBg) {
+      document.documentElement.dataset.hasBg = '1';
+      document.write('<style id="initial-bg-style">#bg{background-image:url(' + JSON.stringify(cachedBg) + ') !important;opacity:1 !important;}body::before{opacity:0 !important;}</style>');
+    }
+  } catch (_) {}
+</script>
 <style>
   :root {
     --bg: #0e1015;
@@ -44,7 +57,6 @@
     overflow: hidden;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", Roboto, "Inter", system-ui, sans-serif;
     user-select: none;
-    transition: background-color 0.25s var(--ease), color 0.25s var(--ease);
   }
 
   /* Subtle static ambient spotlight (no drifting blobs) */
@@ -71,7 +83,6 @@
     background-position: center;
     background-repeat: no-repeat;
     opacity: 0;
-    transition: opacity 0.35s var(--ease);
     pointer-events: none;
     transform: translateZ(0);
   }
@@ -783,10 +794,10 @@
   </div>
 
   <!-- Background buttons -->
-  <button id="bg-btn" class="top-btn" type="button" title="Set custom background image">
+  <label for="bg-file" id="bg-btn" class="top-btn" role="button" tabindex="0" title="Set custom background image">
     <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
     <span id="bg-lbl">Background</span>
-  </button>
+  </label>
   <input type="file" id="bg-file" accept="image/*" style="display: none;">
   <button id="bg-clear" class="top-btn icon-only" type="button" title="Clear custom background">
     <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -1004,6 +1015,8 @@
 
   let curState = null;
   let curBg = '';
+  let curBmsKey = null;
+  let curPersonasKey = null;
   let curEditorMode = 'create';
   let curEditorId = '';
   let curEditorColor = 'orange';
@@ -1311,12 +1324,30 @@
     else openEditorModal('create');
   };
 
+  const bgBtn = document.getElementById('bg-btn');
+  if (bgBtn) {
+    bgBtn.addEventListener('click', (e) => {
+      if (e.target !== document.getElementById('bg-file')) {
+        document.getElementById('bg-file').click();
+      }
+    });
+    bgBtn.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        document.getElementById('bg-file').click();
+      }
+    });
+  }
+
   document.getElementById('bg-file').addEventListener('change', (e) => {
     const f = e.target.files && e.target.files[0];
     if (f) handleBgFile(f);
     e.target.value = '';
   });
   document.getElementById('bg-clear').addEventListener('click', () => {
+    try { localStorage.removeItem('persona_cached_bg'); } catch (_) {}
+    const initStyle = document.getElementById('initial-bg-style');
+    if (initStyle) initStyle.remove();
     send({ nt: 'set_background', data: '', strip: '' });
   });
 
@@ -1401,71 +1432,75 @@
     document.getElementById('persona-count').textContent = pCount;
     document.getElementById('btn-add-persona').style.display = s.can_create ? 'inline-flex' : 'none';
 
-    const listEl = document.getElementById('persona-list');
-    listEl.textContent = '';
-    for (const p of (s.personas || [])) {
-      const item = document.createElement('div');
-      item.className = 'p-item' + (p.is_active ? ' active' : '');
+    const pKey = JSON.stringify(s.personas || []) + s.can_create + s.can_delete;
+    if (pKey !== curPersonasKey) {
+      curPersonasKey = pKey;
+      const listEl = document.getElementById('persona-list');
+      listEl.textContent = '';
+      for (const p of (s.personas || [])) {
+        const item = document.createElement('div');
+        item.className = 'p-item' + (p.is_active ? ' active' : '');
 
-      const av = document.createElement('div');
-      av.className = 'avatar-md';
-      renderAvatarContent(av, p.name, p.color_hex, p.pfp);
+        const av = document.createElement('div');
+        av.className = 'avatar-md';
+        renderAvatarContent(av, p.name, p.color_hex, p.pfp);
 
-      const info = document.createElement('div');
-      info.className = 'p-info';
-      const name = document.createElement('span');
-      name.className = 'p-name';
-      name.textContent = p.name;
-      const sub = document.createElement('span');
-      sub.className = 'p-sub';
-      const cObj = COLOR_PALETTE.find(c => c.name === p.color) || { label: p.color };
-      sub.textContent = `${cObj.label} • ${p.bookmark_count} bookmark${p.bookmark_count === 1 ? '' : 's'}`;
-      info.append(name, sub);
+        const info = document.createElement('div');
+        info.className = 'p-info';
+        const name = document.createElement('span');
+        name.className = 'p-name';
+        name.textContent = p.name;
+        const sub = document.createElement('span');
+        sub.className = 'p-sub';
+        const cObj = COLOR_PALETTE.find(c => c.name === p.color) || { label: p.color };
+        sub.textContent = `${cObj.label} • ${p.bookmark_count} bookmark${p.bookmark_count === 1 ? '' : 's'}`;
+        info.append(name, sub);
 
-      const actions = document.createElement('div');
-      actions.className = 'p-actions';
+        const actions = document.createElement('div');
+        actions.className = 'p-actions';
 
-      const editBtn = document.createElement('button');
-      editBtn.className = 'p-action-btn';
-      editBtn.type = 'button';
-      editBtn.title = 'Edit Persona';
-      editBtn.innerHTML = '<svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
-      editBtn.onclick = (e) => {
-        e.stopPropagation();
-        openEditorModal('edit', p.id);
-      };
-      actions.append(editBtn);
-
-      if (s.can_delete) {
-        const delBtn = document.createElement('button');
-        delBtn.className = 'p-action-btn del-btn';
-        delBtn.type = 'button';
-        delBtn.title = 'Delete Persona';
-        delBtn.innerHTML = '<svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
-        delBtn.onclick = (e) => {
+        const editBtn = document.createElement('button');
+        editBtn.className = 'p-action-btn';
+        editBtn.type = 'button';
+        editBtn.title = 'Edit Persona';
+        editBtn.innerHTML = '<svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
+        editBtn.onclick = (e) => {
           e.stopPropagation();
-          if (confirm(`Delete persona "${p.name}"?`)) {
-            send({ nt: 'delete_persona', id: p.id });
+          openEditorModal('edit', p.id);
+        };
+        actions.append(editBtn);
+
+        if (s.can_delete) {
+          const delBtn = document.createElement('button');
+          delBtn.className = 'p-action-btn del-btn';
+          delBtn.type = 'button';
+          delBtn.title = 'Delete Persona';
+          delBtn.innerHTML = '<svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+          delBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (confirm(`Delete persona "${p.name}"?`)) {
+              send({ nt: 'delete_persona', id: p.id });
+            }
+          };
+          actions.append(delBtn);
+        }
+
+        item.onclick = () => {
+          if (!p.is_active) {
+            send({ nt: 'select_persona', id: p.id });
+            toggleDropdown(false);
           }
         };
-        actions.append(delBtn);
-      }
 
-      item.onclick = () => {
-        if (!p.is_active) {
-          send({ nt: 'select_persona', id: p.id });
-          toggleDropdown(false);
+        item.append(av, info, actions);
+        if (p.is_active) {
+          const chk = document.createElement('span');
+          chk.className = 'p-check';
+          chk.textContent = '✓';
+          item.append(chk);
         }
-      };
-
-      item.append(av, info, actions);
-      if (p.is_active) {
-        const chk = document.createElement('span');
-        chk.className = 'p-check';
-        chk.textContent = '✓';
-        item.append(chk);
+        listEl.append(item);
       }
-      listEl.append(item);
     }
 
     // Hero title and logo
@@ -1491,6 +1526,18 @@
       curBg = bg;
       const bgEl = document.getElementById('bg');
       bgEl.style.backgroundImage = bg ? `url(${JSON.stringify(bg)})` : '';
+      try {
+        if (bg) {
+          localStorage.setItem('persona_cached_bg', bg);
+        } else {
+          localStorage.removeItem('persona_cached_bg');
+          const initStyle = document.getElementById('initial-bg-style');
+          if (initStyle) initStyle.remove();
+        }
+      } catch (_) {}
+    }
+    if (s.persona_color_hex) {
+      try { localStorage.setItem('persona_cached_accent', s.persona_color_hex); } catch (_) {}
     }
     document.getElementById('bg-btn').title = `Change ${personaName} background image`;
     document.getElementById('bg-clear').title = `Clear ${personaName} background image`;
@@ -1503,67 +1550,71 @@
     }
 
     // Speed Dial / Bookmarks Grid
-    const box = document.getElementById('bms');
-    box.textContent = '';
-    const frag = document.createDocumentFragment();
+    const bmsKey = JSON.stringify(s.bookmarks || []);
+    if (bmsKey !== curBmsKey) {
+      curBmsKey = bmsKey;
+      const box = document.getElementById('bms');
+      box.textContent = '';
+      const frag = document.createDocumentFragment();
 
-    const bookmarksList = (s.bookmarks && s.bookmarks.length > 0) ? s.bookmarks : DEFAULT_TOP_SITES;
-    const isDefaultList = !s.bookmarks || s.bookmarks.length === 0;
+      const bookmarksList = (s.bookmarks && s.bookmarks.length > 0) ? s.bookmarks : DEFAULT_TOP_SITES;
+      const isDefaultList = !s.bookmarks || s.bookmarks.length === 0;
 
-    for (const b of bookmarksList) {
-      if (window.__cedericPreconnect) window.__cedericPreconnect(b.url);
+      for (const b of bookmarksList) {
+        if (window.__cedericPreconnect) window.__cedericPreconnect(b.url);
 
-      const tile = document.createElement('a');
-      tile.className = 'speed-tile';
-      tile.href = b.url;
-      tile.title = b.title || b.url;
+        const tile = document.createElement('a');
+        tile.className = 'speed-tile';
+        tile.href = b.url;
+        tile.title = b.title || b.url;
 
-      const card = document.createElement('div');
-      card.className = 'speed-card';
+        const card = document.createElement('div');
+        card.className = 'speed-card';
 
-      const faviconUrl = getFaviconUrl(b.url);
-      const icon = document.createElement('img');
-      icon.className = 'speed-icon';
-      icon.src = faviconUrl;
-      icon.alt = b.title || '';
-      icon.onerror = () => {
-        icon.style.display = 'none';
-        const initial = document.createElement('span');
-        initial.className = 'speed-initial';
-        initial.textContent = (b.title || 'W').trim().charAt(0).toUpperCase();
-        card.append(initial);
-      };
-      card.append(icon);
-
-      const label = document.createElement('span');
-      label.className = 'speed-label';
-      label.textContent = b.title || b.url;
-
-      tile.append(card, label);
-
-      // Delete bookmark button (for real bookmarks)
-      if (!isDefaultList) {
-        const del = document.createElement('button');
-        del.className = 'speed-del';
-        del.type = 'button';
-        del.title = 'Remove shortcut';
-        del.innerHTML = '&times;';
-        del.onclick = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          send({ nt: 'delete_bookmark', url: b.url });
+        const faviconUrl = getFaviconUrl(b.url);
+        const icon = document.createElement('img');
+        icon.className = 'speed-icon';
+        icon.src = faviconUrl;
+        icon.alt = b.title || '';
+        icon.onerror = () => {
+          icon.style.display = 'none';
+          const initial = document.createElement('span');
+          initial.className = 'speed-initial';
+          initial.textContent = (b.title || 'W').trim().charAt(0).toUpperCase();
+          card.append(initial);
         };
-        tile.append(del);
+        card.append(icon);
+
+        const label = document.createElement('span');
+        label.className = 'speed-label';
+        label.textContent = b.title || b.url;
+
+        tile.append(card, label);
+
+        // Delete bookmark button (for real bookmarks)
+        if (!isDefaultList) {
+          const del = document.createElement('button');
+          del.className = 'speed-del';
+          del.type = 'button';
+          del.title = 'Remove shortcut';
+          del.innerHTML = '&times;';
+          del.onclick = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            send({ nt: 'delete_bookmark', url: b.url });
+          };
+          tile.append(del);
+        }
+
+        tile.onclick = (e) => {
+          e.preventDefault();
+          send({ nt: 'open_bookmark', url: b.url });
+        };
+
+        frag.append(tile);
       }
-
-      tile.onclick = (e) => {
-        e.preventDefault();
-        send({ nt: 'open_bookmark', url: b.url });
-      };
-
-      frag.append(tile);
+      box.append(frag);
     }
-    box.append(frag);
   };
 
   send({ nt: 'ready' });
