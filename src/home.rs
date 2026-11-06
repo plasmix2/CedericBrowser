@@ -25,8 +25,6 @@ pub enum HomeCmd {
     Settings,
     ChooseBackground,
     ClearBackground,
-    /// The persona pill; the menu opens under it at this point (page coordinates).
-    PersonaMenu { x: f32, y: f32 },
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -38,7 +36,9 @@ pub struct Tile {
 /// What the page shows; set by `Browser` whenever it changes.
 #[derive(Clone, Debug, Default)]
 pub struct HomeData {
+    #[allow(dead_code)]
     pub persona: String,
+    #[allow(dead_code)]
     pub letter: String,
     pub has_bg: bool,
     pub tiles: Vec<Tile>,
@@ -52,7 +52,6 @@ enum Hit {
     Settings,
     Background,
     ClearBg,
-    Persona,
     Tile(usize),
     TileDel(usize),
 }
@@ -256,58 +255,52 @@ impl Home {
         let card = if photo { th.card.with_alpha(0.85) } else { self.base().mix(th.fg, if self.dark { 0.07 } else { 0.05 }) };
         c.backdrop = card;
 
-        // Top right navigation pills: Settings, Background, Persona
-        let mut rx = w - 20.0;
+        // Top right navigation buttons: Settings, Wallpaper, Remove Wallpaper
+        let mut rx = w - 24.0;
         let ry = 18.0;
+        let dark = self.dark;
+        let pill_bg = if photo {
+            if dark { Rgba(20, 24, 33, 215) } else { Rgba(255, 255, 255, 225) }
+        } else {
+            card
+        };
+        let pill_border = if photo {
+            if dark { Rgba(255, 255, 255, 55) } else { Rgba(0, 0, 0, 40) }
+        } else {
+            th.border
+        };
         let pill = |c: &mut Painter, px: f32, pw: f32, f: f32| {
-            c.rrect(px, ry, pw, PILL_H, PILL_H / 2.0, card.mix(th.fg, 0.07 * f));
+            if photo {
+                c.shadow(px, ry, pw, PILL_H, PILL_H / 2.0, 16.0, 4.0, if dark { 0.45 } else { 0.18 });
+            }
+            c.rrect(px - 1.0, ry - 1.0, pw + 2.0, PILL_H + 2.0, PILL_H / 2.0 + 1.0, pill_border.mix(th.accent, f));
+            c.rrect(px, ry, pw, PILL_H, PILL_H / 2.0, pill_bg.mix(th.fg, 0.08 * f));
         };
 
-        // 1. Persona pill
-        let persona_name = if self.data.persona.is_empty() { "Persona".to_string() } else { self.data.persona.clone() };
-        let nw = c.text_width(&persona_name, 13.0, Weight::SemiBold).min(160.0);
-        let pw = 8.0 + 22.0 + 8.0 + nw + 26.0;
-        rx -= pw;
-        pill(c, rx, pw, self.hot(Hit::Persona));
-        let (ax, ay) = (rx + 8.0, ry + (PILL_H - 22.0) / 2.0);
-        let shown = self.data.avatar.as_ref().is_some_and(|u| self.images.contains_key(u))
-            && c.image_cover(self.data.avatar.as_deref().unwrap_or_default(), ax, ay, 22.0, 22.0, 11.0);
-        if !shown {
-            c.circle(ax + 11.0, ay + 11.0, 11.0, th.accent);
-            let letter = if self.data.letter.is_empty() { "P" } else { &self.data.letter };
-            let lw = c.text_width(letter, 11.5, Weight::SemiBold);
-            let lh = c.line_height(11.5, Weight::SemiBold);
-            c.text(letter, ax + 11.0 - lw / 2.0, ay + 11.0 - lh / 2.0, 11.5, Weight::SemiBold, Rgba(255, 255, 255, 255), 1.0e9);
-        }
-        let ty = ry + (PILL_H - c.line_height(13.0, Weight::SemiBold)) / 2.0;
-        c.text(&persona_name, ax + 30.0, ty, 13.0, Weight::SemiBold, fg, ax + 30.0 + nw);
-        c.icon_rot(Icon::ChevronRight, rx + pw - 22.0, ry + (PILL_H - 14.0) / 2.0, 14.0, dim, std::f32::consts::FRAC_PI_2);
-        self.area(Hit::Persona, rx, ry, pw, PILL_H);
+        // 1. Settings button
+        rx -= PILL_H;
+        pill(c, rx, PILL_H, self.hot(Hit::Settings));
+        c.icon(Icon::Settings, rx + (PILL_H - 16.0) / 2.0, ry + (PILL_H - 16.0) / 2.0, 16.0, fg);
+        self.area(Hit::Settings, rx, ry, PILL_H, PILL_H);
 
-        // 2. Remove-background button (if background is set)
-        if self.data.has_bg {
-            rx -= 8.0 + PILL_H;
-            pill(c, rx, PILL_H, self.hot(Hit::ClearBg));
-            c.icon(Icon::Close, rx + (PILL_H - 16.0) / 2.0, ry + (PILL_H - 16.0) / 2.0, 16.0, fg);
-            self.area(Hit::ClearBg, rx, ry, PILL_H, PILL_H);
-        }
-
-        // 3. Background pill
+        // 2. Wallpaper button
         let bg_label = if self.data.has_bg { "Change wallpaper" } else { "Wallpaper" };
         let lw = c.text_width(bg_label, 13.0, Weight::Regular);
         let bw = 12.0 + 16.0 + 8.0 + lw + 14.0;
-        rx -= 8.0 + bw;
+        rx -= 10.0 + bw;
         pill(c, rx, bw, self.hot(Hit::Background));
         c.icon(Icon::Photo, rx + 12.0, ry + (PILL_H - 16.0) / 2.0, 16.0, fg);
         let ly = ry + (PILL_H - c.line_height(13.0, Weight::Regular)) / 2.0;
         c.text(bg_label, rx + 36.0, ly, 13.0, Weight::Regular, fg, 1.0e9);
         self.area(Hit::Background, rx, ry, bw, PILL_H);
 
-        // 4. Settings pill
-        rx -= 8.0 + PILL_H;
-        pill(c, rx, PILL_H, self.hot(Hit::Settings));
-        c.icon(Icon::ShieldLock, rx + (PILL_H - 16.0) / 2.0, ry + (PILL_H - 16.0) / 2.0, 16.0, fg);
-        self.area(Hit::Settings, rx, ry, PILL_H, PILL_H);
+        // 3. Clear wallpaper button (if wallpaper is active)
+        if self.data.has_bg {
+            rx -= 10.0 + PILL_H;
+            pill(c, rx, PILL_H, self.hot(Hit::ClearBg));
+            c.icon(Icon::Close, rx + (PILL_H - 16.0) / 2.0, ry + (PILL_H - 16.0) / 2.0, 16.0, fg);
+            self.area(Hit::ClearBg, rx, ry, PILL_H, PILL_H);
+        }
 
         // The centre column: logo, name, search box, bookmarks.
         let rows = self.tile_rows(c, w);
@@ -321,30 +314,78 @@ impl Home {
         c.text(TITLE, cx - tw / 2.0, cy, 34.0, Weight::SemiBold, fg, 1.0e9);
         cy += 44.0 + 30.0;
 
-        // Search box.
+        // Search box - beautifully contrast-tuned for custom wallpapers and solid themes.
         let sw = SEARCH_W.min(w - 40.0);
         let sx = cx - sw / 2.0;
         let f = self.hot(Hit::Search);
-        let field = if photo { card } else if self.dark { th.field } else { card };
-        c.shadow(sx, cy, sw, SEARCH_H, SEARCH_H / 2.0, 30.0, 8.0, if self.dark { 0.35 } else { 0.12 });
-        c.rrect(sx - 1.0, cy - 1.0, sw + 2.0, SEARCH_H + 2.0, SEARCH_H / 2.0 + 1.0, th.border.mix(th.accent, f));
-        c.rrect(sx, cy, sw, SEARCH_H, SEARCH_H / 2.0, field);
-        c.backdrop = field;
-        c.icon(Icon::Search, sx + 20.0, cy + (SEARCH_H - 18.0) / 2.0, 18.0, th.dim.mix(th.accent, f));
+
+        let (field_bg, field_border, search_icon_col, placeholder_col) = if photo {
+            let bg = if self.dark {
+                Rgba(18, 22, 30, 240)
+            } else {
+                Rgba(255, 255, 255, 246)
+            };
+            let bdr = if self.dark {
+                Rgba(255, 255, 255, 65).mix(th.accent, f)
+            } else {
+                Rgba(0, 0, 0, 48).mix(th.accent, f)
+            };
+            let icon_c = if self.dark {
+                Rgba(255, 255, 255, 225).mix(th.accent, f)
+            } else {
+                Rgba(30, 35, 45, 225).mix(th.accent, f)
+            };
+            let ph_c = if self.dark {
+                Rgba(255, 255, 255, 190)
+            } else {
+                Rgba(50, 55, 68, 190)
+            };
+            (bg, bdr, icon_c, ph_c)
+        } else {
+            let bg = if self.dark { th.field } else { card };
+            let bdr = th.border.mix(th.accent, f);
+            let icon_c = th.dim.mix(th.accent, f);
+            let ph_c = th.dim;
+            (bg, bdr, icon_c, ph_c)
+        };
+
+        c.shadow(
+            sx,
+            cy,
+            sw,
+            SEARCH_H,
+            SEARCH_H / 2.0,
+            if photo { 36.0 } else { 28.0 },
+            if photo { 10.0 } else { 6.0 },
+            if photo { if self.dark { 0.65 } else { 0.28 } } else { if self.dark { 0.32 } else { 0.10 } },
+        );
+        c.rrect(sx - 1.0, cy - 1.0, sw + 2.0, SEARCH_H + 2.0, SEARCH_H / 2.0 + 1.0, field_border);
+        c.rrect(sx, cy, sw, SEARCH_H, SEARCH_H / 2.0, field_bg);
+        c.backdrop = field_bg;
+        c.icon(Icon::Search, sx + 20.0, cy + (SEARCH_H - 18.0) / 2.0, 18.0, search_icon_col);
         let sty = cy + (SEARCH_H - c.line_height(15.0, Weight::Regular)) / 2.0;
-        c.text("Search the web or type a URL", sx + 50.0, sty, 15.0, Weight::Regular, th.dim, sx + sw - 20.0);
+        c.text("Search the web or type a URL", sx + 50.0, sty, 15.0, Weight::Regular, placeholder_col, sx + sw - 20.0);
         self.area(Hit::Search, sx, cy, sw, SEARCH_H);
         cy += SEARCH_H + 28.0;
 
         // Bookmarks, as chips centred in rows.
-        c.backdrop = card;
+        let (chip_card, chip_bdr_base) = if photo {
+            let c_bg = if self.dark { Rgba(20, 24, 33, 225) } else { Rgba(255, 255, 255, 235) };
+            let c_bdr = if self.dark { Rgba(255, 255, 255, 55) } else { Rgba(0, 0, 0, 38) };
+            (c_bg, c_bdr)
+        } else {
+            (card, th.border)
+        };
         for row in rows {
             let total: f32 = row.iter().map(|(_, cw)| cw).sum::<f32>() + 10.0 * (row.len().saturating_sub(1)) as f32;
             let mut x = cx - total / 2.0;
             for (i, cw) in row {
                 let hot = self.hot(Hit::Tile(i)).max(self.hot(Hit::TileDel(i)));
-                c.rrect(x - 1.0, cy - 1.0, cw + 2.0, CHIP_H + 2.0, CHIP_H / 2.0 + 1.0, th.border.mix(th.accent, hot));
-                c.rrect(x, cy, cw, CHIP_H, CHIP_H / 2.0, card);
+                if photo {
+                    c.shadow(x, cy, cw, CHIP_H, CHIP_H / 2.0, 16.0, 4.0, if self.dark { 0.45 } else { 0.18 });
+                }
+                c.rrect(x - 1.0, cy - 1.0, cw + 2.0, CHIP_H + 2.0, CHIP_H / 2.0 + 1.0, chip_bdr_base.mix(th.accent, hot));
+                c.rrect(x, cy, cw, CHIP_H, CHIP_H / 2.0, chip_card.mix(th.fg, 0.06 * hot));
                 c.icon(Icon::StarFilled, x + 12.0, cy + (CHIP_H - 13.0) / 2.0, 13.0, th.accent);
                 let t = &self.data.tiles[i];
                 let label = if t.title.is_empty() { t.url.clone() } else { t.title.clone() };
@@ -356,7 +397,7 @@ impl Home {
                 if self.hover == Some(Hit::TileDel(i)) {
                     c.circle(dx + 11.0, dy + 11.0, 11.0, th.btn_hover);
                 }
-                c.icon(Icon::Close, dx + 4.0, dy + 4.0, 14.0, dim.with_alpha(if hot > 0.0 { 1.0 } else { 0.45 }));
+                c.icon(Icon::Close, dx + 4.0, dy + 4.0, 14.0, dim.with_alpha(if hot > 0.0 { 1.0 } else { 0.55 }));
                 self.area(Hit::TileDel(i), dx, dy, 22.0, 22.0);
                 x += cw + 10.0;
             }
@@ -438,10 +479,6 @@ impl Home {
             Hit::Settings => Some(HomeCmd::Settings),
             Hit::Background => Some(HomeCmd::ChooseBackground),
             Hit::ClearBg => Some(HomeCmd::ClearBackground),
-            Hit::Persona => {
-                let a = self.areas.iter().find(|a| a.hit == Hit::Persona)?;
-                Some(HomeCmd::PersonaMenu { x: a.x + a.w, y: a.y + a.h + 6.0 })
-            }
             Hit::Tile(i) => url(i).map(HomeCmd::Open),
             Hit::TileDel(i) => url(i).map(HomeCmd::DeleteBookmark),
         }
@@ -480,11 +517,10 @@ mod tests {
         assert_eq!(h.mouse_down(50.0, 120.0), Some(HomeCmd::FocusSearch));
         assert_eq!(h.mouse_move(50.0, 120.0), CursorIcon::Text);
 
-        // Top right buttons: Settings, Background, ClearBg, Persona
+        // Top right buttons: Settings, Background, ClearBg
         h.areas.push(Area { hit: Hit::Settings, x: 500.0, y: 18.0, w: 34.0, h: 34.0 });
         h.areas.push(Area { hit: Hit::Background, x: 550.0, y: 18.0, w: 100.0, h: 34.0 });
         h.areas.push(Area { hit: Hit::ClearBg, x: 660.0, y: 18.0, w: 34.0, h: 34.0 });
-        h.areas.push(Area { hit: Hit::Persona, x: 700.0, y: 18.0, w: 120.0, h: 34.0 });
 
         h.mouse_down(510.0, 25.0);
         assert_eq!(h.mouse_up(510.0, 25.0), Some(HomeCmd::Settings));
@@ -494,8 +530,5 @@ mod tests {
 
         h.mouse_down(670.0, 25.0);
         assert_eq!(h.mouse_up(670.0, 25.0), Some(HomeCmd::ClearBackground));
-
-        h.mouse_down(720.0, 25.0);
-        assert_eq!(h.mouse_up(720.0, 25.0), Some(HomeCmd::PersonaMenu { x: 820.0, y: 58.0 }));
     }
 }

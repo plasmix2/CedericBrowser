@@ -103,8 +103,8 @@ const STEALTH_SCRIPT: &str = r#"
 
 /// Every WebView sharing a data directory must use identical arguments.
 const BROWSER_ARGS: &str = "\
-    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,SpareRendererForSitePerProcess,BackForwardCache,msEdgeShopping,msEdgeCollections \
-    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,ParallelDownloading,UseEcoQoSForBackgroundProcess,IntensiveWakeUpThrottling \
+    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,msEdgeShopping,msEdgeCollections \
+    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,ParallelDownloading,BackForwardCache,CanvasOopRasterization \
     --disable-blink-features=AutomationControlled \
     --autoplay-policy=no-user-gesture-required \
     --enable-quic \
@@ -112,13 +112,14 @@ const BROWSER_ARGS: &str = "\
     --disable-component-update \
     --enable-gpu-rasterization \
     --enable-accelerated-video-decode \
+    --enable-zero-copy \
     --enable-smooth-scrolling \
     --enable-fast-unload \
     --no-pings \
     --disable-domain-reliability \
-    --process-per-site \
     --disable-client-side-phishing-detection \
     --disable-sync \
+    --renderer-process-limit=6 \
     --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
     --enforce-webrtc-ip-permission-check \
     --remote-debugging-port=0";
@@ -2446,26 +2447,30 @@ impl Browser {
     }
 
     fn history_items(&self) -> Vec<MenuItem> {
-        const MAX: usize = 10;
+        const MAX: usize = 12;
         let entries = self.history.entries();
         let has_entries = !entries.is_empty();
         let mut items = vec![
-            MenuItem::new("Anonymous session", MenuAction::ClearHistory)
-                .hint("Auto-clears")
-                .enabled(false),
             MenuItem::new("Clear search history", MenuAction::ClearHistory)
                 .hint("Ctrl+H")
                 .enabled(has_entries),
             MenuItem::sep(),
         ];
         if !has_entries {
-            items.push(MenuItem::new("No searches in session", MenuAction::ClearHistory).enabled(false));
+            items.push(MenuItem::new("No recent searches", MenuAction::ClearHistory).enabled(false));
         } else {
             items.extend(
                 entries
                     .iter()
                     .take(MAX)
-                    .map(|e| MenuItem::new(e.query.clone(), MenuAction::OpenUrl(e.url.clone())).hint("Anonymous")),
+                    .map(|e| {
+                        let hint = if e.is_search {
+                            if !e.engine.is_empty() { e.engine.clone() } else { "Search".to_string() }
+                        } else {
+                            "Visited".to_string()
+                        };
+                        MenuItem::new(e.query.clone(), MenuAction::OpenUrl(e.url.clone())).hint(&hint)
+                    }),
             );
         }
         items.push(MenuItem::sep());
@@ -2601,7 +2606,6 @@ impl Browser {
             HomeCmd::Settings => self.show_settings(),
             HomeCmd::ChooseBackground => self.choose_background(),
             HomeCmd::ClearBackground => self.apply_background(None, None),
-            HomeCmd::PersonaMenu { x, y } => self.theme_menu(x as f64, y as f64 + self.top_bar_height()),
         }
     }
 
@@ -3667,14 +3671,46 @@ impl Browser {
 
     fn set_suggestions(&mut self, items: Vec<String>) {
         let q = self.suggest_query.clone();
-        let url = matches!(input::resolve(&unmask(&q)), Some(u) if !input::is_search(&u));
-        let mut list = vec![Suggestion { url, text: q.clone() }];
-        list.extend(
-            items
-                .into_iter()
-                .filter(|s| !s.eq_ignore_ascii_case(&q))
-                .map(|text| Suggestion { url: false, text }),
-        );
+        let q_clean = unmask(&q).trim().to_lowercase();
+        let is_direct_url = matches!(input::resolve(&unmask(&q)), Some(u) if !input::is_search(&u));
+        let mut list = vec![Suggestion { url: is_direct_url, text: q.clone() }];
+
+        // 1. Instant local encrypted search history matches
+        if !q_clean.is_empty() {
+            for entry in self.history.entries() {
+                let eq = entry.query.trim();
+                let eq_lower = eq.to_lowercase();
+                if eq_lower != q_clean && (eq_lower.starts_with(&q_clean) || eq_lower.contains(&q_clean)) {
+                    if !list.iter().any(|s| s.text.eq_ignore_ascii_case(eq)) {
+                        list.push(Suggestion {
+                            url: !entry.is_search,
+                            text: eq.to_string(),
+                        });
+                        if list.len() >= 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Remote search suggestions
+        for item in items {
+            let item_trimmed = item.trim();
+            if !item_trimmed.is_empty()
+                && !item_trimmed.eq_ignore_ascii_case(&q)
+                && !list.iter().any(|s| s.text.eq_ignore_ascii_case(item_trimmed))
+            {
+                list.push(Suggestion {
+                    url: false,
+                    text: item_trimmed.to_string(),
+                });
+                if list.len() >= 8 {
+                    break;
+                }
+            }
+        }
+
         self.toolbar.set_suggestions(list.iter().map(|s| s.text.clone()).collect());
         let (x, y, w) = self.suggest_anchor;
         let entries = list.iter().map(|s| SuggestEntry { text: s.text.clone(), url: s.url }).collect();
@@ -4876,8 +4912,7 @@ fn main() -> wry::Result<()> {
     // of it is invalidated, and since the window does not clip its children that paints over the
     // pages and makes them flash. Everything that is not a page is drawn by `Browser::redraw`.
 
-    let mut history = HistoryStore::open(&dir);
-    history.clear();
+    let history = HistoryStore::open(&dir);
     let context = WebContext::new(Some(dir.clone()));
 
     let scale = window.scale_factor();
@@ -5013,6 +5048,7 @@ fn main() -> wry::Result<()> {
     });
     browser.open_tab(start, None, true)?;
     browser.layout();
+    browser.window.request_redraw();
     browser.schedule_account_probe(Duration::from_millis(1500));
 
     event_loop.run(move |event, _, control_flow| {
@@ -5045,8 +5081,6 @@ fn main() -> wry::Result<()> {
             _ => ControlFlow::Wait,
         };
         if browser.quit {
-            // Search history is per session; cookies are kept so accounts stay signed in.
-            browser.history.clear();
             *control_flow = ControlFlow::Exit;
         }
     });
@@ -5421,5 +5455,51 @@ mod tests {
         let (mx, my) = tb.menu_anchor();
         tb.mouse_down(MouseButton::Left, mx - 10.0, my - 20.0);
         assert!(tb.cmds.iter().any(|c| matches!(c, ChromeCmd::MainMenu { .. })));
+    }
+
+    #[test]
+    fn history_persists_across_sessions() {
+        let dir = std::env::temp_dir().join(format!(
+            "persona_history_persistence_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut store = HistoryStore::open(&dir);
+            store.record("rust programming", "https://search.brave.com/search?q=rust", "Brave Search", true);
+            store.record("github persona", "https://search.brave.com/search?q=github", "Brave Search", true);
+            assert_eq!(store.entries().len(), 2);
+        }
+
+        // Reopen in a new session: must NOT be cleared
+        let reopened = HistoryStore::open(&dir);
+        let entries = reopened.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].query, "github persona");
+        assert_eq!(entries[1].query, "rust programming");
+        assert_eq!(entries[0].engine, "Brave Search");
+        assert!(entries[0].is_search);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_args_performance_optimizations() {
+        // Must enable high performance features
+        assert!(BROWSER_ARGS.contains("BackForwardCache"));
+        assert!(BROWSER_ARGS.contains("CanvasOopRasterization"));
+        assert!(BROWSER_ARGS.contains("--enable-zero-copy"));
+        assert!(BROWSER_ARGS.contains("--renderer-process-limit=6"));
+
+        // Must NOT disable spare renderers or back-forward cache
+        assert!(!BROWSER_ARGS.contains("SpareRendererForSitePerProcess"));
+        assert!(!BROWSER_ARGS.contains("--disable-features=BackForwardCache"));
+
+        // Must NOT throttle CPU or timers
+        assert!(!BROWSER_ARGS.contains("UseEcoQoSForBackgroundProcess"));
+        assert!(!BROWSER_ARGS.contains("IntensiveWakeUpThrottling"));
+        assert!(!BROWSER_ARGS.contains("--process-per-site"));
     }
 }
