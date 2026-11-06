@@ -115,6 +115,7 @@ const BROWSER_ARGS: &str = "\
     --enable-fast-unload \
     --no-pings \
     --disable-domain-reliability \
+    --process-per-site \
     --disable-client-side-phishing-detection \
     --disable-sync \
     --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
@@ -621,7 +622,8 @@ enum UserEvent {
     OpenInNewTab(String),
     Suggestions(suggest::Response),
     DevtoolsTarget { tab: TabId, old_title: String, url: Option<String> },
-    Prewarm,
+    /// Once a minute: unload idle background tabs.
+    Housekeep,
     /// Frame tick from the pacer while the UI animates.
     Frame,
     FullscreenState(TabId, bool),
@@ -1596,9 +1598,69 @@ struct Suggestion {
     text: String,
 }
 
+/// A tab's WebView, or nothing while the tab has none: a New Tab (drawn natively) or a tab
+/// unloaded to save memory. Calls on an absent page do nothing; it is created again when the tab
+/// is shown or navigates.
+struct Page(Option<WebView>);
+
+impl Page {
+    fn get(&self) -> Option<&WebView> {
+        self.0.as_ref()
+    }
+    fn on(&self, f: impl FnOnce(&WebView) -> wry::Result<()>) -> wry::Result<()> {
+        self.0.as_ref().map_or(Ok(()), f)
+    }
+    fn set_bounds(&self, r: Rect) -> wry::Result<()> {
+        self.on(|v| v.set_bounds(r))
+    }
+    fn set_visible(&self, on: bool) -> wry::Result<()> {
+        self.on(|v| v.set_visible(on))
+    }
+    fn set_memory_usage_level(&self, l: MemoryUsageLevel) -> wry::Result<()> {
+        self.on(|v| v.set_memory_usage_level(l))
+    }
+    fn set_background_color(&self, c: Rgba) -> wry::Result<()> {
+        self.on(|v| v.set_background_color(c))
+    }
+    fn focus(&self) -> wry::Result<()> {
+        self.on(|v| v.focus())
+    }
+    fn focus_parent(&self) -> wry::Result<()> {
+        self.on(|v| v.focus_parent())
+    }
+    fn load_url(&self, url: &str) -> wry::Result<()> {
+        self.on(|v| v.load_url(url))
+    }
+    fn reload(&self) -> wry::Result<()> {
+        self.on(|v| v.reload())
+    }
+    fn evaluate_script(&self, js: &str) -> wry::Result<()> {
+        self.on(|v| v.evaluate_script(js))
+    }
+    fn evaluate_script_with_callback(&self, js: &str, cb: impl Fn(String) + Send + 'static) -> wry::Result<()> {
+        self.on(|v| v.evaluate_script_with_callback(js, cb))
+    }
+    fn can_go_back(&self) -> wry::Result<bool> {
+        self.0.as_ref().map_or(Ok(false), |v| v.can_go_back())
+    }
+    fn can_go_forward(&self) -> wry::Result<bool> {
+        self.0.as_ref().map_or(Ok(false), |v| v.can_go_forward())
+    }
+    fn clear_all_browsing_data(&self) -> wry::Result<()> {
+        self.on(|v| v.clear_all_browsing_data())
+    }
+    fn open_devtools(&self) {
+        if let Some(v) = &self.0 {
+            v.open_devtools();
+        }
+    }
+}
+
 struct Tab {
     id: TabId,
-    view: WebView,
+    view: Page,
+    /// When the tab was last on screen; idle background tabs are unloaded (`Browser::housekeep`).
+    last_seen: Instant,
     title: String,
     url: String,
     favicon: String,
@@ -1641,8 +1703,6 @@ struct Browser {
     laid_out: (u32, u32, f64),
     icons_tx: Sender<String>,
     tabs: Vec<Tab>,
-    /// A hidden, already-rendered new tab so Ctrl+T appears instantly.
-    spare: Option<Tab>,
     active: usize,
     next_id: TabId,
     history: HistoryStore,
@@ -1661,6 +1721,8 @@ struct Browser {
     home: home::Home,
     /// Which wallpaper `home` was given (the saved data URL), to decode it only when it changes.
     home_bg_key: Option<String>,
+    /// The New Tab page is what the window's buffer shows under the toolbar.
+    home_on_screen: bool,
     /// Setup's current step, and whether it is waiting for a Google sign-in in a tab.
     setup_step: u8,
     setup_linking: bool,
@@ -1746,9 +1808,33 @@ impl Browser {
     }
 
     /// Builds a hidden tab. It becomes visible when it is made the active tab.
+    /// A tab showing `url`, or a New Tab (which needs no WebView) when `url` is `None`.
     fn build_tab(&mut self, url: Option<&str>) -> wry::Result<Tab> {
         let id = self.next_id;
         self.next_id += 1;
+        let view = match url {
+            Some(u) => Page(Some(self.build_view(id, Some(u))?)),
+            None => Page(None),
+        };
+        Ok(Tab {
+            id,
+            view,
+            last_seen: Instant::now(),
+            title: if url.is_some() { String::new() } else { "New Tab".into() },
+            url: url.unwrap_or_default().to_owned(),
+            favicon: String::new(),
+            loading: url.is_some(),
+            can_back: false,
+            can_forward: false,
+            pip: false,
+            is_newtab: url.is_none(),
+            newtab_bg: url.is_none(),
+            thumb: None,
+        })
+    }
+
+    /// Creates the WebView for tab `id`, hidden, loading `url` (or a blank page).
+    fn build_view(&mut self, id: TabId, url: Option<&str>) -> wry::Result<WebView> {
         let bounds = self.content_bounds();
         let bg = self.newtab_color();
         let brand_key = if self.prefs.active_color() == PersonaColor::Slate { "uzaki" } else { "cederic" };
@@ -1780,7 +1866,7 @@ impl Browser {
             .with_devtools(true)
             .with_hotkeys_zoom(true)
             .with_general_autofill_enabled(false)
-            .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
+            .with_background_throttling(BackgroundThrottlingPolicy::Throttle)
             .with_permission_handler(move |kind| match kind {
                 PermissionKind::Camera | PermissionKind::DisplayCapture => {
                     if cam.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1856,33 +1942,78 @@ impl Browser {
             // Paint the new-tab page's own color from the first frame, so it never flashes white.
             None => builder.with_html(BLANK_HTML).with_background_color(bg),
         };
-        let view = builder.build_as_child(&self.window)?;
+        builder.build_as_child(&self.window)
+    }
 
-        Ok(Tab {
-            id,
-            view,
-            title: if url.is_some() { String::new() } else { "New Tab".into() },
-            url: url.unwrap_or_default().to_owned(),
-            favicon: String::new(),
-            loading: url.is_some(),
-            can_back: false,
-            can_forward: false,
-            pip: false,
-            is_newtab: url.is_none(),
-            newtab_bg: url.is_none(),
-            thumb: None,
-        })
+    /// Gives tab `i` its WebView back if it was unloaded, reloading its page. Returns false when
+    /// it could not be created.
+    fn ensure_view(&mut self, i: usize) -> bool {
+        let Some(t) = self.tabs.get(i) else { return false };
+        if t.view.get().is_some() || t.is_newtab {
+            return true;
+        }
+        let (id, url) = (t.id, t.url.clone());
+        match self.build_view(id, Some(&url)) {
+            Ok(v) => {
+                let t = &mut self.tabs[i];
+                t.view = Page(Some(v));
+                t.loading = true;
+                t.newtab_bg = false;
+                let _ = t.view.set_background_color((255, 255, 255, 255));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Unloads background tabs nobody looked at for a while: their WebView (and renderer process)
+    /// goes; title, icon, address and snapshot stay, and the page loads again when it is shown.
+    /// Tabs playing video or in Picture-in-Picture, loading, or inspected by DevTools are kept.
+    fn housekeep(&mut self) {
+        const IDLE: Duration = Duration::from_secs(10 * 60);
+        const MAX_LIVE: usize = 6;
+        let now = Instant::now();
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.last_seen = now;
+        }
+        let devtools_tab = self.devtools.open.then_some(self.devtools.tab).flatten();
+        let mut live: Vec<(usize, Instant)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| {
+                *i != self.active
+                    && t.view.get().is_some()
+                    && !t.pip
+                    && !t.loading
+                    && !t.url.contains("youtube.com")
+                    && !t.url.contains("youtu.be")
+                    && Some(t.id) != devtools_tab
+            })
+            .map(|(i, t)| (i, t.last_seen))
+            .collect();
+        // Oldest first: the idle ones, then any beyond the live budget.
+        live.sort_by_key(|&(_, seen)| seen);
+        let over = live.len().saturating_sub(MAX_LIVE);
+        for (k, (i, seen)) in live.into_iter().enumerate() {
+            if k < over || now.duration_since(seen) >= IDLE {
+                self.unload_tab(i);
+            }
+        }
+    }
+
+    fn unload_tab(&mut self, i: usize) {
+        let Some(t) = self.tabs.get_mut(i) else { return };
+        if let Some(v) = t.view.0.take() {
+            let _ = self.thumbs_tx.send(thumbs::Request::Forget(t.id));
+            t.loading = false;
+            drop(v);
+        }
     }
 
     /// Opens a tab at `at` (default: the end). Background tabs don't take focus.
     fn open_tab(&mut self, url: Option<String>, at: Option<usize>, foreground: bool) -> wry::Result<()> {
-        let tab = match (&url, self.spare.take()) {
-            (None, Some(spare)) => spare,
-            (url, spare) => {
-                self.spare = spare;
-                self.build_tab(url.as_deref())?
-            }
-        };
+        let tab = self.build_tab(url.as_deref())?;
         let at = at.unwrap_or(self.tabs.len()).min(self.tabs.len());
         let previous = self.active_tab().map(|t| t.id);
         self.tabs.insert(at, tab);
@@ -1901,13 +2032,6 @@ impl Browser {
             }
             self.sync_ui();
         }
-        // Build the next spare after this tab is on screen, and after its opening animation: creating
-        // a WebView blocks the UI thread, which showed as a flicker right as the tab appeared.
-        let proxy = self.proxy.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(500));
-            let _ = proxy.send_event(UserEvent::Prewarm);
-        });
         Ok(())
     }
 
@@ -2027,6 +2151,11 @@ impl Browser {
     }
 
     fn show_active(&mut self) {
+        // An unloaded tab gets its page back first.
+        self.ensure_view(self.active);
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.last_seen = Instant::now();
+        }
         let bounds = self.content_bounds();
         let is_newtab = if let Some(tab) = self.tabs.get(self.active) {
             let _ = tab.view.set_bounds(bounds);
@@ -2079,9 +2208,6 @@ impl Browser {
         if self.toolbar.is_editing() {
             for t in &self.tabs {
                 let _ = t.view.focus_parent();
-            }
-            if let Some(spare) = &self.spare {
-                let _ = spare.view.focus_parent();
             }
             self.window.set_focus();
         }
@@ -2168,9 +2294,25 @@ impl Browser {
         };
         // Start the load before anything else (closing the dropdown, history, repainting) so the
         // network request leaves as early as possible.
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.is_newtab = false;
+        let i = self.active;
+        if self.tabs.get(i).is_some_and(|t| t.view.get().is_none()) {
+            // A New Tab has no WebView yet: create it right at the address.
+            let id = self.tabs[i].id;
+            match self.build_view(id, Some(&resolved.url)) {
+                Ok(v) => self.tabs[i].view = Page(Some(v)),
+                Err(_) => return,
+            }
+            self.tabs[i].url = resolved.url.clone();
+            self.tabs[i].loading = true;
+        } else if let Some(tab) = self.tabs.get(i) {
             let _ = tab.view.load_url(&resolved.url);
+        }
+        if let Some(tab) = self.tabs.get_mut(i) {
+            tab.is_newtab = false;
+            if tab.newtab_bg {
+                tab.newtab_bg = false;
+                let _ = tab.view.set_background_color((255, 255, 255, 255));
+            }
         }
         self.reveal_active_page();
         self.close_suggest();
@@ -2880,9 +3022,6 @@ impl Browser {
         for t in &self.tabs {
             let _ = t.view.focus_parent();
         }
-        if let Some(spare) = &self.spare {
-            let _ = spare.view.focus_parent();
-        }
         self.window.set_focus();
     }
 
@@ -3182,16 +3321,27 @@ impl Browser {
         if self.devtools.open {
             self.toggle_devtools();
         }
-        let urls: Vec<Option<String>> =
-            self.tabs.iter().map(|t| if t.is_newtab || t.url.is_empty() { None } else { Some(t.url.clone()) }).collect();
+        let kept: Vec<(Option<String>, String, String)> = self
+            .tabs
+            .iter()
+            .map(|t| (if t.is_newtab || t.url.is_empty() { None } else { Some(t.url.clone()) }, t.title.clone(), t.favicon.clone()))
+            .collect();
         let active = self.active;
         let old = std::mem::take(&mut self.tabs);
-        self.spare = None;
-        for url in urls {
-            match self.build_tab(url.as_deref()) {
-                Ok(tab) => self.tabs.push(tab),
+        // Only the tab on screen loads now; the others load when they are shown.
+        for (url, title, favicon) in kept {
+            let mut tab = match self.build_tab(None) {
+                Ok(t) => t,
                 Err(_) => continue,
+            };
+            if let Some(u) = url {
+                tab.is_newtab = false;
+                tab.newtab_bg = false;
+                tab.url = u;
+                tab.title = title;
+                tab.favicon = favicon;
             }
+            self.tabs.push(tab);
         }
         if self.tabs.is_empty()
             && let Ok(tab) = self.build_tab(None)
@@ -3205,7 +3355,6 @@ impl Browser {
             let _ = self.thumbs_tx.send(thumbs::Request::Forget(t.id));
         }
         drop(old);
-        let _ = self.proxy.send_event(UserEvent::Prewarm);
     }
 
     fn set_persona(&mut self, id: &str) {
@@ -3239,12 +3388,6 @@ impl Browser {
                     .replace("Uzaki", &persona.name);
             }
             let _ = tab.view.evaluate_script(&js);
-        }
-        if let Some(spare) = &self.spare {
-            if spare.newtab_bg {
-                let _ = spare.view.set_background_color(bg);
-            }
-            let _ = spare.view.evaluate_script(&js);
         }
         if self.prefs.active_persona().profile_name() != old_profile {
             self.google = None;
@@ -3868,8 +4011,8 @@ impl Browser {
     }
 
     fn with_active(&self, f: impl FnOnce(&WebView) -> wry::Result<()>) {
-        if let Some(t) = self.active_tab() {
-            let _ = f(&t.view);
+        if let Some(v) = self.active_tab().and_then(|t| t.view.get()) {
+            let _ = f(v);
         }
     }
 
@@ -3974,15 +4117,7 @@ impl Browser {
                     self.window.request_redraw();
                 }
             }
-            UserEvent::Prewarm => {
-                if self.spare.is_none()
-                    && let Ok(spare) = self.build_tab(None)
-                {
-                    let _ = spare.view.set_memory_usage_level(MemoryUsageLevel::Low);
-                    self.spare = Some(spare);
-                    self.ensure_chrome_focus();
-                }
-            }
+            UserEvent::Housekeep => self.housekeep(),
             UserEvent::Suggestions(res) => {
                 if res.seq == self.suggest_seq {
                     self.set_suggestions(res.items);
@@ -4163,11 +4298,6 @@ impl Browser {
                         let _ = tab.view.set_background_color(bg);
                     }
                 }
-                if let Some(spare) = &self.spare
-                    && spare.newtab_bg
-                {
-                    let _ = spare.view.set_background_color(bg);
-                }
                 self.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -4310,21 +4440,30 @@ impl Browser {
         }
         let mut damage = vec![softbuffer::Rect { x: 0, y: 0, width: w, height: NonZeroU32::new(bar_h).unwrap_or(h) }];
         if home && h.get() > bar_h {
-            // The New Tab page: drawn by ANVL only when it changed, copied in every frame.
+            // The New Tab page: drawn by ANVL only when it changed.
             let page_w = if dt > 0.0 { logical_w - dt - SPLITTER } else { logical_w };
             let page_h = (h.get() - bar_h) as f64 / scale;
             self.home.set_size(scale as f32, page_w.max(1.0) as f32, page_h as f32);
             home_painted = self.home.render();
+        }
+        // The buffer keeps what was presented last (age 1): copy the page in only when it is new
+        // there, not on every toolbar animation frame.
+        let home_copy = home && h.get() > bar_h && (home_painted || buf.age() == 0 || !self.home_on_screen);
+        self.home_on_screen = home;
+        if home && h.get() > bar_h {
             let pm = &self.home.frame;
             let (pw, ph) = ((pm.width() as usize).min(width), (pm.height() as usize).min(h.get() as usize - bar_h as usize));
-            let data = pm.data();
-            for row in 0..ph {
-                let src = &data[row * pm.width() as usize * 4..][..pw * 4];
-                let dst = &mut buf[(bar_h as usize + row) * width..][..pw];
-                for (d, p) in dst.iter_mut().zip(src.chunks_exact(4)) {
-                    *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+            if home_copy {
+                let data = pm.data();
+                for row in 0..ph {
+                    let src = &data[row * pm.width() as usize * 4..][..pw * 4];
+                    let dst = &mut buf[(bar_h as usize + row) * width..][..pw];
+                    for (d, p) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                        *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+                    }
                 }
             }
+            // Always present it: the system may have asked for the area to be repainted.
             if let (Some(gw), Some(gh)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) {
                 damage.push(softbuffer::Rect { x: 0, y: bar_h, width: gw, height: gh });
             }
@@ -4550,6 +4689,13 @@ fn main() -> wry::Result<()> {
         let _ = p_frame.send_event(UserEvent::Frame);
     });
 
+    let p_house = proxy.clone();
+    std::thread::spawn(move || {
+        while p_house.send_event(UserEvent::Housekeep).is_ok() {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    });
+
     let p_icon = proxy.clone();
     let icons_tx = favicons::spawn(move |url, img| {
         let _ = p_icon.send_event(UserEvent::IconLoaded(url, img));
@@ -4581,7 +4727,6 @@ fn main() -> wry::Result<()> {
         laid_out: (0, 0, 0.0),
         icons_tx,
         tabs: Vec::new(),
-        spare: None,
         active: 0,
         next_id: 1,
         history,
@@ -4598,6 +4743,7 @@ fn main() -> wry::Result<()> {
         persona_form: None,
         home,
         home_bg_key: None,
+        home_on_screen: false,
         setup_step: 0,
         setup_linking: false,
         closed_tabs: Vec::new(),
