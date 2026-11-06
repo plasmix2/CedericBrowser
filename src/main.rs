@@ -3629,12 +3629,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_microphone,
         allow_geolocation,
     };
-    let start = std::env::args().nth(1).and_then(|a| {
-        let resolved = input::resolve_with_info(&unmask(&a))?;
-        browser.history.record(&resolved.query, &resolved.url, resolved.engine, resolved.is_search);
-        Some(resolved.url)
-    });
-    browser.open_tab(start, None, true)?;
+    // Every argument is a URL or search. The first becomes the active tab, the rest open in the
+    // background (the benchmark harness in `bench/` uses this to measure memory per tab).
+    let mut starts = std::env::args()
+        .skip(1)
+        .map(|a| {
+            let resolved = input::resolve_with_info(&unmask(&a))?;
+            browser.history.record(&resolved.query, &resolved.url, resolved.engine, resolved.is_search);
+            Some(resolved.url)
+        })
+        .collect::<Vec<_>>()
+        .into_iter();
+    browser.open_tab(starts.next().flatten(), None, true)?;
+    for url in starts.flatten() {
+        let _ = browser.open_tab(Some(url), None, false);
+    }
     browser.layout();
     browser.schedule_account_probe(Duration::from_millis(1500));
 

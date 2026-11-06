@@ -101,6 +101,11 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`claude/friendly-ptolemy-dzfqha` (Persona 2.0, Phase 0 / WS-C: benchmark harness)**:
+  - New `bench/` (`measure.ps1`, `corpus.txt`, `README.md`; results in git-ignored `bench/results/`). Measures startup time and private working set of the whole `Persona.exe` process tree for idle, one-tab and all-tabs runs, plus memory per tab, in a throwaway `LOCALAPPDATA`. Engine-agnostic, so it can compare WebView2 with a future Servo build.
+  - `main.rs`: every command-line argument is now a URL/search; the first is the active tab, the rest open in the background (was: only the first, others ignored).
+  - **Not run**: no Windows/PowerShell here. Run it on Windows to get the WebView2 baseline, which the 2.0 targets (plan section 6) need. Scroll smoothness, JS benchmarks and idle CPU are not covered yet (listed in `bench/README.md`).
+
 - **`claude/friendly-ptolemy-dzfqha` (Persona 2.0, Phase 0 / WS-B: CDP moved behind the engine)**:
   - `src/thumbs.rs` and `src/devtools.rs` moved (git mv) to `src/engine_webview2/`; they are WebView2-backend private. `main.rs` no longer mentions the debugging port, the DevTools marker title, or CDP.
   - New on the traits: `PageEngine::spawn_snapshots(cb) -> Sender<SnapshotRequest>` (replaces `thumbs::spawn` / `thumbs::Request`), `PageView::devtools_frontend(seq, page_url, done)` + `devtools_lookup_finished()` (replace the marker-title dance in `attach_devtools`/`devtools_target`), `ViewConfig::tag` (caller's id; was the missing `window.__cedericTab`). `UserEvent::DevtoolsTarget` lost `old_title`. The marker-title filter moved into the backend's title handler. `Browser::data_dir` removed.

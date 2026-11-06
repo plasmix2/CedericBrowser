@@ -1,0 +1,9 @@
+# One URL per line. Lines starting with # are ignored.
+# Mix of tiny documents, text-heavy pages and heavy web apps. Network variance affects results:
+# compare engines in the same session, and repeat runs.
+https://example.com
+https://en.wikipedia.org/wiki/Rust_(programming_language)
+https://news.ycombinator.com
+https://developer.mozilla.org/en-US/docs/Web/JavaScript
+https://github.com/rust-lang/rust
+https://www.openstreetmap.org
