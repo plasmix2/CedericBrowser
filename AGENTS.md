@@ -54,7 +54,9 @@ Note that building replaces `target/release/Persona.exe`, so any running Persona
 
 | File | What it does |
 |---|---|
-| `src/main.rs` | Window, tabs, DevTools pane, event loop; decides what menus/suggestions/cards show |
+| `src/main.rs` | Window, tabs, DevTools pane, event loop; decides what menus/suggestions/cards show. Talks to pages only through `engine.rs` |
+| `src/engine.rs` | Engine-neutral `PageEngine` / `PageView` traits and types (no wry, no Chromium flags) |
+| `src/engine_webview2.rs` | The WebView2 backend (wry): the only file that knows wry, `BROWSER_ARGS` and the user agent |
 | `src/toolbar.rs` | Native tab strip, window controls, buttons and address bar: layout, input, animation, drawing |
 | `src/gfx.rs` | Drawing helpers for the native UI: shapes, vector icons, text, theme colors |
 | `src/popups.rs` | Native popup windows: right-click menu, suggestion dropdown, tab hover card |
@@ -92,8 +94,8 @@ Note that building replaces `target/release/Persona.exe`, so any running Persona
   Reversing the order makes the bare window flash between tabs.
 
 - **Every WebView must use the exact same `BROWSER_ARGS`, scroll bar style and data folder.** WebView2
-  refuses to create a WebView whose environment options differ (error `0x8007139F`). If you change one,
-  change them all.
+  refuses to create a WebView whose environment options differ (error `0x8007139F`). They now live in
+  `engine_webview2.rs` and `WryEngine::create_view` applies them to every view, so don't add per-view flags.
 - **Popups are never hidden, only parked off-screen** (`PARKED`, in *physical* pixels), and are
   non-focusable. tao can only show a window without stealing focus at creation time, and a focused
   window gets a blue accent border. Don't add `set_visible(true)` calls for popups, and don't park them

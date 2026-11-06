@@ -86,7 +86,7 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 
 | Agent / Owner | Branch | Files Being Touched | Task Summary |
 |---|---|---|---|
-| Claude | `claude/friendly-ptolemy-dzfqha` | `docs/ENGINE_2_0_PLAN.md`, `INSTRUCTIONS.md` (docs only) | Persona 2.0 in-house engine plan; no code changes yet. Phase 0 (`PageEngine` trait) will touch `src/main.rs` heavily: coordinate before starting. |
+| *(none currently)* | — | — | — |
 
 ---
 
@@ -100,6 +100,13 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
+
+- **`claude/friendly-ptolemy-dzfqha` (Persona 2.0, Phase 0 / WS-A: `PageEngine` seam, no behavior change)**:
+  - Plan: `docs/ENGINE_2_0_PLAN.md` (Servo as the base engine, WebView2 kept as fallback). This entry is the first step.
+  - New `src/engine.rs` (engine-neutral `PageEngine`, `PageView`, `ViewConfig`, `ViewHandlers`, `Bounds`, `MemLevel`, `LoadPhase`, `Perm`, `Role`, `Source`) and `src/engine_webview2.rs` (`WryEngine`, the only wry user). `BROWSER_ARGS` and `USER_AGENT` moved there; `create_view` applies them to every view.
+  - `main.rs`: `Tab.view` / `Devtools.view` / `account_probe` hold `Box<dyn PageView>`; `Browser.context: WebContext` became `Browser.engine: Box<dyn PageEngine>`; `build_tab`, `probe_google_account` and the DevTools frontend call `create_view`; `UserEvent::Load` carries `LoadPhase`; `main` returns `Result<(), Box<dyn Error>>`. Renamed calls: `set_memory_level`, `set_background`, `eval`, `eval_with_result` (takes a `Box<dyn Fn(String) + Send>`), `clear_browsing_data`.
+  - Checked with `cargo check --target x86_64-pc-windows-gnu` (also `--tests` and `--release`): no errors or warnings. **Not run:** `cargo build --release`, `cargo test` and the app itself, because this was written in a Linux container with no Windows toolchain or Wine. Run both on Windows before merging, and open a tab, switch persona, F12 and Ctrl+T once.
+  - Preserve when merging: new engine calls go through the traits, not wry; append new `ViewHandlers`/`PageView` members at the end. Still using CDP (next, WS-B): `devtools.rs`, `thumbs.rs`, `live_eval` test.
 
 - **`claude/kind-brown-esznx2` (combined branch, auto-update, v0.2.0)**:
   - Merged `origin/gemini/picture-in-picture` (7df9d2d, site permissions) with the Google-accounts work. All four conflicts were additive and both sides were kept (`MenuAction`, `Browser` fields + init, tests).

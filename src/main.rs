@@ -2,6 +2,8 @@
 
 mod crypto;
 mod devtools;
+mod engine;
+mod engine_webview2;
 mod favicons;
 mod gfx;
 mod history;
@@ -36,11 +38,7 @@ use tao::{
     keyboard::ModifiersState,
     window::{CursorIcon, Fullscreen, Icon as WinIcon, Theme, Window, WindowBuilder, WindowId},
 };
-use wry::{
-    BackgroundThrottlingPolicy, MemoryUsageLevel, NewWindowResponse, PageLoadEvent,
-    PermissionKind, PermissionResponse, Rect, ScrollBarStyle, WebContext, WebView,
-    WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows,
-};
+use engine::{Bounds, LoadPhase, MemLevel, PageEngine, PageView, Perm, Role, Source, ViewConfig, ViewHandlers};
 
 /// Height of the native tab strip + toolbar, in logical pixels.
 const CHROME_HEIGHT: f64 = toolbar::HEIGHT as f64;
@@ -49,8 +47,6 @@ const SPLITTER: f64 = 5.0;
 const DEVTOOLS_MIN: f64 = 280.0;
 
 const NEWTAB_HTML: &str = include_str!("ui/newtab.html");
-
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
 const STEALTH_SCRIPT: &str = r#"
 (() => {
@@ -94,28 +90,6 @@ const STEALTH_SCRIPT: &str = r#"
   }
 })();
 "#;
-
-/// Every WebView sharing a data directory must use identical arguments.
-const BROWSER_ARGS: &str = "\
-    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,UserAgentClientHint \
-    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,BackForwardCache,ParallelDownloading,CanvasOopRasterization,UseEcoQoSForBackgroundProcess \
-    --disable-blink-features=AutomationControlled \
-    --autoplay-policy=no-user-gesture-required \
-    --enable-quic \
-    --ssl-version-min=tls1.2 \
-    --disable-component-update \
-    --enable-gpu-rasterization \
-    --enable-zero-copy \
-    --enable-accelerated-video-decode \
-    --enable-smooth-scrolling \
-    --enable-fast-unload \
-    --no-pings \
-    --disable-domain-reliability \
-    --disable-client-side-phishing-detection \
-    --disable-sync \
-    --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
-    --enforce-webrtc-ip-permission-check \
-    --remote-debugging-port=0";
 
 /// Keyboard shortcuts, the context menu, speculative link preconnect/prefetch, and Wi-Fi form
 /// encryption guard for content pages. Untrusted web content can only trigger the fixed `Shortcut`
@@ -598,7 +572,7 @@ enum UserEvent {
     PipState(TabId, bool),
     UpgradeHttps(TabId, String),
     Title(TabId, String),
-    Load(TabId, PageLoadEvent, String),
+    Load(TabId, LoadPhase, String),
     Favicon(TabId, String),
     /// A favicon was fetched and decoded (or failed to) for the tab strip.
     IconLoaded(String, Option<Pixmap>),
@@ -1408,7 +1382,7 @@ struct Suggestion {
 
 struct Tab {
     id: TabId,
-    view: WebView,
+    view: Box<dyn PageView>,
     title: String,
     url: String,
     favicon: String,
@@ -1460,7 +1434,7 @@ struct NewTabState<'a> {
 }
 
 struct Devtools {
-    view: Option<WebView>,
+    view: Option<Box<dyn PageView>>,
     open: bool,
     width: f64,
     tab: Option<TabId>,
@@ -1494,7 +1468,7 @@ struct Browser {
     history: HistoryStore,
     prefs: Prefs,
     https_upgrades: u64,
-    context: WebContext,
+    engine: Box<dyn PageEngine>,
     data_dir: PathBuf,
     proxy: EventLoopProxy<UserEvent>,
     quit: bool,
@@ -1515,7 +1489,7 @@ struct Browser {
     /// The Google account signed in to the active persona's profile, once the probe has read it.
     google: Option<GoogleAccount>,
     /// Hidden WebView reading Google's account list (see `probe_google_account`), while it runs.
-    account_probe: Option<(Option<String>, WebView, Instant)>,
+    account_probe: Option<(Option<String>, Box<dyn PageView>, Instant)>,
     /// A probe was asked for while one was running: run another when it ends.
     probe_again: bool,
     /// A probe is already scheduled to run shortly.
@@ -1551,7 +1525,7 @@ impl Browser {
         self.devtools.width.clamp(DEVTOOLS_MIN, (w - 300.0).max(DEVTOOLS_MIN))
     }
 
-    fn content_bounds(&self) -> Rect {
+    fn content_bounds(&self) -> Bounds {
         let size = self.logical_size();
         let top = self.top_bar_height();
         let dt = self.devtools_width();
@@ -1559,7 +1533,7 @@ impl Browser {
         rect(0.0, top, w.max(0.0), (size.height - top).max(0.0))
     }
 
-    fn devtools_bounds(&self) -> Rect {
+    fn devtools_bounds(&self) -> Bounds {
         let size = self.logical_size();
         let top = self.top_bar_height();
         let dt = self.devtools_width();
@@ -1576,7 +1550,7 @@ impl Browser {
     }
 
     /// Builds a hidden tab. It becomes visible when it is made the active tab.
-    fn build_tab(&mut self, url: Option<&str>) -> wry::Result<Tab> {
+    fn build_tab(&mut self, url: Option<&str>) -> engine::Result<Tab> {
         let id = self.next_id;
         self.next_id += 1;
         let bounds = self.content_bounds();
@@ -1595,72 +1569,34 @@ impl Browser {
         let mic = self.allow_microphone.clone();
         let geo = self.allow_geolocation.clone();
 
-        let mut builder = WebViewBuilder::new_with_web_context(&mut self.context)
-            .with_bounds(bounds)
-            .with_visible(false)
-            .with_user_agent(USER_AGENT)
-            .with_initialization_script(STEALTH_SCRIPT)
-            .with_initialization_script(format!(
-                "if (window === window.top && location.hostname === 'search.brave.com') {{ window.__cedericBrand = {brand_key:?}; window.__cedericBrandName = {persona_name:?}; window.__cedericBrandColor = {persona_color_hex:?}; }}"
-            ))
-            .with_initialization_script(SHORTCUT_SCRIPT)
-            .with_initialization_script(BRAND_SCRIPT)
-            .with_additional_browser_args(BROWSER_ARGS)
-            .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
-            .with_devtools(true)
-            .with_hotkeys_zoom(true)
-            .with_general_autofill_enabled(false)
-            .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
-            .with_permission_handler(move |kind| match kind {
-                PermissionKind::Camera | PermissionKind::DisplayCapture => {
-                    if cam.load(std::sync::atomic::Ordering::Relaxed) {
-                        PermissionResponse::Allow
-                    } else {
-                        PermissionResponse::Deny
-                    }
-                }
-                PermissionKind::Notifications => {
-                    if notif.load(std::sync::atomic::Ordering::Relaxed) {
-                        PermissionResponse::Allow
-                    } else {
-                        PermissionResponse::Deny
-                    }
-                }
-                PermissionKind::Microphone => {
-                    if mic.load(std::sync::atomic::Ordering::Relaxed) {
-                        PermissionResponse::Allow
-                    } else {
-                        PermissionResponse::Deny
-                    }
-                }
-                PermissionKind::Geolocation => {
-                    if geo.load(std::sync::atomic::Ordering::Relaxed) {
-                        PermissionResponse::Allow
-                    } else {
-                        PermissionResponse::Deny
-                    }
-                }
-                _ => PermissionResponse::Allow,
-            })
-            .with_navigation_handler(move |nav_url| {
-                if let Some(https_url) = input::upgrade_to_https(&nav_url) {
+        let handlers = ViewHandlers {
+            on_permission: Some(Box::new(move |kind| {
+                let flag = match kind {
+                    Perm::Camera | Perm::DisplayCapture => &cam,
+                    Perm::Notifications => &notif,
+                    Perm::Microphone => &mic,
+                    Perm::Geolocation => &geo,
+                    Perm::Other => return true,
+                };
+                flag.load(std::sync::atomic::Ordering::Relaxed)
+            })),
+            on_navigate: Some(Box::new(move |nav_url| {
+                if let Some(https_url) = input::upgrade_to_https(nav_url) {
                     let _ = p_nav.send_event(UserEvent::UpgradeHttps(id, https_url));
                     return false;
                 }
-                input::is_allowed_navigation(&nav_url)
-            })
-            .with_document_title_changed_handler(move |t| {
+                input::is_allowed_navigation(nav_url)
+            })),
+            on_title: Some(Box::new(move |t| {
                 let _ = p_title.send_event(UserEvent::Title(id, t));
-            })
-            .with_on_page_load_handler(move |ev, url| {
+            })),
+            on_load: Some(Box::new(move |ev, url| {
                 let _ = p_load.send_event(UserEvent::Load(id, ev, url));
-            })
-            .with_new_window_req_handler(move |url, _features| {
+            })),
+            on_new_window: Some(Box::new(move |url| {
                 let _ = p_new.send_event(UserEvent::OpenInNewTab(url));
-                NewWindowResponse::Deny
-            })
-            .with_ipc_handler(move |req| {
-                let body = req.body();
+            })),
+            on_message: Some(Box::new(move |body| {
                 if body == "pip_on" {
                     let _ = p_ipc.send_event(UserEvent::PipState(id, true));
                 } else if body == "pip_off" {
@@ -1676,17 +1612,30 @@ impl Browser {
                 } else if let Some(r) = ContextRequest::parse(body) {
                     let _ = p_ipc.send_event(UserEvent::PageMenu(id, r));
                 }
-            });
-        // Each persona has its own profile: separate cookies, so separate Google sign-ins.
-        if let Some(profile) = self.prefs.active_persona().profile_name() {
-            builder = builder.with_profile_name(profile);
-        }
-        builder = match url {
-            Some(u) => builder.with_url(u),
-            // Paint the new-tab page's own color from the first frame, so it never flashes white.
-            None => builder.with_html(NEWTAB_HTML).with_background_color(bg),
+            })),
         };
-        let view = builder.build_as_child(&self.window)?;
+        let config = ViewConfig {
+            role: Role::Page,
+            // Paint the new-tab page's own color from the first frame, so it never flashes white.
+            content: match url {
+                Some(u) => Source::Url(u),
+                None => Source::Html(NEWTAB_HTML),
+            },
+            bounds,
+            visible: false,
+            background: if url.is_none() { Some(bg) } else { None },
+            // Each persona has its own profile: separate cookies, so separate Google sign-ins.
+            profile: self.prefs.active_persona().profile_name(),
+            init_scripts: vec![
+                STEALTH_SCRIPT.to_owned(),
+                format!(
+                    "if (window === window.top && location.hostname === 'search.brave.com') {{ window.__cedericBrand = {brand_key:?}; window.__cedericBrandName = {persona_name:?}; window.__cedericBrandColor = {persona_color_hex:?}; }}"
+                ),
+                SHORTCUT_SCRIPT.to_owned(),
+                BRAND_SCRIPT.to_owned(),
+            ],
+        };
+        let view = self.engine.create_view(&self.window, config, handlers)?;
 
         Ok(Tab {
             id,
@@ -1705,7 +1654,7 @@ impl Browser {
     }
 
     /// Opens a tab at `at` (default: the end). Background tabs don't take focus.
-    fn open_tab(&mut self, url: Option<String>, at: Option<usize>, foreground: bool) -> wry::Result<()> {
+    fn open_tab(&mut self, url: Option<String>, at: Option<usize>, foreground: bool) -> engine::Result<()> {
         let tab = match (&url, self.spare.take()) {
             (None, Some(spare)) => spare,
             (url, spare) => {
@@ -1828,7 +1777,7 @@ impl Browser {
                 let _ = t.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             } else {
                 let _ = t.view.set_visible(false);
-                let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
+                let _ = t.view.set_memory_level(MemLevel::Low);
             }
         }
     }
@@ -1836,11 +1785,11 @@ impl Browser {
     fn show_active(&mut self) {
         let bounds = self.content_bounds();
         let is_newtab = if let Some(tab) = self.tabs.get(self.active) {
-            let _ = tab.view.set_memory_usage_level(MemoryUsageLevel::Normal);
+            let _ = tab.view.set_memory_level(MemLevel::Normal);
             let _ = tab.view.set_bounds(bounds);
             let _ = tab.view.set_visible(true);
             if tab.is_newtab {
-                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+                Self::push_newtab_state(&*tab.view, &self.prefs, &self.history);
             } else {
                 let _ = tab.view.focus();
             }
@@ -1890,7 +1839,7 @@ impl Browser {
         }
     }
 
-    fn push_newtab_state(view: &WebView, prefs: &Prefs, history: &HistoryStore) {
+    fn push_newtab_state(view: &dyn PageView, prefs: &Prefs, history: &HistoryStore) {
         let active = prefs.active_persona();
         let color = active.parsed_color();
         let personas = prefs
@@ -1926,7 +1875,7 @@ impl Browser {
             allow_geolocation: prefs.permissions.geolocation,
         };
         if let Ok(json) = serde_json::to_string(&state) {
-            let _ = view.evaluate_script(&format!("window.renderNewTab && window.renderNewTab({json})"));
+            let _ = view.eval(&format!("window.renderNewTab && window.renderNewTab({json})"));
         }
     }
 
@@ -1967,7 +1916,7 @@ impl Browser {
             },
         };
         if tab.is_newtab {
-            Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+            Self::push_newtab_state(&*tab.view, &self.prefs, &self.history);
         }
         let title = if tab.title.is_empty() { &active_name } else { &tab.title };
         // Pre-release builds name themselves (PERSONA_BUILD=<git hash> at compile time), so the
@@ -2168,13 +2117,13 @@ impl Browser {
     fn sync_all_newtabs(&self) {
         for tab in &self.tabs {
             if tab.is_newtab {
-                Self::push_newtab_state(&tab.view, &self.prefs, &self.history);
+                Self::push_newtab_state(&*tab.view, &self.prefs, &self.history);
             }
         }
         if let Some(spare) = &self.spare
             && spare.is_newtab
         {
-            Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
+            Self::push_newtab_state(&*spare.view, &self.prefs, &self.history);
         }
     }
 
@@ -2295,10 +2244,10 @@ impl Browser {
         let js = "window.__personaOpenSettings && window.__personaOpenSettings();";
         let is_newtab = self.tabs.get(self.active).is_some_and(|t| t.is_newtab);
         if is_newtab {
-            self.with_active(|v| v.evaluate_script(js));
+            self.with_active(|v| v.eval(js));
         } else {
             let _ = self.open_tab(None, None, true);
-            self.with_active(|v| v.evaluate_script(js));
+            self.with_active(|v| v.eval(js));
         }
     }
 
@@ -2312,7 +2261,7 @@ impl Browser {
 
     fn choose_background(&mut self) {
         let js = "document.dispatchEvent(new CustomEvent('cederic:act', { detail: { cmd: 'pick_bg' } }))";
-        self.with_active(|v| v.evaluate_script(js));
+        self.with_active(|v| v.eval(js));
     }
 
     fn open_persona_editor(&mut self, id: Option<&str>) {
@@ -2322,10 +2271,10 @@ impl Browser {
         };
         let is_newtab = self.tabs.get(self.active).is_some_and(|t| t.is_newtab);
         if is_newtab {
-            self.with_active(|v| v.evaluate_script(&script));
+            self.with_active(|v| v.eval(&script));
         } else {
             let _ = self.open_tab(None, None, true);
-            self.with_active(|v| v.evaluate_script(&script));
+            self.with_active(|v| v.eval(&script));
         }
     }
 
@@ -2341,25 +2290,26 @@ impl Browser {
         self.account_probe = None;
         let profile = self.prefs.active_persona().profile_name();
         let proxy = self.proxy.clone();
-        let mut builder = WebViewBuilder::new_with_web_context(&mut self.context)
-            .with_bounds(rect(-10.0, -10.0, 1.0, 1.0))
-            .with_visible(false)
-            .with_user_agent(USER_AGENT)
-            // Same arguments and scroll bar style as every other WebView (see BROWSER_ARGS).
-            .with_additional_browser_args(BROWSER_ARGS)
-            .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
-            .with_navigation_handler(|u| u == GOOGLE_PROBE_PAGE)
-            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-            .with_on_page_load_handler(move |ev, url| {
-                if matches!(ev, PageLoadEvent::Finished) && url == GOOGLE_PROBE_PAGE {
+        let handlers = ViewHandlers {
+            on_navigate: Some(Box::new(|u| u == GOOGLE_PROBE_PAGE)),
+            on_new_window: Some(Box::new(|_| {})),
+            on_load: Some(Box::new(move |ev, url| {
+                if ev == LoadPhase::Finished && url == GOOGLE_PROBE_PAGE {
                     let _ = proxy.send_event(UserEvent::AccountProbeLoaded);
                 }
-            })
-            .with_url(GOOGLE_PROBE_PAGE);
-        if let Some(name) = &profile {
-            builder = builder.with_profile_name(name.clone());
-        }
-        if let Ok(view) = builder.build_as_child(&self.window) {
+            })),
+            ..Default::default()
+        };
+        let config = ViewConfig {
+            role: Role::Helper,
+            content: Source::Url(GOOGLE_PROBE_PAGE),
+            bounds: rect(-10.0, -10.0, 1.0, 1.0),
+            visible: false,
+            background: None,
+            profile: profile.clone(),
+            init_scripts: Vec::new(),
+        };
+        if let Ok(view) = self.engine.create_view(&self.window, config, handlers) {
             self.account_probe = Some((profile, view, Instant::now()));
         }
     }
@@ -2386,11 +2336,11 @@ impl Browser {
         let read_js = format!(
             "(() => {{ try {{ const x = new XMLHttpRequest(); x.open('POST', {GOOGLE_ACCOUNTS_URL:?}, false); x.send(' '); return x.status === 200 ? x.responseText : ''; }} catch (_) {{ return ''; }} }})()"
         );
-        let read = view.evaluate_script_with_callback(&read_js, move |json| {
+        let read = view.eval_with_result(&read_js, Box::new(move |json| {
             // The callback gets the script's result as JSON: here, a JSON string.
             let text: String = serde_json::from_str(&json).unwrap_or_default();
             let _ = proxy.send_event(UserEvent::GoogleAccount(profile.clone(), parse_google_accounts(&text)));
-        });
+        }));
         if read.is_err() {
             self.account_probe = None;
         }
@@ -2461,7 +2411,7 @@ impl Browser {
         );
         for tab in &mut self.tabs {
             if tab.newtab_bg {
-                let _ = tab.view.set_background_color(bg);
+                let _ = tab.view.set_background(bg);
             }
             if host_of(&tab.url) == Some(REAL_SEARCH_HOST) {
                 tab.title = tab
@@ -2470,13 +2420,13 @@ impl Browser {
                     .replace("Cederic", &persona.name)
                     .replace("Uzaki", &persona.name);
             }
-            let _ = tab.view.evaluate_script(&js);
+            let _ = tab.view.eval(&js);
         }
         if let Some(spare) = &self.spare {
             if spare.newtab_bg {
-                let _ = spare.view.set_background_color(bg);
+                let _ = spare.view.set_background(bg);
             }
-            let _ = spare.view.evaluate_script(&js);
+            let _ = spare.view.eval(&js);
         }
         if self.prefs.active_persona().profile_name() != old_profile {
             self.google = None;
@@ -2639,7 +2589,7 @@ impl Browser {
                 self.apply_background(Some(url.clone()), None);
                 if let Ok(u) = serde_json::to_string(&url) {
                     let js = format!("document.dispatchEvent(new CustomEvent('cederic:act', {{ detail: {{ cmd: 'apply_bg', url: {u} }} }}))");
-                    self.with_active(|v| v.evaluate_script(&js));
+                    self.with_active(|v| v.eval(&js));
                 }
             }
             MenuAction::ClearBackground => self.apply_background(None, None),
@@ -2677,7 +2627,7 @@ impl Browser {
             && let Some(host) = host_of(&target_url)
             && let Ok(origin_js) = serde_json::to_string(&format!("https://{host}"))
         {
-            self.with_active(|v| v.evaluate_script(&format!("window.__cedericPreconnect && window.__cedericPreconnect({origin_js})")));
+            self.with_active(|v| v.eval(&format!("window.__cedericPreconnect && window.__cedericPreconnect({origin_js})")));
         }
         // Show the typed row instantly, then fill in suggestions when they arrive.
         self.suggest_query = text.clone();
@@ -2727,7 +2677,7 @@ impl Browser {
             self.window.set_fullscreen(None);
             if !is_html {
                 let js = "if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document).catch(() => {}); }";
-                self.with_active(|v| v.evaluate_script(js));
+                self.with_active(|v| v.eval(js));
             }
         }
         self.close_menu();
@@ -2749,12 +2699,12 @@ impl Browser {
         let Some(id) = id else { return };
         let Some(i) = self.index_of(id) else { return };
         if i != self.active && !self.tabs[i].pip {
-            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Normal);
+            let _ = self.tabs[i].view.set_memory_level(MemLevel::Normal);
             let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             let _ = self.tabs[i].view.set_visible(true);
         }
         let js = format!("document.dispatchEvent(new CustomEvent('cederic:act', {{ detail: {{ cmd: 'pip', preferCtx: {prefer_ctx} }} }}))");
-        let _ = self.tabs[i].view.evaluate_script(&js);
+        let _ = self.tabs[i].view.eval(&js);
     }
 
     fn toggle_devtools(&mut self) {
@@ -2786,20 +2736,20 @@ impl Browser {
         let js = format!("(() => {{ const t = document.title; document.title = {marker_js}; return t; }})()");
         let Some(tab) = self.active_tab() else { return };
         let page_url = tab.url.clone();
-        let _ = tab.view.evaluate_script_with_callback(&js, move |old_title| {
+        let _ = tab.view.eval_with_result(&js, Box::new(move |old_title| {
             let (dir, marker, proxy, page_url) = (dir.clone(), marker.clone(), proxy.clone(), page_url.clone());
             std::thread::spawn(move || {
                 let url = devtools::frontend_url(&dir, &marker, &page_url);
                 let _ = proxy.send_event(UserEvent::DevtoolsTarget { tab: id, old_title, url });
             });
-        });
+        }));
     }
 
     fn devtools_target(&mut self, tab_id: TabId, old_title: String, url: Option<String>) {
         if let (Some(i), Ok(title)) = (self.index_of(tab_id), serde_json::from_str::<String>(&old_title))
             && let Ok(js) = serde_json::to_string(&title)
         {
-            let _ = self.tabs[i].view.evaluate_script(&format!("document.title = {js}"));
+            let _ = self.tabs[i].view.eval(&format!("document.title = {js}"));
         }
         if !self.devtools.open || self.active_tab().map(|t| t.id) != Some(tab_id) {
             return;
@@ -2821,21 +2771,24 @@ impl Browser {
             }
             None => {
                 let proxy = self.proxy.clone();
-                self.devtools.view = WebViewBuilder::new_with_web_context(&mut self.context)
-                    .with_bounds(rect(0.0, 0.0, 0.0, 0.0))
-                    .with_url(&url)
-                    .with_background_color(if self.dark { (36, 36, 36, 255) } else { (255, 255, 255, 255) })
-                    .with_initialization_script(DEVTOOLS_SCRIPT)
-                    .with_additional_browser_args(BROWSER_ARGS)
-                    .with_user_agent(USER_AGENT)
-                    .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
-                    .with_ipc_handler(move |req| {
-                        if req.body() == "devtools" {
+                let handlers = ViewHandlers {
+                    on_message: Some(Box::new(move |body| {
+                        if body == "devtools" {
                             let _ = proxy.send_event(UserEvent::Shortcut(Shortcut::Devtools));
                         }
-                    })
-                    .build_as_child(&self.window)
-                    .ok();
+                    })),
+                    ..Default::default()
+                };
+                let config = ViewConfig {
+                    role: Role::Helper,
+                    content: Source::Url(&url),
+                    bounds: rect(0.0, 0.0, 0.0, 0.0),
+                    visible: true,
+                    background: Some(if self.dark { (36, 36, 36, 255) } else { (255, 255, 255, 255) }),
+                    profile: None,
+                    init_scripts: vec![DEVTOOLS_SCRIPT.to_owned()],
+                };
+                self.devtools.view = self.engine.create_view(&self.window, config, handlers).ok();
             }
         }
         self.layout();
@@ -2905,7 +2858,7 @@ impl Browser {
             ChromeCmd::Back => self.with_active(|v| v.go_back()),
             ChromeCmd::Forward => self.with_active(|v| v.go_forward()),
             ChromeCmd::Reload => self.with_active(|v| v.reload()),
-            ChromeCmd::Stop => self.with_active(|v| v.evaluate_script("window.stop()")),
+            ChromeCmd::Stop => self.with_active(|v| v.eval("window.stop()")),
             ChromeCmd::Devtools => self.toggle_devtools(),
             ChromeCmd::Minimize => self.window.set_minimized(true),
             ChromeCmd::Maximize => self.window.set_maximized(!self.window.is_maximized()),
@@ -2921,7 +2874,7 @@ impl Browser {
             ChromeCmd::ClearSiteData => {
                 self.history.clear();
                 for t in &self.tabs {
-                    let _ = t.view.clear_all_browsing_data();
+                    let _ = t.view.clear_browsing_data();
                 }
                 self.sync_ui();
             }
@@ -3006,7 +2959,7 @@ impl Browser {
             && spare.id == id
         {
             if matches!(cmd, NewTabCmd::Ready) {
-                Self::push_newtab_state(&spare.view, &self.prefs, &self.history);
+                Self::push_newtab_state(&*spare.view, &self.prefs, &self.history);
             }
             return;
         }
@@ -3016,7 +2969,7 @@ impl Browser {
         }
         match cmd {
             NewTabCmd::Ready => {
-                Self::push_newtab_state(&self.tabs[i].view, &self.prefs, &self.history);
+                Self::push_newtab_state(&*self.tabs[i].view, &self.prefs, &self.history);
                 self.ensure_chrome_focus();
             }
             NewTabCmd::AutoKey { key } => {
@@ -3082,9 +3035,9 @@ impl Browser {
         }
     }
 
-    fn with_active(&self, f: impl FnOnce(&WebView) -> wry::Result<()>) {
+    fn with_active(&self, f: impl FnOnce(&dyn PageView) -> engine::Result<()>) {
         if let Some(t) = self.active_tab() {
-            let _ = f(&t.view);
+            let _ = f(&*t.view);
         }
     }
 
@@ -3112,7 +3065,7 @@ impl Browser {
                                 t.pip = false;
                                 if j != active {
                                     let _ = t.view.set_visible(false);
-                                    let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
+                                    let _ = t.view.set_memory_level(MemLevel::Low);
                                     let _ = t.view.set_bounds(bounds);
                                 }
                             }
@@ -3121,12 +3074,12 @@ impl Browser {
                     self.tabs[i].pip = on;
                     if i != active {
                         if on {
-                            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Normal);
+                            let _ = self.tabs[i].view.set_memory_level(MemLevel::Normal);
                             let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
                             let _ = self.tabs[i].view.set_visible(true);
                         } else {
                             let _ = self.tabs[i].view.set_visible(false);
-                            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Low);
+                            let _ = self.tabs[i].view.set_memory_level(MemLevel::Low);
                             let _ = self.tabs[i].view.set_bounds(bounds);
                         }
                     }
@@ -3168,7 +3121,7 @@ impl Browser {
                 if self.spare.is_none()
                     && let Ok(spare) = self.build_tab(None)
                 {
-                    let _ = spare.view.set_memory_usage_level(MemoryUsageLevel::Low);
+                    let _ = spare.view.set_memory_level(MemLevel::Low);
                     self.spare = Some(spare);
                     self.ensure_chrome_focus();
                 }
@@ -3218,14 +3171,14 @@ impl Browser {
             UserEvent::Load(id, ev, url) => {
                 // Signing in or out of Google finishes on a Google page. Wait until the sign-in and
                 // challenge steps (passwords, passkeys, 2-step) are over before checking.
-                if matches!(ev, PageLoadEvent::Finished)
+                if matches!(ev, LoadPhase::Finished)
                     && host_of(&url).is_some_and(|h| h == "google.com" || h.ends_with(".google.com"))
                     && !["/signin", "/challenge", "/v3/", "/ServiceLogin", "/InteractiveLogin"].iter().any(|p| url.contains(p))
                 {
                     self.schedule_account_probe(Duration::from_millis(1500));
                 }
                 let Some(i) = self.index_of(id) else { return };
-                let started = matches!(ev, PageLoadEvent::Started);
+                let started = matches!(ev, LoadPhase::Started);
                 if started && let Some((query, engine)) = input::extract_search(&url) {
                     self.history.record(&query, &url, engine, true);
                 }
@@ -3238,7 +3191,7 @@ impl Browser {
                 }
                 if started && tab.newtab_bg && url.starts_with("http") {
                     tab.newtab_bg = false;
-                    let _ = tab.view.set_background_color((255, 255, 255, 255));
+                    let _ = tab.view.set_background((255, 255, 255, 255));
                 }
                 if started && host_of(&url) != host_of(&tab.url) {
                     tab.favicon = if host_of(&url) == Some(REAL_SEARCH_HOST) {
@@ -3258,18 +3211,18 @@ impl Browser {
                         let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
                     }
                     let proxy = self.proxy.clone();
-                    let _ = tab.view.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
+                    let _ = tab.view.eval_with_result(FAVICON_SCRIPT, Box::new(move |res| {
                         if let Some(icon) = parse_favicon(&res) {
                             let _ = proxy.send_event(UserEvent::Favicon(id, icon));
                         }
-                    });
+                    }));
                     if !is_newtab {
                         let proxy = self.proxy.clone();
-                        let _ = view_ref.evaluate_script_with_callback(FAVICON_SCRIPT, move |res| {
+                        let _ = view_ref.eval_with_result(FAVICON_SCRIPT, Box::new(move |res| {
                             if let Some(icon) = parse_favicon(&res) {
                                 let _ = proxy.send_event(UserEvent::Favicon(id, icon));
                             }
-                        });
+                        }));
                     }
                     if !is_newtab && self.tabs.len() > 1 {
                         let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
@@ -3330,13 +3283,13 @@ impl Browser {
                 let bg = self.newtab_color();
                 for tab in &self.tabs {
                     if tab.newtab_bg {
-                        let _ = tab.view.set_background_color(bg);
+                        let _ = tab.view.set_background(bg);
                     }
                 }
                 if let Some(spare) = &self.spare
                     && spare.newtab_bg
                 {
-                    let _ = spare.view.set_background_color(bg);
+                    let _ = spare.view.set_background(bg);
                 }
                 self.window.request_redraw();
             }
@@ -3457,8 +3410,8 @@ impl Browser {
     }
 }
 
-fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
-    Rect { position: LogicalPosition::new(x, y).into(), size: LogicalSize::new(w, h).into() }
+fn rect(x: f64, y: f64, w: f64, h: f64) -> Bounds {
+    Bounds::new(x, y, w, h)
 }
 
 /// The page reports its own favicon, so only accept web or inline image URLs.
@@ -3552,7 +3505,7 @@ fn load_app_icon() -> Option<WinIcon> {
     WinIcon::from_rgba(rgba, w, h).ok()
 }
 
-fn main() -> wry::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     update::cleanup();
@@ -3597,7 +3550,7 @@ fn main() -> wry::Result<()> {
 
     let mut history = HistoryStore::open(&dir);
     history.clear();
-    let context = WebContext::new(Some(dir.clone()));
+    let engine: Box<dyn PageEngine> = Box::new(engine_webview2::WryEngine::new(dir.clone()));
 
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
@@ -3657,7 +3610,7 @@ fn main() -> wry::Result<()> {
         history,
         prefs,
         https_upgrades: 0,
-        context,
+        engine,
         data_dir: dir,
         proxy,
         quit: false,
