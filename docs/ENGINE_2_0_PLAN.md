@@ -15,6 +15,10 @@ one is good enough, so users are never left with a browser that cannot open thei
 
 Success is defined by numbers (section 6), not by "we wrote it ourselves".
 
+**Priority order (set by the owner, 2026-11-06): speed first, and as useful as WebView2.** "Fastest everything"
+and "lowest memory" pull in opposite directions (a JIT, GPU rasterization and caches all cost memory). Speed and
+compatibility win ties; memory is minimized *within* that, mainly via process/tab discarding and shared caches.
+
 ## 2. Where we start (audit of this repo)
 
 All engine coupling is in `src/main.rs` (`build_tab`, `Browser::*`), `src/devtools.rs` and `src/thumbs.rs`.
@@ -65,14 +69,16 @@ Events: `Started, Finished, Title, NewWindow, Ipc, Pip, Fullscreen`. The securit
 | CSS cascade | Stylo | own cascade over cssparser | Stylo is heavy and MPL-2, but writing a cascade is a huge compat cost |
 | Layout | Taffy (block/flex/grid) + own inline, float, table | Blitz layout | Blitz is pre-alpha, float support unconfirmed; Servo layout is not usable standalone |
 | Text | cosmic-text (already used) | Parley | Avoid two shaping stacks |
-| Paint | tiny-skia / vello_cpu (CPU) | Vello/wgpu GPU | GPU stack costs roughly 50-150 MB driver memory *(unverified)*, conflicts with the memory goal; decide by measurement |
-| JavaScript | **open decision**, see below | | |
+| Paint | **GPU**: Vello or Skia (Graphite/Ganesh) on D3D12 via wgpu, compositor with GPU-resident tile layers | tiny-skia / vello_cpu as software fallback | Speed is the priority, so GPU is the default; GPU stack costs roughly 50-150 MB driver memory *(unverified)*, accepted. Bake-off picks Vello vs Skia |
+| JavaScript | **V8 (JIT)** via the `v8` crate | QuickJS-ng only for tiny internal pages | Only option with JIT speed and full ES/Wasm support. Cost: ~20-30 MB binary, several MB per isolate *(unverified)*. Heavy `unsafe` stays in the renderer process |
 | Network | hyper + rustls + h2, own cookie jar/cache | quinn+h3 later | HTTP/3 still unstable in the ecosystem |
 | Whole engine fallback | Servo crate (0.x, monthly breaking releases, LTS branch) | WebView2 | Evaluate in Phase 1 as a bake-off |
 
-**JavaScript is the make-or-break layer.** V8 is fastest but large and a heavy build; QuickJS-ng (rquickjs)
-is tiny but interpreter-only; Boa is pure Rust but slower; SpiderMonkey is painful on Windows. Phase 1
-measures each on real pages before we commit.
+**JavaScript is the make-or-break layer.** Given "fastest" and WebView2-level usefulness, the default is V8
+(JIT, Wasm, full modern ES), with Phase 1 confirming its Windows build, isolate-per-site memory and embedding
+cost. Interpreters (QuickJS-ng, Boa) are ruled out for general pages because they are too slow. Note that
+V8 alone is not a web platform: DOM, fetch, workers, Web APIs, media, WebGL/WebGPU and WebRTC are all ours to build
+or integrate, and are the real parity cost.
 
 `unsafe_code = "forbid"` only covers our crate. JS engines, Stylo and graphics crates contain `unsafe`.
 Plan: keep them in separate workspace crates / a renderer process, audit with `cargo-geiger` / `cargo-vet`,
@@ -91,8 +97,8 @@ Each workstream is one branch, one owner, small PRs, per AGENTS.md. Claim it in 
   Baseline WebView2.
 
 **Phase 1: de-risk (4-6 weeks, parallel, throwaway prototypes).**
-- WS-D *JS bake-off*: V8 vs QuickJS-ng vs Boa vs SpiderMonkey: idle memory per context, speed, Windows build.
-- WS-E *Paint bake-off*: tiny-skia vs vello_cpu vs GPU on a fixed display list; memory and frame time.
+- WS-D *V8 embedding spike*: `v8` crate on Windows, isolate/context cost, snapshotting for fast startup, a minimal DOM binding layer; compare to Boa/SpiderMonkey only as sanity checks.
+- WS-E *Paint bake-off*: Vello vs Skia on D3D12 with a fixed display list; frame time, latency, GPU memory; tiny-skia as software fallback.
 - WS-F *Servo bake-off*: embed the `servo` crate with software readback on our surface; measure memory/size/compat vs WebView2.
 - WS-G *Compat gap study*: run html5ever+Stylo+Taffy prototype over the corpus; count what breaks (float, inline, tables).
 - Gate: written go/no-go with numbers. If Servo or WebView2 meets the targets, we do not build layers ourselves.
