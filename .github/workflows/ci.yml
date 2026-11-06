@@ -1,0 +1,42 @@
+# Builds and tests Persona on Windows for every push and pull request, and uploads the exe as a
+# workflow artifact (Actions tab -> the run -> Artifacts). It never creates a release or a tag,
+# so installed copies do not auto-update from it (see release.yml for that).
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: -D warnings
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Name the exe after the commit
+        shell: pwsh
+        run: Copy-Item target\release\Persona.exe "Persona-${env:GITHUB_SHA}.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Persona-${{ github.sha }}
+          path: Persona-${{ github.sha }}.exe
+          retention-days: 14

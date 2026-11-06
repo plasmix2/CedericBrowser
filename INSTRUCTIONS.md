@@ -101,6 +101,8 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`claude/friendly-ptolemy-dzfqha` (CI)**: new `.github/workflows/ci.yml` builds (`-D warnings`) and tests on Windows for every push/PR and uploads `Persona-<sha>.exe` as a 14-day workflow artifact. It creates no tag or release, so it never triggers auto-update. Not yet run on GitHub.
+
 - **`claude/friendly-ptolemy-dzfqha` (Persona 2.0, Phase 0 / WS-C: benchmark harness)**:
   - New `bench/` (`measure.ps1`, `corpus.txt`, `README.md`; results in git-ignored `bench/results/`). Measures startup time and private working set of the whole `Persona.exe` process tree for idle, one-tab and all-tabs runs, plus memory per tab, in a throwaway `LOCALAPPDATA`. Engine-agnostic, so it can compare WebView2 with a future Servo build.
   - `main.rs`: every command-line argument is now a URL/search; the first is the active tab, the rest open in the background (was: only the first, others ignored).
