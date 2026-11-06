@@ -48,6 +48,9 @@ const HERO_H: f32 = 160.0;
 const DOT: f32 = 30.0;
 /// Where the sliders' tracks start (their labels sit to the left).
 const SLIDER_X: f32 = 92.0;
+/// Frames bigger than this (in pixels) do not keep cached GPU buffers once they are gone: about
+/// the size of the toolbar strip on a large screen.
+pub const TRIM_PIXELS: u64 = 1_200_000;
 /// Width of the switches dialog (`Content::Modal`).
 pub const MODAL_W: f32 = 420.0;
 /// Radius of a slider's knob, which stays inside the track.
@@ -465,6 +468,26 @@ impl Popups {
             p.v.rows.clear();
             p.pending_pos = None;
             p.window.set_outer_position(PARKED);
+            // The big ones (the blurred backdrop covers the window; dialogs and hover cards are
+            // large) give their pixel buffers back while parked, and so does the GPU.
+            if matches!(kind, Kind::Scrim | Kind::Modal | Kind::Preview) {
+                p.pm = Pixmap::new(1, 1).expect("1x1 pixmap");
+                p.card = Pixmap::new(1, 1).expect("1x1 pixmap");
+                p.frame = None;
+                p.window.set_inner_size(PhysicalSize::new(1, 1));
+                p.phys_size = (1, 1);
+                let one = NonZeroU32::new(1).expect("1 is not zero");
+                if p.surface.resize(one, one).is_ok() {
+                    p.surface_size = (1, 1);
+                }
+                if let Some(e) = &self.engine {
+                    e.trim(TRIM_PIXELS);
+                    if kind == Kind::Scrim {
+                        let mut e = e.clone();
+                        e.forget_texture("popup:scrim");
+                    }
+                }
+            }
         }
     }
 

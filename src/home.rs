@@ -121,6 +121,18 @@ impl Home {
         }
     }
 
+    /// Frees the page's picture (a full window of pixels, here and on the GPU) while no New Tab
+    /// is on screen; it is drawn again when one is.
+    pub fn release(&mut self) {
+        if self.frame.width() > 1 {
+            self.frame = Pixmap::new(1, 1).expect("1x1 pixmap");
+            self.dirty = true;
+            if let Some(e) = &self.engine {
+                e.trim(crate::popups::TRIM_PIXELS);
+            }
+        }
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

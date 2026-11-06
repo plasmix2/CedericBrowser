@@ -124,6 +124,11 @@ impl Engine {
         self.0.borrow_mut().ensure_texture(key, pm);
     }
 
+    /// Frees the GPU's cached buffers for frames bigger than `max_pixels`.
+    pub fn trim(&self, max_pixels: u64) {
+        self.0.borrow_mut().renderer.trim(max_pixels);
+    }
+
     pub fn forget_texture(&mut self, key: &str) {
         self.0.borrow_mut().forget_texture(key);
     }

@@ -102,8 +102,8 @@ const STEALTH_SCRIPT: &str = r#"
 
 /// Every WebView sharing a data directory must use identical arguments.
 const BROWSER_ARGS: &str = "\
-    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate \
-    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,BackForwardCache,ParallelDownloading,UseEcoQoSForBackgroundProcess \
+    --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,InterestFeedContentSuggestions,Translate,SpareRendererForSitePerProcess,BackForwardCache,msEdgeShopping,msEdgeCollections \
+    --enable-features=NetworkServiceInProcess2,AsyncDns,HappyEyeballsV3,EncryptedClientHello,ParallelDownloading,UseEcoQoSForBackgroundProcess,IntensiveWakeUpThrottling \
     --disable-blink-features=AutomationControlled \
     --autoplay-policy=no-user-gesture-required \
     --enable-quic \
@@ -1972,8 +1972,8 @@ impl Browser {
     /// goes; title, icon, address and snapshot stay, and the page loads again when it is shown.
     /// Tabs playing video or in Picture-in-Picture, loading, or inspected by DevTools are kept.
     fn housekeep(&mut self) {
-        const IDLE: Duration = Duration::from_secs(10 * 60);
-        const MAX_LIVE: usize = 6;
+        const IDLE: Duration = Duration::from_secs(5 * 60);
+        const MAX_LIVE: usize = 4;
         let now = Instant::now();
         if let Some(t) = self.tabs.get_mut(self.active) {
             t.last_seen = now;
@@ -2183,6 +2183,8 @@ impl Browser {
         if is_newtab {
             self.refresh_home();
             self.focus_address();
+        } else {
+            self.home.release();
         }
         self.maybe_setup();
         if self.devtools.open {
@@ -2519,6 +2521,7 @@ impl Browser {
 
     /// Shows the active tab's page after it left the New Tab page.
     fn reveal_active_page(&mut self) {
+        self.home.release();
         let bounds = self.content_bounds();
         if let Some(tab) = self.tabs.get(self.active) {
             let _ = tab.view.set_bounds(bounds);

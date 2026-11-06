@@ -576,6 +576,17 @@ impl Renderer {
         });
     }
 
+    /// Persona patch: frees the cached offscreen textures, read-back buffers and blur targets
+    /// bigger than `max_pixels`, so a full-window frame (a dialog's backdrop) does not keep its
+    /// buffers after it is gone.
+    pub fn trim(&mut self, max_pixels: u64) {
+        self.offscreen.retain(|(w, h, _)| (*w as u64) * (*h as u64) <= max_pixels);
+        self.readback.retain(|(size, _)| *size <= max_pixels * 4);
+        if self.blur_targets.as_ref().is_some_and(|t| (t.size.0 as u64) * (t.size.1 as u64) > max_pixels) {
+            self.blur_targets = None;
+        }
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
