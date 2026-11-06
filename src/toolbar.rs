@@ -35,7 +35,6 @@ const TAB_H: f32 = 34.0;
 const WIN_BTN_W: f32 = 46.0;
 const BTN: f32 = 34.0;
 /// Space between the groups of buttons on the right of the toolbar (the usual gap is 2).
-const GROUP_GAP: f32 = 12.0;
 const ROW_Y: f32 = TITLE_H + 5.0;
 const FONT: f32 = 12.5;
 const URL_FONT: f32 = 13.5;
@@ -60,8 +59,6 @@ pub struct Model {
     pub can_forward: bool,
     pub loading: bool,
     pub maximized: bool,
-    pub devtools: bool,
-    pub pip: bool,
     pub bookmarked: bool,
     pub brand: Brand,
     pub color: PersonaColor,
@@ -85,11 +82,9 @@ enum Hit {
     Reload,
     Omni,
     Star,
-    Bookmarks,
-    Pip,
-    History,
     Theme,
-    Devtools,
+    /// The main menu: bookmarks, history, picture-in-picture, developer tools, settings.
+    Menu,
     DragArea,
     None,
 }
@@ -197,9 +192,6 @@ pub struct Toolbar {
     /// Button under the pointer, when it started hovering, and whether its tooltip is up.
     tip: Option<(Hit, Instant, bool)>,
     last_frame: Instant,
-    bg: Option<Pixmap>,
-    /// Whether `bg` has been uploaded to the engine since it last changed.
-    bg_uploaded: bool,
     logo: Option<Pixmap>,
     /// Requests for the browser, drained after each event.
     pub cmds: Vec<ChromeCmd>,
@@ -279,11 +271,8 @@ fn hit_key(h: Hit) -> usize {
         Hit::Forward => 6,
         Hit::Reload => 7,
         Hit::Omni => 8,
-        Hit::History => 9,
-        Hit::Devtools => 10,
+        Hit::Menu => 9,
         Hit::Star => 11,
-        Hit::Bookmarks => 12,
-        Hit::Pip => 13,
         Hit::Theme => 14,
         _ => 0,
     }
@@ -349,8 +338,6 @@ impl Toolbar {
             card_leave: None,
             tip: None,
             last_frame: now,
-            bg: None,
-            bg_uploaded: false,
             logo: Pixmap::decode_png(include_bytes!("ui/logo_64.png")).ok(),
             cmds: Vec::new(),
         }
@@ -371,11 +358,6 @@ impl Toolbar {
         };
         self.model.color = color;
         self.model.badge_letter = badge_letter.to_uppercase();
-    }
-
-    pub fn set_background(&mut self, bg: Option<Pixmap>) {
-        self.bg = bg;
-        self.bg_uploaded = false;
     }
 
     pub fn set_size(&mut self, scale: f32, width: f32) {
@@ -455,13 +437,19 @@ impl Toolbar {
 
     /// Where the history dropdown hangs from (right edge, top), in logical pixels.
     pub fn history_anchor(&self) -> (f32, f32) {
-        let r = self.geo().hist;
+        let r = self.geo().menu;
         (r.x + r.w, r.y + r.h + 4.0)
     }
 
     /// Where the bookmarks dropdown hangs from (right edge, top), in logical pixels.
     pub fn bookmarks_anchor(&self) -> (f32, f32) {
-        let r = self.geo().bookmarks;
+        let r = self.geo().menu;
+        (r.x + r.w, r.y + r.h + 4.0)
+    }
+
+    /// Where the main menu hangs from (right edge, top), in logical pixels.
+    pub fn menu_anchor(&self) -> (f32, f32) {
+        let r = self.geo().menu;
         (r.x + r.w, r.y + r.h + 4.0)
     }
 
@@ -550,13 +538,10 @@ impl Toolbar {
 
     fn geo(&self) -> Geo {
         let w = self.width;
-        // Right side, in groups: [star bookmarks history] | [picture-in-picture dev tools] | persona.
-        let theme = R { x: w - 8.0 - BTN, y: ROW_Y, w: BTN, h: BTN };
-        let dev = R { x: theme.x - GROUP_GAP - BTN, ..theme };
-        let pip = R { x: dev.x - 2.0 - BTN, ..theme };
-        let hist = R { x: pip.x - GROUP_GAP - BTN, ..theme };
-        let bookmarks = R { x: hist.x - 2.0 - BTN, ..theme };
-        let star = R { x: bookmarks.x - 2.0 - BTN, ..theme };
+        // Right side: star, then the persona and the main menu. Everything else is in the menus.
+        let menu = R { x: w - 8.0 - BTN, y: ROW_Y, w: BTN, h: BTN };
+        let theme = R { x: menu.x - 4.0 - BTN, ..menu };
+        let star = R { x: theme.x - 6.0 - BTN, ..menu };
         let ox = 8.0 + 3.0 * (BTN + 2.0) + 6.0;
         Geo {
             back: R { x: 8.0, y: ROW_Y, w: BTN, h: BTN },
@@ -564,11 +549,8 @@ impl Toolbar {
             reload: R { x: 8.0 + 2.0 * (BTN + 2.0), y: ROW_Y, w: BTN, h: BTN },
             omni: R { x: ox, y: ROW_Y, w: (star.x - 8.0 - ox).max(60.0), h: BTN },
             star,
-            bookmarks,
-            pip,
-            hist,
             theme,
-            dev,
+            menu,
             new_tab: R { x: self.tabs_end() + 6.0, y: TAB_Y + 2.0, w: 30.0, h: 30.0 },
             min: R { x: w - 3.0 * WIN_BTN_W, y: 0.0, w: WIN_BTN_W, h: TITLE_H },
             max: R { x: w - 2.0 * WIN_BTN_W, y: 0.0, w: WIN_BTN_W, h: TITLE_H },
@@ -613,11 +595,8 @@ impl Toolbar {
                 (g.reload, Hit::Reload),
                 (g.omni, Hit::Omni),
                 (g.star, Hit::Star),
-                (g.bookmarks, Hit::Bookmarks),
-                (g.pip, Hit::Pip),
-                (g.hist, Hit::History),
                 (g.theme, Hit::Theme),
-                (g.dev, Hit::Devtools),
+                (g.menu, Hit::Menu),
             ] {
                 if r.has(x, y) {
                     return h;
@@ -779,12 +758,20 @@ impl Toolbar {
         if self.locked && !matches!(hit, Hit::Min | Hit::Max | Hit::Close | Hit::DragArea) {
             return;
         }
-        self.cmds.push(ChromeCmd::Dismiss);
         self.end_hover_card();
         self.end_tip();
         if self.editing && hit != Hit::Omni {
             self.blur_address();
         }
+        // Dropdown buttons open on press (no waiting for the release); pressing again closes
+        // the dropdown (`main.rs` toggles it, so no Dismiss first).
+        if button == MouseButton::Left && matches!(hit, Hit::Theme | Hit::Menu) {
+            self.pressed = Some(hit);
+            let (x, y) = if hit == Hit::Theme { self.theme_anchor() } else { self.menu_anchor() };
+            self.cmds.push(if hit == Hit::Theme { ChromeCmd::ThemeMenu { x: x as f64, y: y as f64 } } else { ChromeCmd::MainMenu { x: x as f64, y: y as f64 } });
+            return;
+        }
+        self.cmds.push(ChromeCmd::Dismiss);
         match (button, hit) {
             (MouseButton::Middle, Hit::Tab(id) | Hit::TabClose(id)) => self.close_tab(id),
             (MouseButton::Right, Hit::Tab(id) | Hit::TabClose(id)) => {
@@ -842,7 +829,9 @@ impl Toolbar {
             }
         }
         let Some(p) = self.pressed.take() else { return };
-        if self.hit(x, y) != p {
+        // A release a few pixels off the button (a slight wobble while clicking) still counts.
+        let near = self.tip_rect(p).is_some_and(|r| x >= r.x - 6.0 && x < r.x + r.w + 6.0 && y >= r.y - 6.0 && y < r.y + r.h + 6.0);
+        if self.hit(x, y) != p && !near {
             return;
         }
         let cmd = match p {
@@ -864,20 +853,6 @@ impl Toolbar {
                 }
             }
             Hit::Star if !self.model.url.is_empty() => ChromeCmd::ToggleBookmark,
-            Hit::Bookmarks => {
-                let (x, y) = self.bookmarks_anchor();
-                ChromeCmd::BookmarksMenu { x: x as f64, y: y as f64 }
-            }
-            Hit::Pip => ChromeCmd::Pip,
-            Hit::History => {
-                let (x, y) = self.history_anchor();
-                ChromeCmd::HistoryMenu { x: x as f64, y: y as f64 }
-            }
-            Hit::Theme => {
-                let (x, y) = self.theme_anchor();
-                ChromeCmd::ThemeMenu { x: x as f64, y: y as f64 }
-            }
-            Hit::Devtools => ChromeCmd::Devtools,
             _ => return,
         };
         self.cmds.push(cmd);
@@ -953,12 +928,9 @@ impl Toolbar {
             Hit::Star if self.model.url.is_empty() => return None,
             Hit::Star if self.model.bookmarked => "Remove bookmark (Ctrl+D)",
             Hit::Star => "Bookmark this page (Ctrl+D)",
-            Hit::Bookmarks => "Bookmarks (Ctrl+B)",
-            Hit::Pip => "Picture in picture (Alt+P)",
-            Hit::History => "Search history (Ctrl+H)",
+            Hit::Menu => "Menu",
             Hit::Theme if self.model.update_ready => "Update ready: restart from this menu",
             Hit::Theme => "Persona and theme",
-            Hit::Devtools => "Developer tools (F12)",
             Hit::NewTab => "New tab (Ctrl+T)",
             Hit::Min => "Minimize",
             Hit::Max if self.model.maximized => "Restore down",
@@ -975,11 +947,8 @@ impl Toolbar {
             Hit::Forward => g.fwd,
             Hit::Reload => g.reload,
             Hit::Star => g.star,
-            Hit::Bookmarks => g.bookmarks,
-            Hit::Pip => g.pip,
-            Hit::History => g.hist,
             Hit::Theme => g.theme,
-            Hit::Devtools => g.dev,
+            Hit::Menu => g.menu,
             Hit::NewTab => g.new_tab,
             Hit::Min => g.min,
             Hit::Max => g.max,
@@ -1275,7 +1244,7 @@ impl Toolbar {
 
         for h in [
             Hit::NewTab, Hit::Min, Hit::Max, Hit::Close, Hit::Back, Hit::Forward, Hit::Reload,
-            Hit::Omni, Hit::Star, Hit::Bookmarks, Hit::Pip, Hit::History, Hit::Theme, Hit::Devtools,
+            Hit::Omni, Hit::Star, Hit::Theme, Hit::Menu,
         ] {
             let target = if self.hover == h { 1.0 } else { 0.0 };
             busy |= approach01(&mut self.hover_fade[hit_key(h)], target, kf);
@@ -1350,13 +1319,6 @@ impl Toolbar {
         if let Some(logo) = &self.logo {
             engine.ensure_texture("persona:logo", logo);
         }
-        if !self.bg_uploaded {
-            engine.forget_texture("persona:bg");
-            if let Some(bg) = &self.bg {
-                engine.ensure_texture("persona:bg", bg);
-            }
-            self.bg_uploaded = true;
-        }
     }
 
     fn paint(&mut self, c: &mut Painter) {
@@ -1365,10 +1327,6 @@ impl Toolbar {
         c.backdrop = th.strip;
         c.rect(0.0, 0.0, self.width, TITLE_H, th.strip);
         c.rect(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar);
-        if self.bg.is_some() && c.image("persona:bg", 0.0, 0.0, self.width, HEIGHT, 0.44) {
-            c.rect(0.0, 0.0, self.width, TITLE_H, th.strip.with_alpha(0.56));
-            c.rect(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar.with_alpha(0.74));
-        }
 
         self.draw_tabs(c, &th);
         let g = self.geo();
@@ -1405,8 +1363,7 @@ impl Toolbar {
         for (r, h, icon, on) in [
             (g.back, Hit::Back, Icon::Back, self.model.can_back),
             (g.fwd, Hit::Forward, Icon::Forward, self.model.can_forward),
-            (g.bookmarks, Hit::Bookmarks, Icon::Bookmarks, true),
-            (g.hist, Hit::History, Icon::History, true),
+            (g.menu, Hit::Menu, Icon::Menu, true),
         ] {
             if on {
                 self.button_bg(c, r, h, 9.0, &th);
@@ -1440,24 +1397,6 @@ impl Toolbar {
         c.icon_rot(Icon::Stop, rx, ry, rs, th.fg.with_alpha(m), (m - 1.0) * std::f32::consts::PI);
         self.button_bg(c, g.theme, Hit::Theme, 9.0, &th);
         self.draw_avatar(c, g.theme, &th);
-        for (r, h, icon, active) in [
-            (g.pip, Hit::Pip, Icon::Pip, self.model.pip),
-            (g.dev, Hit::Devtools, Icon::Code, self.model.devtools),
-        ] {
-            if active {
-                c.rrect(r.x, r.y, r.w, r.h, 9.0, th.accent.with_alpha(0.14));
-            } else {
-                self.button_bg(c, r, h, 9.0, &th);
-            }
-            let sz = 20.0 * self.press_scale(h);
-            c.icon(icon, r.x + 7.0 + (20.0 - sz) / 2.0, r.y + 7.0 + (20.0 - sz) / 2.0, sz, if active { th.accent } else { th.fg });
-        }
-
-        // Thin dividers between the button groups.
-        for left in [g.pip, g.theme] {
-            let x = left.x - GROUP_GAP / 2.0 + 1.0;
-            c.hairline_v(x, ROW_Y + 8.0, BTN - 16.0, th.border);
-        }
 
         self.draw_omni(c, g.omni, &th);
 
@@ -1740,11 +1679,8 @@ struct Geo {
     reload: R,
     omni: R,
     star: R,
-    bookmarks: R,
-    pip: R,
-    hist: R,
     theme: R,
-    dev: R,
+    menu: R,
     new_tab: R,
     min: R,
     max: R,

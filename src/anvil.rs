@@ -456,11 +456,11 @@ struct IconDef {
     grid: f32,
 }
 
-const ALL_ICONS: [Icon; 35] = [
+const ALL_ICONS: [Icon; 36] = [
     Icon::Back, Icon::Forward, Icon::Reload, Icon::Stop, Icon::Close, Icon::Plus, Icon::Lock, Icon::Info,
     Icon::Search, Icon::Globe, Icon::Star, Icon::StarFilled, Icon::Bookmarks, Icon::Pip, Icon::History,
     Icon::Code, Icon::WinMin, Icon::WinMax, Icon::WinRestore, Icon::WinClose,
-    Icon::ExternalLink, Icon::Copy, Icon::Link, Icon::Photo, Icon::Printer, Icon::Maximize, Icon::UserCircle, Icon::Users, Icon::Settings, Icon::ChevronRight, Icon::Check, Icon::Logout, Icon::ShieldLock, Icon::Trash, Icon::Sparkles,
+    Icon::ExternalLink, Icon::Copy, Icon::Link, Icon::Photo, Icon::Printer, Icon::Maximize, Icon::UserCircle, Icon::Users, Icon::Settings, Icon::ChevronRight, Icon::Check, Icon::Logout, Icon::ShieldLock, Icon::Trash, Icon::Sparkles, Icon::Menu,
 ];
 
 fn icon_def(icon: Icon) -> &'static IconDef {

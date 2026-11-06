@@ -617,8 +617,6 @@ enum UserEvent {
     Favicon(TabId, String),
     /// A favicon was fetched and decoded (or failed to) for the tab strip.
     IconLoaded(String, Option<Pixmap>),
-    /// A wallpaper picked from a web address finished downloading.
-    BackgroundLoaded(String, Option<Pixmap>),
     OpenInNewTab(String),
     Suggestions(suggest::Response),
     DevtoolsTarget { tab: TabId, old_title: String, url: Option<String> },
@@ -681,6 +679,8 @@ enum ChromeCmd {
     TipEnd,
     /// Ctrl+Shift+T: reopen the tab closed last.
     ReopenTab,
+    /// The main menu button.
+    MainMenu { x: f64, y: f64 },
 }
 
 /// Messages from web content (untrusted): only these exact strings are accepted.
@@ -788,9 +788,10 @@ enum MenuAction {
     SelectPersona(String),
     OpenNewPersona,
     OpenManagePersonas,
-    ChooseBackground,
-    SetBackgroundUrl(String),
-    ClearBackground,
+    OpenNewTab,
+    ReopenTab,
+    Pip,
+    Devtools,
     ToggleFullscreen,
     Print,
     ClearSiteData,
@@ -1191,15 +1192,6 @@ impl Prefs {
         self.bg_cache.get(&key).and_then(|opt| opt.as_deref())
     }
 
-    fn bg_strip(&self) -> Option<Pixmap> {
-        self.bg_strip_for(&self.active_persona_id)
-    }
-
-    fn bg_strip_for(&self, id_or_brand: impl AsRef<str>) -> Option<Pixmap> {
-        let key = id_or_brand.as_ref().to_ascii_lowercase();
-        self.strip_cache.get(&key).and_then(|opt| opt.clone())
-    }
-
     fn bg_path(&self, id: &str) -> PathBuf {
         self.data_dir.join(format!("background_{id}.txt"))
     }
@@ -1468,14 +1460,18 @@ impl FormKey {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuOwner {
+    Persona,
+    Main,
+}
+
 /// Which dialog the modal popup is showing.
 #[derive(Clone)]
 enum ModalKind {
     Settings,
     Persona,
     ConfirmDelete(String),
-    /// A message with only an OK button.
-    Notice,
     /// The first-run setup, at this step: 0 name and color, 1 Google, 2 permissions, 3 done.
     Setup(u8),
 }
@@ -1717,10 +1713,10 @@ struct Browser {
     menu_actions: Vec<Option<MenuAction>>,
     modal_kind: Option<ModalKind>,
     persona_form: Option<PersonaFormState>,
+    /// Which toolbar dropdown the open menu belongs to, so pressing that button again closes it.
+    menu_owner: Option<MenuOwner>,
     /// The New Tab page, drawn natively under the toolbar while a New Tab is active.
     home: home::Home,
-    /// Which wallpaper `home` was given (the saved data URL), to decode it only when it changes.
-    home_bg_key: Option<String>,
     /// The New Tab page is what the window's buffer shows under the toolbar.
     home_on_screen: bool,
     /// Setup's current step, and whether it is waiting for a Google sign-in in a tab.
@@ -2237,8 +2233,6 @@ impl Browser {
             can_forward: tab.can_forward,
             loading: tab.loading,
             maximized: self.window.is_maximized(),
-            devtools: self.devtools.open,
-            pip: self.tabs.iter().any(|t| t.pip),
             bookmarked: self.prefs.is_bookmarked(&tab.url),
             brand,
             color,
@@ -2342,6 +2336,7 @@ impl Browser {
     }
 
     fn close_menu(&mut self) {
+        self.menu_owner = None;
         self.sub_for = None;
         self.popups.hide(PopupKind::Menu);
         self.popups.hide(PopupKind::Sub);
@@ -2467,6 +2462,11 @@ impl Browser {
 
     /// Recent anonymous session searches, newest first, as a dropdown under the history button.
     fn history_menu(&mut self, right: f64, y: f64) {
+        let items = self.history_items();
+        self.show_menu(items, (right - 248.0).max(0.0), y);
+    }
+
+    fn history_items(&self) -> Vec<MenuItem> {
         const MAX: usize = 10;
         let entries = self.history.entries();
         let has_entries = !entries.is_empty();
@@ -2491,7 +2491,7 @@ impl Browser {
         }
         items.push(MenuItem::sep());
         items.push(MenuItem::new("Clear cookies and site data", MenuAction::ClearSiteData).hint("Signs you out"));
-        self.show_menu(items, (right - 248.0).max(0.0), y);
+        items
     }
 
     fn toggle_bookmark(&mut self) {
@@ -2505,40 +2505,9 @@ impl Browser {
 
     /// Hands the New Tab page what it shows (persona, bookmarks, wallpaper) and repaints it.
     fn refresh_home(&mut self) {
-        let p = self.prefs.active_persona();
-        let avatar = p.pfp.clone().or_else(|| self.google.as_ref().map(|g| g.photo.clone()).filter(|u| !u.is_empty()));
-        let data = home::HomeData {
-            persona: p.name.clone(),
-            letter: p.badge_letter(),
-            has_bg: self.prefs.background().is_some(),
-            tiles: self.prefs.active_bookmarks().iter().map(|b| home::Tile { title: b.title.clone(), url: b.url.clone() }).collect(),
-            avatar,
-        };
+        let tiles = self.prefs.active_bookmarks().iter().map(|b| home::Tile { title: b.title.clone(), url: b.url.clone() }).collect();
         self.home.set_theme(self.dark, self.prefs.active_color());
-        self.home.set_data(data);
-        if let Some(u) = self.home.wants_image() {
-            match self.popups.image(u) {
-                Some(img) => {
-                    let (u, img) = (u.to_owned(), img.clone());
-                    self.home.image_loaded(&u, Some(&img));
-                }
-                None => {
-                    let _ = self.icons_tx.send(u.to_owned());
-                }
-            }
-        }
-        let key = self.prefs.background().map(str::to_owned);
-        if key != self.home_bg_key {
-            self.home_bg_key = key.clone();
-            let pic = key.as_deref().and_then(decode_data_image);
-            if pic.is_none()
-                && let Some(url) = key.filter(|k| k.starts_with("http"))
-            {
-                // A wallpaper saved as a web address: fetch it once and keep a copy.
-                self.fetch_background(url);
-            }
-            self.home.set_background(pic.map(|p| fit_within(&p, 2560, 1600)));
-        }
+        self.home.set_tiles(tiles);
         self.window.request_redraw();
     }
 
@@ -2559,48 +2528,6 @@ impl Browser {
         !self.fullscreen && self.active_tab().is_some_and(|t| t.is_newtab)
     }
 
-    fn fetch_background(&self, url: String) {
-        let proxy = self.proxy.clone();
-        std::thread::spawn(move || {
-            let img = favicons::fetch_picture(&url);
-            let _ = proxy.send_event(UserEvent::BackgroundLoaded(url, img));
-        });
-    }
-
-    /// Saves `img` as the active persona's wallpaper (as a PNG data URL, with the blurred strip the
-    /// tab strip shows). `from` is the web address it came from, if it is the one currently saved.
-    fn set_background_picture(&mut self, img: &Pixmap, from: Option<&str>) {
-        if from.is_some() && self.prefs.background() != from {
-            return;
-        }
-        let img = fit_within(img, 1920, 1080);
-        let Ok(png) = img.encode_png() else { return };
-        let data = format!("data:image/png;base64,{}", base64_encode(&png));
-        let strip = strip_picture(&img).and_then(|p| p.encode_png().ok()).map(|b| format!("data:image/png;base64,{}", base64_encode(&b)));
-        self.apply_background(Some(data), strip.as_deref());
-    }
-
-    /// Background… on the New Tab page or in the persona menu: a native file dialog.
-    fn choose_background(&mut self) {
-        let picked = rfd::FileDialog::new()
-            .set_title("Choose a background")
-            .add_filter("Images", &["png", "jpg", "jpeg"])
-            .set_parent(&*self.window)
-            .pick_file();
-        let Some(path) = picked else { return };
-        let img = std::fs::read(&path).ok().and_then(|b| favicons::decode_picture(&b));
-        match img {
-            Some(img) => self.set_background_picture(&img, None),
-            None => self.show_notice("That picture could not be opened", "Choose a PNG or JPEG image."),
-        }
-    }
-
-    /// A short native message with an OK button.
-    fn show_notice(&mut self, title: &str, note: &str) {
-        self.modal_kind = Some(ModalKind::Notice);
-        self.show_modal(Content::Confirm { title: title.into(), note: note.into(), ok: "OK".into(), cancel: String::new(), primary: true }, popups::FORM_W, popups::CONFIRM_H);
-    }
-
     fn home_cmd(&mut self, cmd: home::HomeCmd) {
         use home::HomeCmd;
         match cmd {
@@ -2612,15 +2539,16 @@ impl Browser {
                     self.sync_ui();
                 }
             }
-            HomeCmd::Settings => self.show_settings(),
-            HomeCmd::ChooseBackground => self.choose_background(),
-            HomeCmd::ClearBackground => self.apply_background(None, None),
-            HomeCmd::PersonaMenu { x, y } => self.theme_menu(x as f64, y as f64 + self.top_bar_height()),
         }
     }
 
     /// Saved bookmarks dropdown under the bookmarks button.
     fn bookmarks_menu(&mut self, right: f64, y: f64) {
+        let items = self.bookmark_items();
+        self.show_menu(items, (right - 248.0).max(0.0), y);
+    }
+
+    fn bookmark_items(&self) -> Vec<MenuItem> {
         const MAX: usize = 14;
         let (can_bookmark, is_bookmarked, active_url) = self
             .active_tab()
@@ -2657,6 +2585,44 @@ impl Browser {
                 ));
             }
         }
+        items
+    }
+
+    /// Opens the dropdown of a toolbar button, or closes it when it is already open.
+    fn toggle_menu(&mut self, owner: MenuOwner, x: f64, y: f64) {
+        let open = self.menu_owner == Some(owner) && self.popups.is_open(PopupKind::Menu);
+        self.close_menu();
+        if open {
+            return;
+        }
+        match owner {
+            MenuOwner::Persona => self.theme_menu(x, y),
+            MenuOwner::Main => self.main_menu(x, y),
+        }
+        self.menu_owner = Some(owner);
+    }
+
+    /// Everything that is not a page control lives here: bookmarks, history, tools, settings.
+    fn main_menu(&mut self, right: f64, y: f64) {
+        let mut items = Vec::new();
+        if let Some(v) = &self.update_ready {
+            items.push(MenuItem::new(format!("Restart to update to Persona {v}"), MenuAction::RestartToUpdate).icon(Icon::Sparkles));
+            items.push(MenuItem::sep());
+        }
+        items.push(MenuItem::new("New tab", MenuAction::OpenNewTab).hint("Ctrl+T").icon(Icon::Plus));
+        items.push(MenuItem::new("Reopen closed tab", MenuAction::ReopenTab).hint("Ctrl+Shift+T").icon(Icon::Reload).enabled(!self.closed_tabs.is_empty()));
+        items.push(MenuItem::sep());
+        items.push(MenuItem::submenu("Bookmarks", self.bookmark_items()).icon(Icon::Bookmarks));
+        items.push(MenuItem::submenu("History", self.history_items()).icon(Icon::History));
+        items.push(MenuItem::sep());
+        let page = self.active_tab().is_some_and(|t| !t.is_newtab);
+        let pip = self.active_tab().is_some_and(|t| t.pip);
+        items.push(MenuItem::new(if pip { "Exit Picture in Picture" } else { "Picture in Picture" }, MenuAction::Pip).hint("Alt+P").icon(Icon::Pip).enabled(page));
+        items.push(MenuItem::new("Full screen", MenuAction::ToggleFullscreen).hint("F11").icon(Icon::Maximize));
+        items.push(MenuItem::new("Print…", MenuAction::Print).hint("Ctrl+P").icon(Icon::Printer).enabled(page));
+        items.push(MenuItem::new(if self.devtools.open { "Close developer tools" } else { "Developer tools" }, MenuAction::Devtools).hint("F12").icon(Icon::Code));
+        items.push(MenuItem::sep());
+        items.push(MenuItem::new("Site permissions…", MenuAction::OpenSettings).icon(Icon::ShieldLock));
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
@@ -2665,10 +2631,6 @@ impl Browser {
     fn theme_menu(&mut self, right: f64, y: f64) {
         let active_id = self.prefs.active_id().to_string();
         let mut items = Vec::new();
-        if let Some(v) = &self.update_ready {
-            items.push(MenuItem::new(format!("Restart to update to Persona {v}"), MenuAction::RestartToUpdate).hint("Update"));
-            items.push(MenuItem::sep());
-        }
         // The linked Google account comes first, with its photo: it is the default identity.
         match self.google.clone() {
             Some(g) => {
@@ -2730,14 +2692,7 @@ impl Browser {
         let mut row = MenuItem::submenu("Personas", persona_items).icon(Icon::Users);
         row.hint = Some(self.prefs.active_name().to_string());
         items.push(row);
-        items.push(MenuItem::sep());
-        let has_bg = self.prefs.background().is_some();
-        items.push(MenuItem::new(if has_bg { "Change background…" } else { "Set background…" }, MenuAction::ChooseBackground).icon(Icon::Photo));
-        if has_bg {
-            items.push(MenuItem::new("Remove background", MenuAction::ClearBackground).icon(Icon::Trash));
-        }
-        items.push(MenuItem::new("Site permissions…", MenuAction::OpenSettings).icon(Icon::ShieldLock));
-        self.show_menu(items, (right - 260.0).max(0.0), y);
+        self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
     fn set_permissions(&mut self, camera: bool, notifications: bool, microphone: bool, geolocation: bool) {
@@ -2933,7 +2888,7 @@ impl Browser {
             Some(ModalKind::Persona) => self.show_persona_form(),
             Some(ModalKind::ConfirmDelete(id)) => self.ask_delete_persona(&id),
             Some(ModalKind::Setup(step)) => self.show_setup(step),
-            Some(ModalKind::Notice) | None => {}
+            None => {}
         }
     }
 
@@ -3064,10 +3019,6 @@ impl Browser {
             if setup.is_none() {
                 self.hide_modal();
             }
-            return;
-        }
-        if matches!(self.modal_kind, Some(ModalKind::Notice)) && key == FormKey::Enter {
-            self.hide_modal();
             return;
         }
         if !self.form_open() {
@@ -3211,14 +3162,6 @@ impl Browser {
 
     fn open_settings(&mut self) {
         self.show_settings();
-    }
-
-    fn apply_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
-        let active_id = self.prefs.active_id().to_string();
-        self.prefs.set_background(&active_id, data, strip_png);
-        self.toolbar.set_background(self.prefs.bg_strip());
-        self.refresh_home();
-        self.sync_ui();
     }
 
 
@@ -3367,7 +3310,6 @@ impl Browser {
         let letter = persona.badge_letter();
 
         self.toolbar.set_persona_theme(self.dark, color, &letter);
-        self.toolbar.set_background(self.prefs.bg_strip());
         self.popups.set_persona_theme(self.dark, color);
 
         let bg = self.newtab_color();
@@ -3426,7 +3368,6 @@ impl Browser {
         if !r.image.is_empty() {
             items.push(MenuItem::new("Open image in new tab", MenuAction::OpenBackground(r.image.clone())).icon(Icon::Photo));
             items.push(MenuItem::new("Copy image address", MenuAction::Copy(r.image.clone())).icon(Icon::Copy));
-            items.push(MenuItem::new("Set image as background", MenuAction::SetBackgroundUrl(r.image)).icon(Icon::Photo));
             items.push(MenuItem::sep());
         }
         if r.video || r.pip || tab.pip {
@@ -3548,13 +3489,10 @@ impl Browser {
                 let id = self.prefs.active_id().to_string();
                 self.open_persona_editor(Some(&id));
             }
-            MenuAction::ChooseBackground => self.choose_background(),
-            MenuAction::SetBackgroundUrl(url) => {
-                // Remember the address now (it shows at once wherever it loads) and keep a copy
-                // once it has downloaded.
-                self.apply_background(Some(url), None);
-            }
-            MenuAction::ClearBackground => self.apply_background(None, None),
+            MenuAction::OpenNewTab => self.handle_chrome(ChromeCmd::NewTab),
+            MenuAction::ReopenTab => self.handle_chrome(ChromeCmd::ReopenTab),
+            MenuAction::Pip => self.handle_chrome(ChromeCmd::Pip),
+            MenuAction::Devtools => self.handle_chrome(ChromeCmd::Devtools),
             MenuAction::ToggleFullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
             MenuAction::OpenSettings => self.open_settings(),
             MenuAction::Print => self.with_active(|v| v.evaluate_script("window.print()")),
@@ -3829,7 +3767,8 @@ impl Browser {
             ChromeCmd::Pip => self.toggle_pip(None, false),
             ChromeCmd::ToggleBookmark => self.toggle_bookmark(),
             ChromeCmd::BookmarksMenu { x, y } => self.bookmarks_menu(x, y),
-            ChromeCmd::ThemeMenu { x, y } => self.theme_menu(x, y),
+            ChromeCmd::ThemeMenu { x, y } => self.toggle_menu(MenuOwner::Persona, x, y),
+            ChromeCmd::MainMenu { x, y } => self.toggle_menu(MenuOwner::Main, x, y),
             ChromeCmd::ToggleFullscreen => self.toggle_fullscreen(),
             ChromeCmd::ReopenTab => {
                 if let Some(url) = self.closed_tabs.pop() {
@@ -3899,7 +3838,6 @@ impl Browser {
                     let step = *step;
                     self.setup_pick(step, index);
                 }
-                Some(ModalKind::Notice) => self.hide_modal(),
                 Some(ModalKind::ConfirmDelete(id)) => {
                     let id = id.clone();
                     self.hide_modal();
@@ -4026,13 +3964,7 @@ impl Browser {
                     self.form_key(key);
                 }
             }
-            UserEvent::BackgroundLoaded(url, img) => {
-                if let Some(img) = img {
-                    self.set_background_picture(&img, Some(&url));
-                }
-            }
             UserEvent::IconLoaded(url, img) => {
-                self.home.image_loaded(&url, img.as_ref());
                 self.popups.image_loaded(url.clone(), img.clone());
                 self.toolbar.icon_loaded(url, img);
                 self.window.request_redraw();
@@ -4302,27 +4234,7 @@ impl Browser {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f64>(self.window.scale_factor());
-                self.mouse = (p.x, p.y);
-                if !self.fullscreen && (p.y < CHROME_HEIGHT || self.toolbar.captures_mouse()) {
-                    let icon = self.toolbar.mouse_move(p.x as f32, p.y as f32);
-                    self.set_cursor(icon);
-                    self.devtools.hover = false;
-                    // Only repaint when the move changed something; a GPU frame per mouse move
-                    // would keep the event loop too busy to see clicks promptly.
-                    if self.toolbar.take_dirty() {
-                        self.window.request_redraw();
-                    }
-                } else {
-                    self.toolbar.mouse_left();
-                    self.on_cursor(p.x, p.y);
-                    if self.home_active() && !self.devtools.hover && !self.devtools.dragging {
-                        let icon = self.home.mouse_move(p.x as f32, (p.y - self.top_bar_height()) as f32);
-                        self.set_cursor(icon);
-                        if self.home.is_dirty() {
-                            self.window.request_redraw();
-                        }
-                    }
-                }
+                self.pointer_at(p.x, p.y);
             }
             WindowEvent::CursorLeft { .. } => {
                 self.toolbar.mouse_left();
@@ -4330,32 +4242,86 @@ impl Browser {
                 self.window.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if !self.fullscreen {
-                    let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
-                    match state {
-                        ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
-                        ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => {
-                            self.toolbar.mouse_up(button, x, y)
-                        }
-                        _ if button == MouseButton::Left && self.home_active() && !self.devtools.hover && self.modal_kind.is_none() => {
-                            let hy = y - self.top_bar_height() as f32;
-                            let cmd = if state == ElementState::Pressed { self.home.mouse_down(x, hy) } else { self.home.mouse_up(x, hy) };
-                            if cmd.is_none() && state == ElementState::Pressed && self.toolbar.is_editing() {
-                                // A click on the page outside the search box ends address editing.
-                                self.toolbar.blur_address();
-                            }
-                            if let Some(cmd) = cmd {
-                                self.home_cmd(cmd);
-                            }
-                        }
-                        _ => {}
-                    }
-                    if button == MouseButton::Left {
-                        self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
-                    }
+                // Where the pointer really is now. The last move event can be stale: after a popup
+                // under the pointer closes, or when this window was clicked without a move first,
+                // a click would otherwise land on whatever was under the old position.
+                if let Some((x, y)) = self.live_pointer()
+                    && (x, y) != self.mouse
+                {
+                    self.pointer_at(x, y);
+                }
+                self.mouse_input(state, button);
+            }
+            _ => self.handle_window_rest(event),
+        }
+        self.flush_toolbar();
+    }
+
+    /// The pointer in this window's client area (logical px), read from the system.
+    fn live_pointer(&self) -> Option<(f64, f64)> {
+        let scale = self.window.scale_factor();
+        let at = self.window.cursor_position().ok()?;
+        let origin = self.window.inner_position().ok()?;
+        Some(((at.x - origin.x as f64) / scale, (at.y - origin.y as f64) / scale))
+    }
+
+    fn pointer_at(&mut self, x: f64, y: f64) {
+        self.mouse = (x, y);
+        if !self.fullscreen && (y < CHROME_HEIGHT || self.toolbar.captures_mouse()) {
+            let icon = self.toolbar.mouse_move(x as f32, y as f32);
+            self.set_cursor(icon);
+            self.devtools.hover = false;
+            // Only repaint when the move changed something; a GPU frame per mouse move
+            // would keep the event loop too busy to see clicks promptly.
+            if self.toolbar.take_dirty() {
+                self.window.request_redraw();
+            }
+        } else {
+            self.toolbar.mouse_left();
+            self.on_cursor(x, y);
+            if self.home_active() && !self.devtools.hover && !self.devtools.dragging {
+                let icon = self.home.mouse_move(x as f32, (y - self.top_bar_height()) as f32);
+                self.set_cursor(icon);
+                if self.home.is_dirty() {
                     self.window.request_redraw();
                 }
             }
+        }
+    }
+
+    fn mouse_input(&mut self, state: ElementState, button: MouseButton) {
+        if self.fullscreen {
+            return;
+        }
+        let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
+        match state {
+            ElementState::Pressed if self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_down(button, x, y),
+            ElementState::Released if self.toolbar.captures_mouse() || self.mouse.1 < CHROME_HEIGHT => self.toolbar.mouse_up(button, x, y),
+            _ if button == MouseButton::Left && self.home_active() && !self.devtools.hover && self.modal_kind.is_none() => {
+                let hy = y - self.top_bar_height() as f32;
+                let cmd = if state == ElementState::Pressed { self.home.mouse_down(x, hy) } else { self.home.mouse_up(x, hy) };
+                if state == ElementState::Pressed {
+                    // A click on the page closes any open dropdown.
+                    self.close_menu();
+                    if cmd.is_none() && self.toolbar.is_editing() {
+                        // ...and, outside the search box, ends address editing.
+                        self.toolbar.blur_address();
+                    }
+                }
+                if let Some(cmd) = cmd {
+                    self.home_cmd(cmd);
+                }
+            }
+            _ => {}
+        }
+        if button == MouseButton::Left {
+            self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
+        }
+        self.window.request_redraw();
+    }
+
+    fn handle_window_rest(&mut self, event: WindowEvent) {
+        match event {
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => {
                 if !self.modal_key(&event) {
@@ -4381,7 +4347,6 @@ impl Browser {
             }
             _ => {}
         }
-        self.flush_toolbar();
     }
 
     fn set_cursor(&mut self, icon: CursorIcon) {
@@ -4489,39 +4454,6 @@ impl Browser {
     }
 }
 
-/// Decodes a `data:image/…;base64,` URL (PNG or JPEG).
-fn decode_data_image(url: &str) -> Option<Pixmap> {
-    let (meta, data) = url.strip_prefix("data:image/")?.split_once(',')?;
-    if !meta.ends_with(";base64") {
-        return None;
-    }
-    favicons::decode_picture(&favicons::base64_decode(data)?)
-}
-
-/// `img` scaled down (never up) to fit within `max_w` x `max_h`.
-fn fit_within(img: &Pixmap, max_w: u32, max_h: u32) -> Pixmap {
-    let k = (max_w as f32 / img.width() as f32).min(max_h as f32 / img.height() as f32);
-    if k >= 1.0 {
-        return img.clone();
-    }
-    let (w, h) = (((img.width() as f32 * k).round() as u32).max(1), ((img.height() as f32 * k).round() as u32).max(1));
-    let Some(mut out) = Pixmap::new(w, h) else { return img.clone() };
-    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
-    out.draw_pixmap(0, 0, img.as_ref(), &paint, tiny_skia::Transform::from_scale(k, k), None);
-    out
-}
-
-/// The blurred band of a wallpaper the tab strip shows: 640x84, cover-fitted, from the upper part.
-fn strip_picture(img: &Pixmap) -> Option<Pixmap> {
-    let (sw, sh) = (640.0, 84.0);
-    let mut out = Pixmap::new(sw as u32, sh as u32)?;
-    let k = (sw / img.width() as f32).max(sh / img.height() as f32);
-    let (dw, dh) = (img.width() as f32 * k, img.height() as f32 * k);
-    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
-    out.draw_pixmap(0, 0, img.as_ref(), &paint, tiny_skia::Transform::from_row(k, 0.0, 0.0, k, (sw - dw) / 2.0, (sh - dh) * 0.2), None);
-    Some(anvil::blur_pixmap(&out, 2))
-}
-
 fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
     Rect { position: LogicalPosition::new(x, y).into(), size: LogicalSize::new(w, h).into() }
 }
@@ -4584,22 +4516,6 @@ fn host_of(url: &str) -> Option<&str> {
 
 fn data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Cederic")
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(T[((n >> 18) & 0x3F) as usize] as char);
-        out.push(T[((n >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 0x3F) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 0x3F) as usize] as char } else { '=' });
-    }
-    out
 }
 
 fn load_app_icon() -> Option<WinIcon> {
@@ -4670,7 +4586,6 @@ fn main() -> wry::Result<()> {
     let engine = anvil::Engine::new();
     let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32, engine.clone());
     toolbar.set_persona_theme(dark, color, &letter);
-    toolbar.set_background(prefs.bg_strip());
     toolbar.set_locked(!prefs.setup_done, false);
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
@@ -4741,8 +4656,8 @@ fn main() -> wry::Result<()> {
         menu_actions: Vec::new(),
         modal_kind: None,
         persona_form: None,
+        menu_owner: None,
         home,
-        home_bg_key: None,
         home_on_screen: false,
         setup_step: 0,
         setup_linking: false,

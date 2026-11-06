@@ -50,26 +50,6 @@ fn bytes(agent: &Agent, url: &str) -> Option<Vec<u8>> {
     resp.body_mut().with_config().limit(MAX_BYTES).read_to_vec().ok()
 }
 
-/// Decodes a PNG or JPEG picture (wallpapers, profile photos).
-pub fn decode_picture(b: &[u8]) -> Option<Pixmap> {
-    decode(b)
-}
-
-/// Downloads a picture of up to 12 MB (a wallpaper picked from a page).
-pub fn fetch_picture(url: &str) -> Option<Pixmap> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return None;
-    }
-    let agent: Agent = Agent::config_builder()
-        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
-        .timeout_global(Some(Duration::from_secs(20)))
-        .build()
-        .into();
-    let mut resp = agent.get(url).call().ok()?;
-    let b = resp.body_mut().with_config().limit(12 * 1024 * 1024).read_to_vec().ok()?;
-    decode(&b)
-}
-
 fn decode(b: &[u8]) -> Option<Pixmap> {
     if b.starts_with(b"\x89PNG") {
         return Pixmap::decode_png(b).ok();

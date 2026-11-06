@@ -459,6 +459,7 @@ pub enum Icon {
     ShieldLock,
     Trash,
     Sparkles,
+    Menu,
 }
 
 /// HSL (all 0..1) to a color.

@@ -374,10 +374,6 @@ impl Popups {
         }
     }
 
-    pub fn image(&self, url: &str) -> Option<&Pixmap> {
-        self.images.get(url)
-    }
-
     pub fn has_image(&self, url: &str) -> bool {
         self.images.contains_key(url)
     }
@@ -542,12 +538,18 @@ impl Popups {
                 None
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                // A popup that appeared under a still pointer never got a move event: find the
-                // pressed row from the last known position rather than ignoring the click.
-                if *state == ElementState::Pressed && p.v.hover.is_none() {
-                    let (x, y) = p.cursor;
-                    let inside = x >= 0.0 && x < p.v.size.0;
-                    p.v.hover = p.v.rows.iter().position(|r| inside && row_hit(r, x, y));
+                // Where the pointer really is. A popup that appeared under a still pointer never
+                // got a move event, and the last one can be stale: read it from the system.
+                if let (Ok(at), Ok(origin)) = (p.window.cursor_position(), p.window.inner_position()) {
+                    let m = margins(kind);
+                    p.cursor = (((at.x - origin.x as f64) / sc) as f32 - m.l, ((at.y - origin.y as f64) / sc) as f32 - m.t);
+                }
+                let (x, y) = p.cursor;
+                let inside = x >= 0.0 && x < p.v.size.0;
+                let under = p.v.rows.iter().position(|r| inside && row_hit(r, x, y));
+                if under != p.v.hover {
+                    p.v.hover = under;
+                    p.window.request_redraw();
                 }
                 match (kind, state) {
                 // Suggestions act on press: the address bar may lose focus before release.
@@ -564,7 +566,11 @@ impl Popups {
                         p.window.request_redraw();
                         return None;
                     }
-                    let picked = p.v.pressed.take().filter(|i| Some(*i) == p.v.hover);
+                    // Pressed in this popup and released on a row: that row, even if the pointer
+                    // slid from one row to the next while clicking (as native menus do).
+                    // A dialog's buttons need press and release on the same one.
+                    let pressed = p.v.pressed.take();
+                    let picked = if kind == Kind::Modal { pressed.filter(|i| Some(*i) == p.v.hover) } else { pressed.and(p.v.hover) };
                     picked.map(match kind {
                         Kind::Modal => Pick::Modal,
                         Kind::Sub => Pick::Sub,
