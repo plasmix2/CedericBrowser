@@ -576,6 +576,8 @@ enum UserEvent {
     /// Frame tick from the pacer while the UI animates.
     Frame,
     FullscreenState(TabId, bool),
+    /// A background image was loaded or decoded.
+    BackgroundLoaded(String, Option<Pixmap>),
     /// Time to check which Google account is signed in (scheduled, never run from a page event).
     ProbeAccount,
     /// A newer version was downloaded and put in place; it runs after a restart.
@@ -757,6 +759,8 @@ enum MenuAction {
     OpenTab(String),
     RestartToUpdate,
     OpenSettings,
+    ChooseBackground,
+    ClearBackground,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1147,14 +1151,10 @@ impl Prefs {
         }
     }
 
-    // Backgrounds are off for now; the saved ones stay readable (and tested) for later.
-    #[cfg(test)]
     fn background(&self) -> Option<&str> {
         self.background_for(&self.active_persona_id)
     }
 
-    // Backgrounds are off for now; the saved ones stay readable (and tested) for later.
-    #[cfg(test)]
     fn background_for(&self, id_or_brand: impl AsRef<str>) -> Option<&str> {
         let key = id_or_brand.as_ref().to_ascii_lowercase();
         self.bg_cache.get(&key).and_then(|opt| opt.as_deref())
@@ -1297,8 +1297,6 @@ impl Prefs {
         }
     }
 
-    // Backgrounds are off for now; the saved ones stay readable (and tested) for later.
-    #[cfg(test)]
     fn set_background(
         &mut self,
         id_or_brand: impl AsRef<str>,
@@ -1443,6 +1441,7 @@ enum ModalKind {
     Settings,
     Persona,
     ConfirmDelete(String),
+    Notice,
     /// The first-run setup, at this step: 0 name and color, 1 Google, 2 permissions, 3 done.
     Setup(u8),
 }
@@ -1685,6 +1684,8 @@ struct Browser {
     menu_owner: Option<MenuOwner>,
     /// The New Tab page, drawn natively under the toolbar while a New Tab is active.
     home: home::Home,
+    /// Which wallpaper `home` was given (the saved data URL), to decode it only when it changes.
+    home_bg_key: Option<String>,
     /// The New Tab page is what the window's buffer shows under the toolbar.
     home_on_screen: bool,
     /// The GPU engine shared by the toolbar, popups and New Tab page (for trimming it when idle).
@@ -2483,10 +2484,89 @@ impl Browser {
 
     /// Hands the New Tab page what it shows (persona, bookmarks, wallpaper) and repaints it.
     fn refresh_home(&mut self) {
-        let tiles = self.prefs.active_bookmarks().iter().map(|b| home::Tile { title: b.title.clone(), url: b.url.clone() }).collect();
+        let p = self.prefs.active_persona();
+        let avatar = p.pfp.clone().or_else(|| self.google.as_ref().map(|g| g.photo.clone()).filter(|u| !u.is_empty()));
+        let data = home::HomeData {
+            persona: p.name.clone(),
+            letter: p.badge_letter(),
+            has_bg: self.prefs.background().is_some(),
+            tiles: self.prefs.active_bookmarks().iter().map(|b| home::Tile { title: b.title.clone(), url: b.url.clone() }).collect(),
+            avatar,
+        };
         self.home.set_theme(self.dark, self.prefs.active_color());
-        self.home.set_tiles(tiles);
+        self.home.set_data(data);
+        if let Some(u) = self.home.wants_image() {
+            match self.popups.image(u) {
+                Some(img) => {
+                    let (u, img) = (u.to_owned(), img.clone());
+                    self.home.image_loaded(&u, Some(&img));
+                }
+                None => {
+                    let _ = self.icons_tx.send(u.to_owned());
+                }
+            }
+        }
+        let key = self.prefs.background().map(str::to_owned);
+        if key != self.home_bg_key {
+            self.home_bg_key = key.clone();
+            let pic = key.as_deref().and_then(decode_data_image);
+            if pic.is_none()
+                && let Some(url) = key.filter(|k| k.starts_with("http"))
+            {
+                self.fetch_background(url);
+            }
+            self.home.set_background(pic.map(|p| fit_within(&p, 2560, 1600)));
+        }
         self.window.request_redraw();
+    }
+
+    fn fetch_background(&self, url: String) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let img = favicons::fetch_picture(&url);
+            let _ = proxy.send_event(UserEvent::BackgroundLoaded(url, img));
+        });
+    }
+
+    /// Saves `img` as the active persona's wallpaper (as a PNG data URL, with the blurred strip the
+    /// tab strip shows). `from` is the web address it came from, if it is the one currently saved.
+    fn set_background_picture(&mut self, img: &Pixmap, from: Option<&str>) {
+        if from.is_some() && self.prefs.background() != from {
+            return;
+        }
+        let img = fit_within(img, 1920, 1080);
+        let Ok(png) = img.encode_png() else { return };
+        let data = format!("data:image/png;base64,{}", base64_encode(&png));
+        let strip = strip_picture(&img).and_then(|p| p.encode_png().ok()).map(|b| format!("data:image/png;base64,{}", base64_encode(&b)));
+        self.apply_background(Some(data), strip.as_deref());
+    }
+
+    /// Background… on the New Tab page or in the persona menu: a native file dialog.
+    fn choose_background(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Choose a wallpaper")
+            .add_filter("Images", &["png", "jpg", "jpeg"])
+            .set_parent(&*self.window)
+            .pick_file();
+        let Some(path) = picked else { return };
+        let img = std::fs::read(&path).ok().and_then(|b| favicons::decode_picture(&b));
+        match img {
+            Some(img) => self.set_background_picture(&img, None),
+            None => self.show_notice("That picture could not be opened", "Choose a PNG or JPEG image."),
+        }
+    }
+
+    /// A short native message with an OK button.
+    fn show_notice(&mut self, title: &str, note: &str) {
+        self.modal_kind = Some(ModalKind::Notice);
+        self.show_modal(Content::Confirm { title: title.into(), note: note.into(), ok: "OK".into(), cancel: String::new(), primary: true }, popups::FORM_W, popups::CONFIRM_H);
+    }
+
+    fn apply_background(&mut self, data: Option<String>, strip_png: Option<&str>) {
+        let active_id = self.prefs.active_id().to_string();
+        self.prefs.set_background(&active_id, data, strip_png);
+        self.refresh_home();
+        self.sync_ui();
     }
 
     /// Shows the active tab's page after it left the New Tab page.
@@ -2504,7 +2584,7 @@ impl Browser {
 
     /// Whether the active tab shows the native New Tab page.
     fn home_active(&self) -> bool {
-        !self.fullscreen && self.active_tab().is_some_and(|t| t.is_newtab)
+        self.active_tab().is_some_and(|t| t.is_newtab)
     }
 
     fn home_cmd(&mut self, cmd: home::HomeCmd) {
@@ -2518,6 +2598,10 @@ impl Browser {
                     self.sync_ui();
                 }
             }
+            HomeCmd::Settings => self.show_settings(),
+            HomeCmd::ChooseBackground => self.choose_background(),
+            HomeCmd::ClearBackground => self.apply_background(None, None),
+            HomeCmd::PersonaMenu { x, y } => self.theme_menu(x as f64, y as f64 + self.top_bar_height()),
         }
     }
 
@@ -2698,6 +2782,13 @@ impl Browser {
         let mut row = MenuItem::submenu("Personas", persona_items).icon(Icon::Users);
         row.hint = Some(self.prefs.active_name().to_string());
         items.push(row);
+        items.push(MenuItem::sep());
+        let has_bg = self.prefs.background().is_some();
+        items.push(MenuItem::new(if has_bg { "Change wallpaper…" } else { "Set wallpaper…" }, MenuAction::ChooseBackground).icon(Icon::Photo));
+        if has_bg {
+            items.push(MenuItem::new("Remove wallpaper", MenuAction::ClearBackground).icon(Icon::Trash));
+        }
+        items.push(MenuItem::new("Site permissions…", MenuAction::OpenSettings).icon(Icon::ShieldLock));
         self.show_menu(items, (right - 248.0).max(0.0), y);
     }
 
@@ -2894,6 +2985,7 @@ impl Browser {
             Some(ModalKind::Persona) => self.show_persona_form(),
             Some(ModalKind::ConfirmDelete(id)) => self.ask_delete_persona(&id),
             Some(ModalKind::Setup(step)) => self.show_setup(step),
+            Some(ModalKind::Notice) => {}
             None => {}
         }
     }
@@ -3105,12 +3197,10 @@ impl Browser {
         self.lock_chrome();
     }
 
-    /// The chrome takes no input (except the window buttons) while setup runs or a dialog is open.
+    /// The chrome takes no input (except the window buttons) while a dialog is open.
     fn lock_chrome(&mut self) {
         let modal = self.modal_kind.is_some();
-        // While setup waits for a Google sign-in in a tab, that tab has to be usable.
-        let setup = !self.prefs.setup_done && !self.setup_linking;
-        self.toolbar.set_locked(modal || setup, modal);
+        self.toolbar.set_locked(modal, modal);
         self.window.request_redraw();
     }
 
@@ -3544,6 +3634,8 @@ impl Browser {
             MenuAction::Devtools => self.handle_chrome(ChromeCmd::Devtools),
             MenuAction::ToggleFullscreen => self.handle_chrome(ChromeCmd::ToggleFullscreen),
             MenuAction::OpenSettings => self.open_settings(),
+            MenuAction::ChooseBackground => self.choose_background(),
+            MenuAction::ClearBackground => self.apply_background(None, None),
             MenuAction::Print => self.with_active(|v| v.evaluate_script("window.print()")),
         }
     }
@@ -3623,6 +3715,7 @@ impl Browser {
         self.hide_preview();
         self.layout();
         self.sync_ui();
+        self.window.request_redraw();
     }
 
     fn toggle_pip(&mut self, target: Option<TabId>, prefer_ctx: bool) {
@@ -3818,8 +3911,18 @@ impl Browser {
             ChromeCmd::Pip => self.toggle_pip(None, false),
             ChromeCmd::ToggleBookmark => self.toggle_bookmark(),
             ChromeCmd::BookmarksMenu { x, y } => self.bookmarks_menu(x, y),
-            ChromeCmd::ThemeMenu { x, y } => self.toggle_menu(MenuOwner::Persona, x, y),
-            ChromeCmd::MainMenu { x, y } => self.toggle_menu(MenuOwner::Main, x, y),
+            ChromeCmd::ThemeMenu { x, y } => {
+                if self.modal_kind.is_some() {
+                    self.hide_modal();
+                }
+                self.toggle_menu(MenuOwner::Persona, x, y);
+            }
+            ChromeCmd::MainMenu { x, y } => {
+                if self.modal_kind.is_some() {
+                    self.hide_modal();
+                }
+                self.toggle_menu(MenuOwner::Main, x, y);
+            }
             ChromeCmd::ToggleFullscreen => self.toggle_fullscreen(),
             ChromeCmd::ReopenTab => {
                 if let Some(url) = self.closed_tabs.pop() {
@@ -3897,6 +4000,7 @@ impl Browser {
                         self.set_persona(&active_id);
                     }
                 }
+                Some(ModalKind::Notice) => self.hide_modal(),
                 Some(ModalKind::Settings) | None => {
                     if index >= 4 {
                         self.hide_modal();
@@ -4063,6 +4167,11 @@ impl Browser {
             UserEvent::FullscreenState(id, on) => {
                 if self.active_tab().map(|t| t.id) == Some(id) {
                     self.set_fullscreen(on, true);
+                }
+            }
+            UserEvent::BackgroundLoaded(url, img) => {
+                if let Some(img) = img {
+                    self.set_background_picture(&img, Some(&url));
                 }
             }
             UserEvent::UpgradeHttps(id, https_url) => {
@@ -4362,7 +4471,7 @@ impl Browser {
     }
 
     fn mouse_input(&mut self, state: ElementState, button: MouseButton) {
-        if self.fullscreen {
+        if self.fullscreen && !self.home_active() {
             return;
         }
         let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
@@ -4431,6 +4540,16 @@ impl Browser {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    if event.logical_key == Key::F11 {
+                        self.toggle_fullscreen();
+                        return;
+                    }
+                    if event.logical_key == Key::Escape && self.fullscreen {
+                        self.set_fullscreen(false, false);
+                        return;
+                    }
+                }
                 if !self.modal_key(&event) {
                     // Typing on the New Tab page starts a search in the address bar.
                     let typing = event.state == ElementState::Pressed
@@ -4478,22 +4597,24 @@ impl Browser {
     /// pane) is put on screen: the rest of the window is covered by page windows, and painting
     /// under them would flicker.
     fn redraw(&mut self) {
-        if self.fullscreen {
-            return;
-        }
         let now = Instant::now();
         self.last_paint = now;
         self.next_frame = self.toolbar.tick(now);
         self.flush_toolbar();
+        if self.fullscreen && !self.home_active() {
+            return;
+        }
         let size = self.window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
         let scale = self.window.scale_factor();
-        let bar_h = ((CHROME_HEIGHT * scale).round() as u32).min(h.get()).max(1);
-        if self.frame.width() != w.get() || self.frame.height() != bar_h {
-            let Some(pm) = Pixmap::new(w.get(), bar_h) else { return };
-            self.frame = pm;
+        let bar_h = if self.fullscreen { 0 } else { ((CHROME_HEIGHT * scale).round() as u32).min(h.get()).max(1) };
+        if bar_h > 0 {
+            if self.frame.width() != w.get() || self.frame.height() != bar_h {
+                let Some(pm) = Pixmap::new(w.get(), bar_h) else { return };
+                self.frame = pm;
+            }
+            self.toolbar.render(&mut self.frame);
         }
-        self.toolbar.render(&mut self.frame);
         let dt = self.devtools_width();
         let logical_w = self.logical_size().width;
         let (w_u32, h_u32) = (w.get(), h.get());
@@ -4507,11 +4628,14 @@ impl Browser {
         let mut home_painted = false;
         let Ok(mut buf) = self.surface.buffer_mut() else { return };
         let width = w.get() as usize;
-        let bar_px = width * bar_h as usize;
-        for (d, p) in buf[..bar_px].iter_mut().zip(self.frame.data().chunks_exact(4)) {
-            *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+        let mut damage = Vec::new();
+        if bar_h > 0 {
+            let bar_px = width * bar_h as usize;
+            for (d, p) in buf[..bar_px].iter_mut().zip(self.frame.data().chunks_exact(4)) {
+                *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+            }
+            damage.push(softbuffer::Rect { x: 0, y: 0, width: w, height: NonZeroU32::new(bar_h).unwrap_or(h) });
         }
-        let mut damage = vec![softbuffer::Rect { x: 0, y: 0, width: w, height: NonZeroU32::new(bar_h).unwrap_or(h) }];
         if home && h.get() > bar_h {
             // The New Tab page: drawn by ANVL only when it changed.
             let page_w = if dt > 0.0 { logical_w - dt - SPLITTER } else { logical_w };
@@ -4579,6 +4703,55 @@ impl Browser {
             self.show_scrim(false);
         }
     }
+}
+
+/// Decodes a `data:image/…;base64,` URL (PNG or JPEG).
+fn decode_data_image(url: &str) -> Option<Pixmap> {
+    let (meta, data) = url.strip_prefix("data:image/")?.split_once(',')?;
+    if !meta.ends_with(";base64") {
+        return None;
+    }
+    favicons::decode_picture(&favicons::base64_decode(data)?)
+}
+
+/// `img` scaled down (never up) to fit within `max_w` x `max_h`.
+fn fit_within(img: &Pixmap, max_w: u32, max_h: u32) -> Pixmap {
+    let k = (max_w as f32 / img.width() as f32).min(max_h as f32 / img.height() as f32);
+    if k >= 1.0 {
+        return img.clone();
+    }
+    let (w, h) = (((img.width() as f32 * k).round() as u32).max(1), ((img.height() as f32 * k).round() as u32).max(1));
+    let Some(mut out) = Pixmap::new(w, h) else { return img.clone() };
+    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
+    out.draw_pixmap(0, 0, img.as_ref(), &paint, tiny_skia::Transform::from_scale(k, k), None);
+    out
+}
+
+/// The blurred band of a wallpaper the tab strip shows: 640x84, cover-fitted, from the upper part.
+fn strip_picture(img: &Pixmap) -> Option<Pixmap> {
+    let (sw, sh) = (640.0, 84.0);
+    let mut out = Pixmap::new(sw as u32, sh as u32)?;
+    let k = (sw / img.width() as f32).max(sh / img.height() as f32);
+    let (dw, dh) = (img.width() as f32 * k, img.height() as f32 * k);
+    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+    out.draw_pixmap(0, 0, img.as_ref(), &paint, tiny_skia::Transform::from_row(k, 0.0, 0.0, k, (sw - dw) / 2.0, (sh - dh) * 0.2), None);
+    Some(anvil::blur_pixmap(&out, 2))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 0x3F) as usize] as char);
+        out.push(T[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
@@ -4713,7 +4886,7 @@ fn main() -> wry::Result<()> {
     let engine = anvil::Engine::new();
     let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32, engine.clone());
     toolbar.set_persona_theme(dark, color, &letter);
-    toolbar.set_locked(!prefs.setup_done, false);
+    toolbar.set_locked(false, false);
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
@@ -4791,6 +4964,7 @@ fn main() -> wry::Result<()> {
         persona_form: None,
         menu_owner: None,
         home,
+        home_bg_key: None,
         home_on_screen: false,
         engine: gpu,
         last_paint: Instant::now(),
@@ -5233,5 +5407,19 @@ mod tests {
         assert!(reloaded.permissions.geolocation);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toolbar_locked_allows_persona_and_settings() {
+        let mut tb = Toolbar::new(true, 1.0, 1000.0);
+        tb.set_locked(true, false);
+        let (tx, ty) = tb.theme_anchor();
+        tb.mouse_down(MouseButton::Left, tx - 10.0, ty - 20.0);
+        assert!(tb.cmds.iter().any(|c| matches!(c, ChromeCmd::ThemeMenu { .. })));
+        tb.cmds.clear();
+
+        let (mx, my) = tb.menu_anchor();
+        tb.mouse_down(MouseButton::Left, mx - 10.0, my - 20.0);
+        assert!(tb.cmds.iter().any(|c| matches!(c, ChromeCmd::MainMenu { .. })));
     }
 }

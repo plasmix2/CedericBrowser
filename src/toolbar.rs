@@ -755,7 +755,7 @@ impl Toolbar {
     pub fn mouse_down(&mut self, button: MouseButton, x: f32, y: f32) {
         self.mouse = (x, y);
         let hit = self.hit(x, y);
-        if self.locked && !matches!(hit, Hit::Min | Hit::Max | Hit::Close | Hit::DragArea) {
+        if self.locked && !matches!(hit, Hit::Min | Hit::Max | Hit::Close | Hit::DragArea | Hit::Theme | Hit::Menu) {
             return;
         }
         self.end_hover_card();

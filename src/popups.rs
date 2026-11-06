@@ -381,6 +381,10 @@ impl Popups {
         self.images.contains_key(url)
     }
 
+    pub fn image(&self, url: &str) -> Option<&Pixmap> {
+        self.images.get(url)
+    }
+
     /// Where row `i` of an open popup is on screen: (card left, row top, card width), logical px.
     pub fn row_anchor(&mut self, kind: Kind, i: usize) -> Option<(f64, f64, f32)> {
         let p = self.get(kind);
