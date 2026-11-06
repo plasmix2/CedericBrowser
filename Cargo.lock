@@ -2550,6 +2550,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "url",
+ "wgpu",
  "wry",
 ]
 

@@ -97,6 +97,9 @@ fn margins(kind: Kind) -> Margins {
         // Small margins: the transparent margin is still part of the window and takes clicks away
         // from whatever is under it, so it only reaches as far as the shadow needs to.
         Kind::Tip => Margins { l: 12.0, t: 3.0, r: 12.0, b: 18.0 },
+        // The hover card sits 2px under the tab strip: its window must not reach up over the tabs,
+        // or the pointer would be over the card instead of the tab it is hovering.
+        Kind::Preview => Margins { l: 20.0, t: 2.0, r: 20.0, b: 32.0 },
         _ => Margins { l: 20.0, t: 6.0, r: 20.0, b: 32.0 },
     }
 }
@@ -736,10 +739,10 @@ impl Popup {
                 .build(target)
                 .expect("failed to create popup window"),
         );
-        // Tooltips and hover cards are never clicked: let clicks fall through to what is under them.
-        if matches!(kind, Kind::Tip | Kind::Preview) {
-            let _ = window.set_ignore_cursor_events(true);
-        }
+        // Tooltips and hover cards must NOT use `set_ignore_cursor_events`: tao makes that a
+        // WS_EX_LAYERED window and never calls SetLayeredWindowAttributes, and Windows does not show
+        // such a window at all (tooltips and hover cards were invisible). They stay out of the
+        // pointer's way by placement instead: see `margins` and `anchors_stay_clear` below.
         // The creation-time position gets clamped on-screen; move it away explicitly.
         window.set_outer_position(PARKED);
         let ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
@@ -1298,6 +1301,15 @@ fn compose(card: &Pixmap, out: &mut Pixmap, frame: &mut Option<Frame>, engine: O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tooltips and hover cards are not click-through (that made them invisible), so their windows,
+    /// shadow margin included, must not cover the button or tab that opened them.
+    #[test]
+    fn anchors_stay_clear() {
+        // `Toolbar` puts a tooltip 6px under its button and the hover card 2px under the tab strip.
+        assert!(margins(Kind::Tip).t < 6.0 || !rounded_popups());
+        assert!(margins(Kind::Preview).t <= 2.0 || !rounded_popups());
+    }
 
     #[test]
     fn persona_dialog_rows_and_hit_testing() {
