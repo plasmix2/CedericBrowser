@@ -129,9 +129,12 @@ telemetry-free crash reports (existing `crash.log`), then default switch only wh
 5. **Scope creep**: media codecs, WebRTC, WebGL, accessibility, IME, printing and PDF are each large; cut explicitly in a scope list.
 6. **Merge collisions** with the other agent in `main.rs`/`toolbar.rs`: do WS-A first and alone.
 
-## 8. Decisions needed from the owners
+## 8. Decisions
 
-1. Is a WebView2 fallback acceptable during and after the transition? (Plan assumes yes.)
-2. Is Servo acceptable as the 2.0 engine if the bake-off shows it beats a custom stack on memory and compat?
-3. JS: is an interpreter (QuickJS-ng) acceptable if memory is the priority, or do we need a JIT (V8)?
-4. Target platforms beyond Windows?
+Decided (owner, 2026-11-06): speed is the top priority and the engine must be as useful as WebView2, so the JS engine is V8 (JIT)
+and painting is GPU-first.
+
+Still open:
+1. Is a WebView2 fallback acceptable during and after the transition? (Plan assumes yes; without it, "as useful as WebView2" cannot be guaranteed at launch.)
+2. Is Servo acceptable as the 2.0 engine if the bake-off shows it beats a custom stack on speed and compat?
+3. Target platforms beyond Windows?
