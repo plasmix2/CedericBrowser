@@ -1183,10 +1183,14 @@ impl Prefs {
         }
     }
 
+    // Backgrounds are off for now; the saved ones stay readable (and tested) for later.
+    #[cfg(test)]
     fn background(&self) -> Option<&str> {
         self.background_for(&self.active_persona_id)
     }
 
+    // Backgrounds are off for now; the saved ones stay readable (and tested) for later.
+    #[cfg(test)]
     fn background_for(&self, id_or_brand: impl AsRef<str>) -> Option<&str> {
         let key = id_or_brand.as_ref().to_ascii_lowercase();
         self.bg_cache.get(&key).and_then(|opt| opt.as_deref())
@@ -1328,6 +1332,8 @@ impl Prefs {
         }
     }
 
+    // Backgrounds are off for now; the saved ones stay readable (and tested) for later.
+    #[cfg(test)]
     fn set_background(
         &mut self,
         id_or_brand: impl AsRef<str>,
