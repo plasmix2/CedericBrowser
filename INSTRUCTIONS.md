@@ -101,6 +101,12 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`claude/friendly-ptolemy-dzfqha` (Persona 2.0: first Servo engine)**:
+  - New cargo feature `servo` (`--features servo`), `src/engine_servo.rs` (`ServoEngine`, Servo 0.7.0, software rendering, one process, one profile). A `servo` build uses Servo unless `PERSONA_ENGINE=webview2` is set or Servo fails to start; a normal build is unchanged (WebView2).
+  - Engine trait additions (defaults keep WebView2 unchanged): `PageView::{host_painted, paint -> Rc<PageFrame>, input(PageInput)}`, `PageEngine::{pump, set_scale}`. `main.rs`: `make_engine`, `UserEvent::EngineWake`, `Browser::{pump_engine, painted_by_host, page_input, next_pump, mouse_px}`, `page_key`, mouse wheel and input forwarding, and `redraw` draws the engine frame under the toolbar and adds it to the damage list (the "only present the toolbar" rule applies to child-window engines only).
+  - Servo limits in v1: no Google account probe, docked DevTools, thumbnails, popups/`window.open`, audio/video, per-persona profiles. `window.ipc` is emulated through `console.log("__ipc__...")`. Keys with Ctrl/Alt and F-keys are not forwarded to the page (the toolbar handles them).
+  - CI: `.github/workflows/ci.yml` gained a `windows-servo` job (artifact `Persona-Servo-<sha>`). Not compiled before the first CI run: the Servo code is unverified.
+
 - **`claude/friendly-ptolemy-dzfqha` (CI)**: new `.github/workflows/ci.yml` builds (`-D warnings`) and tests on Windows for every push/PR and uploads `Persona-<sha>.exe` as a 14-day workflow artifact. It creates no tag or release, so it never triggers auto-update. Not yet run on GitHub.
 
 - **`claude/friendly-ptolemy-dzfqha` (Persona 2.0, Phase 0 / WS-C: benchmark harness)**:

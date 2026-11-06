@@ -3,6 +3,8 @@
 mod crypto;
 mod engine;
 mod engine_webview2;
+#[cfg(feature = "servo")]
+mod engine_servo;
 mod favicons;
 mod gfx;
 mod history;
@@ -36,7 +38,7 @@ use tao::{
     keyboard::ModifiersState,
     window::{CursorIcon, Fullscreen, Icon as WinIcon, Theme, Window, WindowBuilder, WindowId},
 };
-use engine::{Bounds, LoadPhase, MemLevel, PageEngine, PageView, Perm, Role, SnapshotRequest, Source, ViewConfig, ViewHandlers};
+use engine::{Bounds, LoadPhase, MemLevel, PageEngine, PageInput, PageView, Perm, Role, SnapshotRequest, Source, ViewConfig, ViewHandlers};
 
 /// Height of the native tab strip + toolbar, in logical pixels.
 const CHROME_HEIGHT: f64 = toolbar::HEIGHT as f64;
@@ -589,6 +591,9 @@ enum UserEvent {
     AccountProbeLoaded,
     /// What the probe read, for the profile it ran in.
     GoogleAccount(Option<String>, Option<GoogleAccount>),
+    /// The engine asks for its event loop to run (host-painted engines such as Servo).
+    #[cfg_attr(not(feature = "servo"), allow(dead_code))]
+    EngineWake,
 }
 
 /// What the browser chrome (the native toolbar, menus) asks the browser to do.
@@ -1452,6 +1457,10 @@ struct Browser {
     next_frame: Option<Instant>,
     pacer: pacer::Pacer,
     mouse: (f64, f64),
+    /// Last mouse position in physical pixels, for forwarding to host-painted engines.
+    mouse_px: (f32, f32),
+    /// When a host-painted engine wants its event loop run again (it is animating).
+    next_pump: Option<Instant>,
     mods: ModifiersState,
     cursor: CursorIcon,
     /// Last laid-out window size, so repeated `Resized` events with an unchanged size (Windows sends
@@ -1935,6 +1944,7 @@ impl Browser {
     }
 
     fn layout(&mut self) {
+        self.engine.set_scale(self.window.scale_factor());
         let scale = self.window.scale_factor() as f32;
         self.toolbar.set_size(scale, self.logical_size().width as f32);
         self.window.request_redraw();
@@ -3157,6 +3167,7 @@ impl Browser {
                 self.probe_scheduled = false;
                 self.probe_google_account();
             }
+            UserEvent::EngineWake => self.pump_engine(),
             UserEvent::AccountProbeLoaded => self.account_probe_loaded(),
             UserEvent::GoogleAccount(profile, account) => self.set_google_account(profile, account),
             UserEvent::Load(id, ev, url) => {
@@ -3237,6 +3248,9 @@ impl Browser {
         if id != self.window.id() {
             return;
         }
+        if self.painted_by_host() {
+            self.engine.pump();
+        }
         match event {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 let size = self.window.inner_size();
@@ -3287,6 +3301,7 @@ impl Browser {
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f64>(self.window.scale_factor());
                 self.mouse = (p.x, p.y);
+                self.mouse_px = (position.x as f32, position.y as f32);
                 if !self.fullscreen && (p.y < CHROME_HEIGHT || self.toolbar.captures_mouse()) {
                     let icon = self.toolbar.mouse_move(p.x as f32, p.y as f32);
                     self.set_cursor(icon);
@@ -3295,9 +3310,25 @@ impl Browser {
                 } else {
                     self.toolbar.mouse_left();
                     self.on_cursor(p.x, p.y);
+                    if self.painted_by_host() {
+                        self.page_input(PageInput::MouseMove { x: self.mouse_px.0, y: self.mouse_px.1 - self.content_origin_px() });
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.painted_by_host() && self.mouse.1 >= CHROME_HEIGHT && !self.toolbar.captures_mouse() {
+                    let (dx, dy, line) = match delta {
+                        tao::event::MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64, true),
+                        tao::event::MouseScrollDelta::PixelDelta(p) => (p.x, p.y, false),
+                        _ => (0.0, 0.0, false),
+                    };
+                    self.page_input(PageInput::Wheel { dx, dy, line, x: self.mouse_px.0, y: self.mouse_px.1 - self.content_origin_px() });
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                if self.painted_by_host() {
+                    self.page_input(PageInput::MouseLeave);
+                }
                 self.toolbar.mouse_left();
                 self.window.request_redraw();
             }
@@ -3314,12 +3345,36 @@ impl Browser {
                     if button == MouseButton::Left {
                         self.devtools.dragging = state == ElementState::Pressed && self.devtools.hover;
                     }
+                    if self.painted_by_host() && self.mouse.1 >= CHROME_HEIGHT && !self.devtools.hover {
+                        let down = state == ElementState::Pressed;
+                        let code = match button {
+                            MouseButton::Left => Some(0),
+                            MouseButton::Middle => Some(1),
+                            MouseButton::Right => Some(2),
+                            _ => None,
+                        };
+                        if down {
+                            // Clicking the page takes focus (and the keyboard) away from the address bar.
+                            self.handle_chrome(ChromeCmd::Dismiss);
+                            self.toolbar.blur_address();
+                            self.with_active(|v| v.focus());
+                        }
+                        if let Some(button) = code {
+                            self.page_input(PageInput::MouseButton { down, button, x: self.mouse_px.0, y: self.mouse_px.1 - self.content_origin_px() });
+                        }
+                    }
                     self.window.request_redraw();
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => {
+                let was_editing = self.toolbar.is_editing();
                 self.toolbar.key(&event, self.mods);
+                if self.painted_by_host() && !was_editing && !self.toolbar.is_editing() {
+                    if let Some(ev) = page_key(&event, self.mods) {
+                        self.page_input(ev);
+                    }
+                }
                 self.window.request_redraw();
             }
             WindowEvent::ReceivedImeText(text) => {
@@ -3329,6 +3384,29 @@ impl Browser {
             _ => {}
         }
         self.flush_toolbar();
+    }
+
+    /// True when the visible page is drawn by the engine into a buffer (Servo), not by a child window.
+    fn painted_by_host(&self) -> bool {
+        self.active_tab().is_some_and(|t| t.view.host_painted())
+    }
+
+    /// Runs the engine's event loop work and schedules the next run if it is animating.
+    fn pump_engine(&mut self) {
+        self.next_pump = self.engine.pump().map(|d| Instant::now() + d);
+        self.window.request_redraw();
+    }
+
+    /// Sends input to the visible page of a host-painted engine. Coordinates are physical pixels
+    /// relative to the page area under the toolbar.
+    fn page_input(&self, ev: PageInput) {
+        if let Some(t) = self.active_tab() {
+            t.view.input(ev);
+        }
+    }
+
+    fn content_origin_px(&self) -> f32 {
+        (CHROME_HEIGHT * self.window.scale_factor()).round() as f32
     }
 
     fn set_cursor(&mut self, icon: CursorIcon) {
@@ -3377,6 +3455,7 @@ impl Browser {
             }
             self.surface_size = (w_u32, h_u32);
         }
+        let page_frame = self.active_tab().filter(|t| t.view.host_painted()).and_then(|t| t.view.paint());
         let Ok(mut buf) = self.surface.buffer_mut() else { return };
         let width = w.get() as usize;
         let bar_px = width * bar_h as usize;
@@ -3397,8 +3476,66 @@ impl Browser {
                 damage.push(softbuffer::Rect { x: x0, y: bar_h, width: gw, height: gh });
             }
         }
+        if let Some(frame) = page_frame {
+            // A host-painted engine (Servo): draw its frame under the toolbar.
+            let (fw, fh) = (frame.width as usize, frame.height as usize);
+            let rows = fh.min((h.get() - bar_h) as usize);
+            let cols = fw.min(width);
+            for y in 0..rows {
+                let src = &frame.rgba[y * fw * 4..(y * fw + cols) * 4];
+                let start = (bar_h as usize + y) * width;
+                for (d, p) in buf[start..start + cols].iter_mut().zip(src.chunks_exact(4)) {
+                    *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+                }
+            }
+            if let (Some(cw), Some(ch)) = (NonZeroU32::new(cols as u32), NonZeroU32::new(rows as u32)) {
+                damage.push(softbuffer::Rect { x: 0, y: bar_h, width: cw, height: ch });
+            }
+        }
         let _ = buf.present_with_damage(&damage);
     }
+}
+
+/// A key press for a host-painted page, or `None` for keys the browser keeps for itself.
+/// Shortcuts (Ctrl/Alt combinations, F-keys) are handled by the toolbar; sending them to the page
+/// too would run them twice, because the page's own shortcut script reports them as well.
+fn page_key(e: &tao::event::KeyEvent, mods: ModifiersState) -> Option<PageInput> {
+    use tao::keyboard::Key;
+    let (ctrl, alt) = (mods.control_key(), mods.alt_key());
+    let key = match &e.logical_key {
+        Key::Character(c) => c.to_string(),
+        Key::Unidentified(_) | Key::Dead(_) => return None,
+        other => match format!("{other:?}").as_str() {
+            "Space" => " ".to_string(),
+            "Super" => "Meta".to_string(),
+            name => name.to_string(),
+        },
+    };
+    let is_fkey = key.len() > 1 && key.starts_with('F') && key[1..].chars().all(|c| c.is_ascii_digit());
+    let editing_combo = ctrl && !alt && matches!(key.to_lowercase().as_str(), "c" | "v" | "x" | "a" | "z" | "y");
+    if is_fkey || alt || (ctrl && !editing_combo) {
+        return None;
+    }
+    let mut m = 0u8;
+    if mods.shift_key() {
+        m |= 1;
+    }
+    if ctrl {
+        m |= 2;
+    }
+    if alt {
+        m |= 4;
+    }
+    if mods.super_key() {
+        m |= 8;
+    }
+    Some(PageInput::Key {
+        down: e.state == ElementState::Pressed,
+        key,
+        code: format!("{:?}", e.physical_key),
+        mods: m,
+        repeat: e.repeat,
+    })
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> Bounds {
@@ -3496,6 +3633,28 @@ fn load_app_icon() -> Option<WinIcon> {
     WinIcon::from_rgba(rgba, w, h).ok()
 }
 
+/// WebView2 by default. A build with the `servo` feature uses Servo instead, unless
+/// `PERSONA_ENGINE=webview2` is set or Servo cannot start.
+fn make_engine(window: &Window, proxy: &EventLoopProxy<UserEvent>, dir: &std::path::Path) -> Box<dyn PageEngine> {
+    #[cfg(feature = "servo")]
+    if std::env::var("PERSONA_ENGINE").map_or(true, |v| v != "webview2") {
+        let wake_proxy = std::sync::Mutex::new(proxy.clone());
+        let wake: engine_servo::Wake = std::sync::Arc::new(move || {
+            if let Ok(p) = wake_proxy.lock() {
+                let _ = p.send_event(UserEvent::EngineWake);
+            }
+        });
+        let size = window.inner_size();
+        let bar = (CHROME_HEIGHT * window.scale_factor()).round() as u32;
+        match engine_servo::ServoEngine::new(dir.to_path_buf(), (size.width, size.height.saturating_sub(bar)), window.scale_factor(), wake) {
+            Ok(e) => return Box::new(e),
+            Err(e) => eprintln!("Servo failed to start ({e}); using WebView2"),
+        }
+    }
+    let _ = (window, proxy);
+    Box::new(engine_webview2::WryEngine::new(dir.to_path_buf()))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -3541,7 +3700,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut history = HistoryStore::open(&dir);
     history.clear();
-    let mut engine: Box<dyn PageEngine> = Box::new(engine_webview2::WryEngine::new(dir.clone()));
+    let mut engine = make_engine(&window, &proxy, &dir);
 
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
@@ -3590,6 +3749,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_frame: None,
         pacer,
         mouse: (-1.0, -1.0),
+        mouse_px: (0.0, 0.0),
+        next_pump: None,
         mods: ModifiersState::empty(),
         cursor: CursorIcon::Default,
         laid_out: (0, 0, 0.0),
@@ -3660,13 +3821,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     browser.popups.redraw(kind);
                 }
             }
-            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => browser.window.request_redraw(),
+            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+                if browser.next_pump.is_some_and(|t| t <= Instant::now()) {
+                    browser.pump_engine();
+                }
+                browser.window.request_redraw();
+            }
             _ => {}
         }
         // Animations are driven by the pacer (accurate frame timing); only slow timers such as the
         // caret blink or the hover-card delay use the event loop's own timeout.
         let now = Instant::now();
         let next = match (browser.next_frame, browser.popups.tick(now)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let next = match (next, browser.next_pump) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };

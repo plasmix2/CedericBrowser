@@ -123,6 +123,26 @@ pub enum SnapshotRequest {
     Forget(u32),
 }
 
+/// One rendered frame of a host-painted view: RGBA bytes, `width * height * 4` long.
+pub struct PageFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Input for engines that render into a buffer the host draws (`PageView::host_painted`).
+/// Coordinates are physical pixels relative to the view's top-left corner.
+#[cfg_attr(not(feature = "servo"), allow(dead_code))]
+pub enum PageInput {
+    MouseMove { x: f32, y: f32 },
+    MouseLeave,
+    /// `button`: 0 primary, 1 middle, 2 secondary, 3 back, 4 forward.
+    MouseButton { down: bool, button: u8, x: f32, y: f32 },
+    Wheel { dx: f64, dy: f64, line: bool, x: f32, y: f32 },
+    /// `key` and `code` are DOM `KeyboardEvent.key` / `.code` strings. `mods`: 1 shift, 2 ctrl, 4 alt, 8 meta.
+    Key { down: bool, key: String, code: String, mods: u8, repeat: bool },
+}
+
 /// One page (or helper surface). Dropping it frees the page's renderer and memory.
 pub trait PageView {
     fn load_url(&self, url: &str) -> Result<()>;
@@ -144,6 +164,17 @@ pub trait PageView {
     fn eval(&self, js: &str) -> Result<()>;
     /// Run JavaScript and pass its JSON-serialized result to `callback`.
     fn eval_with_result(&self, js: &str, callback: Box<dyn Fn(String) + Send>) -> Result<()>;
+
+    /// True if this engine draws into a buffer instead of a child window. The host then calls
+    /// `paint` to get the pixels, draws them under the toolbar, and forwards input with `input`.
+    fn host_painted(&self) -> bool {
+        false
+    }
+    /// The latest frame (only called for the visible view of a host-painted engine).
+    fn paint(&self) -> Option<std::rc::Rc<PageFrame>> {
+        None
+    }
+    fn input(&self, _event: PageInput) {}
 
     /// Delete cookies, cache and site storage for this view's profile.
     fn clear_browsing_data(&self) -> Result<()>;
@@ -167,6 +198,14 @@ pub trait PageEngine {
         config: ViewConfig<'_>,
         handlers: ViewHandlers,
     ) -> Result<Box<dyn PageView>>;
+
+    /// Runs the engine's own event loop work. Called when the engine wakes the host (see the
+    /// wake callback an engine is built with) and on a timer while it returns a delay.
+    fn pump(&mut self) -> Option<std::time::Duration> {
+        None
+    }
+    /// The host window's scale factor changed (host-painted engines need it to size their buffer).
+    fn set_scale(&mut self, _scale: f64) {}
 
     /// Start the worker that takes small snapshots of views for tab hover cards.
     fn spawn_snapshots(&mut self, on_snapshot: Box<dyn Fn(u32, tiny_skia::Pixmap) + Send>) -> std::sync::mpsc::Sender<SnapshotRequest>;

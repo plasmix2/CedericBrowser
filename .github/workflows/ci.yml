@@ -40,3 +40,32 @@ jobs:
           name: Persona-${{ github.sha }}
           path: Persona-${{ github.sha }}.exe
           retention-days: 14
+
+  # Experimental Persona 2.0 build on the Servo engine. Long first build (SpiderMonkey, Stylo);
+  # later runs reuse the cache. Run it with PERSONA_ENGINE unset; PERSONA_ENGINE=webview2 falls back.
+  windows-servo:
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: ""
+      LIBCLANG_PATH: C:\Program Files\LLVM\lib
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: servo
+
+      - name: Build (Servo)
+        run: cargo build --release --features servo
+
+      - name: Name the exe after the commit
+        shell: pwsh
+        run: Copy-Item target\release\Persona.exe "Persona-Servo-${env:GITHUB_SHA}.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Persona-Servo-${{ github.sha }}
+          path: Persona-Servo-${{ github.sha }}.exe
+          retention-days: 14

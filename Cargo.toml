@@ -25,6 +25,15 @@ ureq = { version = "3.5.1", default-features = false, features = ["native-tls"] 
 url = "2.5.8"
 wry = { version = "0.57.1", features = ["devtools"] }
 
+# Servo engine (optional, `--features servo`): a long first build. See docs/ENGINE_2_0_PLAN.md.
+servo = { version = "0.7.0", default-features = false, features = ["bundled", "js_jit", "no-wgl"], optional = true }
+dpi = { version = "0.1", optional = true }
+euclid = { version = "0.22", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"], optional = true }
+
+[features]
+servo = ["dep:servo", "dep:dpi", "dep:euclid", "dep:rustls"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
