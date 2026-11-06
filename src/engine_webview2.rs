@@ -3,7 +3,13 @@
 //! This is the only file that knows about wry or Chromium flags. Every view, page or helper,
 //! gets the same `BROWSER_ARGS`, scroll bar style, user agent and data folder.
 
-use std::path::PathBuf;
+mod devtools;
+mod thumbs;
+
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc::Sender},
+};
 
 use tao::{
     dpi::{LogicalPosition, LogicalSize},
@@ -17,7 +23,7 @@ use wry::{
 
 use crate::engine::{
     Bounds, EngineError, LoadPhase, MemLevel, PageEngine, PageView, Perm, Result, Rgba, Role,
-    Source, ViewConfig, ViewHandlers,
+    SnapshotRequest, Source, ViewConfig, ViewHandlers,
 };
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
@@ -69,15 +75,20 @@ fn perm_of(kind: PermissionKind) -> Perm {
 /// The WebView2 engine. Owns the shared `WebContext` (data folder).
 pub struct WryEngine {
     context: WebContext,
+    data_dir: PathBuf,
 }
 
 impl WryEngine {
     pub fn new(data_dir: PathBuf) -> Self {
-        WryEngine { context: WebContext::new(Some(data_dir)) }
+        WryEngine { context: WebContext::new(Some(data_dir.clone())), data_dir }
     }
 }
 
 impl PageEngine for WryEngine {
+    fn spawn_snapshots(&mut self, on_snapshot: Box<dyn Fn(u32, tiny_skia::Pixmap) + Send>) -> Sender<SnapshotRequest> {
+        thumbs::spawn(self.data_dir.clone(), on_snapshot)
+    }
+
     fn create_view(
         &mut self,
         parent: &Window,
@@ -90,6 +101,11 @@ impl PageEngine for WryEngine {
             .with_user_agent(USER_AGENT)
             .with_additional_browser_args(BROWSER_ARGS)
             .with_scroll_bar_style(ScrollBarStyle::FluentOverlay);
+        // How the snapshot worker recognises this view among the engine's debugging targets.
+        b = b.with_initialization_script(format!(
+            "if (window === window.top) Object.defineProperty(window, '__cedericTab', {{ value: {} }});",
+            config.tag
+        ));
         for script in config.init_scripts {
             b = b.with_initialization_script(script);
         }
@@ -117,7 +133,12 @@ impl PageEngine for WryEngine {
             b = b.with_navigation_handler(move |url| f(&url));
         }
         if let Some(f) = on_title {
-            b = b.with_document_title_changed_handler(f);
+            // Hide the temporary marker title `devtools_frontend` uses to find the page.
+            b = b.with_document_title_changed_handler(move |t| {
+                if !t.contains(devtools::MARKER) {
+                    f(t)
+                }
+            });
         }
         if let Some(f) = on_load {
             b = b.with_on_page_load_handler(move |ev, url| {
@@ -143,12 +164,21 @@ impl PageEngine for WryEngine {
             Source::Url(u) => b.with_url(u),
             Source::Html(h) => b.with_html(h),
         };
-        Ok(Box::new(WryView { view: b.build_as_child(parent)? }))
+        Ok(Box::new(WryView {
+            view: b.build_as_child(parent)?,
+            tag: config.tag,
+            data_dir: self.data_dir.clone(),
+            saved_title: Arc::new(Mutex::new(None)),
+        }))
     }
 }
 
 struct WryView {
     view: WebView,
+    tag: u32,
+    data_dir: PathBuf,
+    /// The page title replaced by the DevTools lookup marker, as the JSON string the page returned.
+    saved_title: Arc<Mutex<Option<String>>>,
 }
 
 impl PageView for WryView {
@@ -199,6 +229,34 @@ impl PageView for WryView {
     }
     fn clear_browsing_data(&self) -> Result<()> {
         Ok(self.view.clear_all_browsing_data()?)
+    }
+    fn devtools_frontend(&self, seq: u64, page_url: &str, done: Box<dyn FnOnce(Option<String>) + Send>) -> Result<()> {
+        // WebView2 lists its pages on a loopback debugging port; the page is found by briefly
+        // giving it a unique invisible title.
+        let marker = format!("{}cederic-{}-{}", devtools::MARKER, self.tag, seq);
+        let marker_js = serde_json::to_string(&marker).map_err(|e| EngineError(e.to_string()))?;
+        let js = format!("(() => {{ const t = document.title; document.title = {marker_js}; return t; }})()");
+        let (dir, page_url, saved) = (self.data_dir.clone(), page_url.to_owned(), self.saved_title.clone());
+        let done = Mutex::new(Some(done));
+        self.eval_with_result(
+            &js,
+            Box::new(move |old_title| {
+                if let Ok(mut slot) = saved.lock() {
+                    *slot = Some(old_title);
+                }
+                let Some(done) = done.lock().ok().and_then(|mut d| d.take()) else { return };
+                let (dir, marker, page_url) = (dir.clone(), marker.clone(), page_url.clone());
+                std::thread::spawn(move || done(devtools::frontend_url(&dir, &marker, &page_url)));
+            }),
+        )
+    }
+    fn devtools_lookup_finished(&self) {
+        let Some(old) = self.saved_title.lock().ok().and_then(|mut s| s.take()) else { return };
+        if let Ok(title) = serde_json::from_str::<String>(&old)
+            && let Ok(js) = serde_json::to_string(&title)
+        {
+            let _ = self.view.evaluate_script(&format!("document.title = {js}"));
+        }
     }
     fn open_devtools(&self) {
         self.view.open_devtools();

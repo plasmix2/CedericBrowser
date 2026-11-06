@@ -101,6 +101,13 @@ Resolve any overlaps by preserving both features, verify with `cargo build --rel
 ### Completed & Handoff Log
 *Newest entries at the top. Append your entry here before opening a PR so the next agent merging `origin/main` knows exactly what changed.*
 
+- **`claude/friendly-ptolemy-dzfqha` (Persona 2.0, Phase 0 / WS-B: CDP moved behind the engine)**:
+  - `src/thumbs.rs` and `src/devtools.rs` moved (git mv) to `src/engine_webview2/`; they are WebView2-backend private. `main.rs` no longer mentions the debugging port, the DevTools marker title, or CDP.
+  - New on the traits: `PageEngine::spawn_snapshots(cb) -> Sender<SnapshotRequest>` (replaces `thumbs::spawn` / `thumbs::Request`), `PageView::devtools_frontend(seq, page_url, done)` + `devtools_lookup_finished()` (replace the marker-title dance in `attach_devtools`/`devtools_target`), `ViewConfig::tag` (caller's id; was the missing `window.__cedericTab`). `UserEvent::DevtoolsTarget` lost `old_title`. The marker-title filter moved into the backend's title handler. `Browser::data_dir` removed.
+  - **Bug fixed on the way:** `window.__cedericTab` had been dropped in `12ca3f8`, so `thumbs.rs` could never match a tab and hover thumbnails stayed empty. The backend now sets it from `ViewConfig::tag`. Untested on Windows.
+  - Checked only with `cargo check --target x86_64-pc-windows-gnu` (default, `--tests`, `--release`); not built, run or tested (no Windows here). Test: hover a tab for a thumbnail; F12 docks DevTools and the page title is unchanged afterwards.
+  - `live_eval` and `live_lookup_finds_search_tab` still use CDP directly (they are WebView2-backend tests).
+
 - **`claude/friendly-ptolemy-dzfqha` (Persona 2.0, Phase 0 / WS-A: `PageEngine` seam, no behavior change)**:
   - Plan: `docs/ENGINE_2_0_PLAN.md` (Servo as the base engine, WebView2 kept as fallback). This entry is the first step.
   - New `src/engine.rs` (engine-neutral `PageEngine`, `PageView`, `ViewConfig`, `ViewHandlers`, `Bounds`, `MemLevel`, `LoadPhase`, `Perm`, `Role`, `Source`) and `src/engine_webview2.rs` (`WryEngine`, the only wry user). `BROWSER_ARGS` and `USER_AGENT` moved there; `create_view` applies them to every view.

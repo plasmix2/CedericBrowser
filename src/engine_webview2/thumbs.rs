@@ -1,6 +1,7 @@
 //! Tab thumbnails for hover cards. A worker thread talks to the engine's loopback DevTools port
 //! (the same one the docked DevTools pane uses) and screenshots the visible tab, small and as JPEG.
-//! Each tab's page carries `window.__cedericTab = <id>`, which is how its target is recognised.
+//! Each view's page carries `window.__cedericTab = <tag>` (set by `WryEngine::create_view`), which is how
+//! its target is recognised.
 
 use std::{
     collections::HashMap,
@@ -13,21 +14,13 @@ use std::{
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket};
 
-use crate::devtools;
+use super::devtools;
+use crate::engine::SnapshotRequest as Request;
 
 /// Thumbnail width in CSS pixels; the card shows it at about this size.
 const WIDTH: f64 = 320.0;
 
-pub enum Request {
-    /// The tab now on screen (`None` while nothing should be captured, e.g. minimized).
-    Active(Option<u32>),
-    /// Capture this tab now (it just finished loading or was just shown).
-    Capture(u32),
-    /// The tab was closed.
-    Forget(u32),
-}
-
-pub fn spawn(data_dir: PathBuf, on_thumb: impl Fn(u32, tiny_skia::Pixmap) + Send + 'static) -> mpsc::Sender<Request> {
+pub fn spawn(data_dir: PathBuf, on_thumb: Box<dyn Fn(u32, tiny_skia::Pixmap) + Send>) -> mpsc::Sender<Request> {
     let (tx, rx) = mpsc::channel::<Request>();
     std::thread::spawn(move || {
         let mut targets: HashMap<u32, String> = HashMap::new();

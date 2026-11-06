@@ -1,6 +1,6 @@
 # Persona 2.0: in-house rendering engine plan
 
-Status: **Phase 0 / WS-A done (the `PageEngine` seam, `src/engine.rs` + `src/engine_webview2.rs`; type-checked, not yet run on Windows). WS-B (CDP removal) and WS-C (benchmark harness) are next.** Written 2026-11-06. Numbers marked *(unverified)* come from
+Status: **Phase 0 / WS-A done (the `PageEngine` seam, `src/engine.rs` + `src/engine_webview2.rs`; type-checked, not yet run on Windows). WS-B (CDP moved behind the engine) done the same way. WS-C (benchmark harness) is next.** Written 2026-11-06. Numbers marked *(unverified)* come from
 background knowledge or thin sources and must be measured before they drive a decision.
 
 ## 1. Goal and honest scope

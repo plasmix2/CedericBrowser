@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod crypto;
-mod devtools;
 mod engine;
 mod engine_webview2;
 mod favicons;
@@ -11,7 +10,6 @@ mod input;
 mod pacer;
 mod popups;
 mod suggest;
-mod thumbs;
 mod toolbar;
 mod update;
 
@@ -38,7 +36,7 @@ use tao::{
     keyboard::ModifiersState,
     window::{CursorIcon, Fullscreen, Icon as WinIcon, Theme, Window, WindowBuilder, WindowId},
 };
-use engine::{Bounds, LoadPhase, MemLevel, PageEngine, PageView, Perm, Role, Source, ViewConfig, ViewHandlers};
+use engine::{Bounds, LoadPhase, MemLevel, PageEngine, PageView, Perm, Role, SnapshotRequest, Source, ViewConfig, ViewHandlers};
 
 /// Height of the native tab strip + toolbar, in logical pixels.
 const CHROME_HEIGHT: f64 = toolbar::HEIGHT as f64;
@@ -578,7 +576,7 @@ enum UserEvent {
     IconLoaded(String, Option<Pixmap>),
     OpenInNewTab(String),
     Suggestions(suggest::Response),
-    DevtoolsTarget { tab: TabId, old_title: String, url: Option<String> },
+    DevtoolsTarget { tab: TabId, url: Option<String> },
     Prewarm,
     /// Frame tick from the pacer while the UI animates.
     Frame,
@@ -1469,13 +1467,12 @@ struct Browser {
     prefs: Prefs,
     https_upgrades: u64,
     engine: Box<dyn PageEngine>,
-    data_dir: PathBuf,
     proxy: EventLoopProxy<UserEvent>,
     quit: bool,
     dark: bool,
     popups: Popups,
     menu_actions: Vec<Option<MenuAction>>,
-    thumbs_tx: Sender<thumbs::Request>,
+    thumbs_tx: Sender<SnapshotRequest>,
     suggest_tx: Sender<suggest::Request>,
     suggest_seq: u64,
     suggest_query: String,
@@ -1616,6 +1613,7 @@ impl Browser {
         };
         let config = ViewConfig {
             role: Role::Page,
+            tag: id,
             // Paint the new-tab page's own color from the first frame, so it never flashes white.
             content: match url {
                 Some(u) => Source::Url(u),
@@ -1709,7 +1707,7 @@ impl Browser {
             self.show_active();
         }
         // Dropping the WebView tears down its renderer and frees its memory.
-        let _ = self.thumbs_tx.send(thumbs::Request::Forget(self.tabs[idx].id));
+        let _ = self.thumbs_tx.send(SnapshotRequest::Forget(self.tabs[idx].id));
         drop(self.tabs.remove(idx));
         if idx < self.active {
             self.active -= 1;
@@ -1734,7 +1732,7 @@ impl Browser {
         let active_id = self.tabs[self.active].id;
         for (i, t) in self.tabs.iter().enumerate() {
             if !kept[i] {
-                let _ = self.thumbs_tx.send(thumbs::Request::Forget(t.id));
+                let _ = self.thumbs_tx.send(SnapshotRequest::Forget(t.id));
             }
         }
         let mut i = 0;
@@ -1793,7 +1791,7 @@ impl Browser {
             } else {
                 let _ = tab.view.focus();
             }
-            let _ = self.thumbs_tx.send(thumbs::Request::Active(Some(tab.id)));
+            let _ = self.thumbs_tx.send(SnapshotRequest::Active(Some(tab.id)));
             tab.is_newtab
         } else {
             false
@@ -2023,7 +2021,7 @@ impl Browser {
             && !cur.url.contains("youtube.com")
             && !cur.url.contains("youtu.be")
         {
-            let _ = self.thumbs_tx.send(thumbs::Request::Capture(cur.id));
+            let _ = self.thumbs_tx.send(SnapshotRequest::Capture(cur.id));
         }
         let shown = display_url(&tab.url, self.prefs.active_name());
         let card = Card {
@@ -2302,6 +2300,7 @@ impl Browser {
         };
         let config = ViewConfig {
             role: Role::Helper,
+            tag: 0,
             content: Source::Url(GOOGLE_PROBE_PAGE),
             bounds: rect(-10.0, -10.0, 1.0, 1.0),
             visible: false,
@@ -2384,7 +2383,7 @@ impl Browser {
         // Show the new active tab before the old ones go, so the window never flashes bare.
         self.show_active();
         for t in &old {
-            let _ = self.thumbs_tx.send(thumbs::Request::Forget(t.id));
+            let _ = self.thumbs_tx.send(SnapshotRequest::Forget(t.id));
         }
         drop(old);
         let _ = self.proxy.send_event(UserEvent::Prewarm);
@@ -2730,26 +2729,21 @@ impl Browser {
             return;
         }
         self.devtools.seq += 1;
-        let marker = format!("{}cederic-{}-{}", devtools::MARKER, id, self.devtools.seq);
-        let Ok(marker_js) = serde_json::to_string(&marker) else { return };
-        let (dir, proxy) = (self.data_dir.clone(), self.proxy.clone());
-        let js = format!("(() => {{ const t = document.title; document.title = {marker_js}; return t; }})()");
+        let proxy = self.proxy.clone();
         let Some(tab) = self.active_tab() else { return };
         let page_url = tab.url.clone();
-        let _ = tab.view.eval_with_result(&js, Box::new(move |old_title| {
-            let (dir, marker, proxy, page_url) = (dir.clone(), marker.clone(), proxy.clone(), page_url.clone());
-            std::thread::spawn(move || {
-                let url = devtools::frontend_url(&dir, &marker, &page_url);
-                let _ = proxy.send_event(UserEvent::DevtoolsTarget { tab: id, old_title, url });
-            });
-        }));
+        let _ = tab.view.devtools_frontend(
+            self.devtools.seq,
+            &page_url,
+            Box::new(move |url| {
+                let _ = proxy.send_event(UserEvent::DevtoolsTarget { tab: id, url });
+            }),
+        );
     }
 
-    fn devtools_target(&mut self, tab_id: TabId, old_title: String, url: Option<String>) {
-        if let (Some(i), Ok(title)) = (self.index_of(tab_id), serde_json::from_str::<String>(&old_title))
-            && let Ok(js) = serde_json::to_string(&title)
-        {
-            let _ = self.tabs[i].view.eval(&format!("document.title = {js}"));
+    fn devtools_target(&mut self, tab_id: TabId, url: Option<String>) {
+        if let Some(i) = self.index_of(tab_id) {
+            self.tabs[i].view.devtools_lookup_finished();
         }
         if !self.devtools.open || self.active_tab().map(|t| t.id) != Some(tab_id) {
             return;
@@ -2781,6 +2775,7 @@ impl Browser {
                 };
                 let config = ViewConfig {
                     role: Role::Helper,
+                    tag: 0,
                     content: Source::Url(&url),
                     bounds: rect(0.0, 0.0, 0.0, 0.0),
                     visible: true,
@@ -3131,12 +3126,8 @@ impl Browser {
                     self.set_suggestions(res.items);
                 }
             }
-            UserEvent::DevtoolsTarget { tab, old_title, url } => self.devtools_target(tab, old_title, url),
+            UserEvent::DevtoolsTarget { tab, url } => self.devtools_target(tab, url),
             UserEvent::Title(id, title) => {
-                // Our own temporary DevTools marker title; the real title is restored right after.
-                if title.contains(devtools::MARKER) {
-                    return;
-                }
                 if let Some(i) = self.index_of(id) {
                     let brand_name = self.prefs.active_name();
                     let t = &mut self.tabs[i];
@@ -3208,7 +3199,7 @@ impl Browser {
                 let view_ref = &tab.view;
                 if !started {
                     if !tab.url.contains("youtube.com") && !tab.url.contains("youtu.be") {
-                        let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
+                        let _ = self.thumbs_tx.send(SnapshotRequest::Capture(id));
                     }
                     let proxy = self.proxy.clone();
                     let _ = tab.view.eval_with_result(FAVICON_SCRIPT, Box::new(move |res| {
@@ -3225,7 +3216,7 @@ impl Browser {
                         }));
                     }
                     if !is_newtab && self.tabs.len() > 1 {
-                        let _ = self.thumbs_tx.send(thumbs::Request::Capture(id));
+                        let _ = self.thumbs_tx.send(SnapshotRequest::Capture(id));
                     }
                 }
                 if is_newtab && i == self.active {
@@ -3550,7 +3541,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut history = HistoryStore::open(&dir);
     history.clear();
-    let engine: Box<dyn PageEngine> = Box::new(engine_webview2::WryEngine::new(dir.clone()));
+    let mut engine: Box<dyn PageEngine> = Box::new(engine_webview2::WryEngine::new(dir.clone()));
 
     let scale = window.scale_factor();
     let size = window.inner_size().to_logical::<f64>(scale);
@@ -3564,9 +3555,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     popups.set_persona_theme(dark, color);
 
     let p_thumb = proxy.clone();
-    let thumbs_tx = thumbs::spawn(dir.clone(), move |tab, img| {
+    let thumbs_tx = engine.spawn_snapshots(Box::new(move |tab, img| {
         let _ = p_thumb.send_event(UserEvent::Thumb(tab, img));
-    });
+    }));
 
     let p_frame = proxy.clone();
     let pacer = pacer::Pacer::spawn(move || {
@@ -3611,7 +3602,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         prefs,
         https_upgrades: 0,
         engine,
-        data_dir: dir,
         proxy,
         quit: false,
         dark,

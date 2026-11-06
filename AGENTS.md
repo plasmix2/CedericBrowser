@@ -64,8 +64,8 @@ Note that building replaces `target/release/Persona.exe`, so any running Persona
 | `src/favicons.rs` | Fetches and decodes tab favicons (PNG/ICO) for the native tab strip |
 | `src/input.rs` | Address-bar input → URL or search; HTTPS upgrades; search-query extraction |
 | `src/suggest.rs` | Search suggestions, fetched on a background thread |
-| `src/devtools.rs` | Finds tabs on the loopback DevTools port for the docked DevTools pane |
-| `src/thumbs.rs` | Tab snapshots for hover cards, over the same DevTools port |
+| `src/engine_webview2/devtools.rs` | WebView2 backend only: finds tabs on the loopback DevTools port for the docked DevTools pane |
+| `src/engine_webview2/thumbs.rs` | WebView2 backend only: tab snapshots for hover cards, over the same DevTools port (`PageEngine::spawn_snapshots`) |
 | `src/history.rs`, `src/crypto.rs` | Search history, encrypted on disk |
 | `src/ui/newtab.html` | New-tab page |
 
@@ -108,7 +108,7 @@ Note that building replaces `target/release/Persona.exe`, so any running Persona
 - **`--remote-debugging-port=0`** makes the engine pick a free loopback-only port, written to
   `%LOCALAPPDATA%\Cederic\EBWebView\DevToolsActivePort`. Never change it to a fixed port or bind it to
   anything other than loopback.
-- **Each tab's page has `window.__cedericTab = <id>`.** That is how `thumbs.rs` finds a tab's target.
+- **Each tab's page has `window.__cedericTab = <tag>`** (`ViewConfig::tag`, set by `WryEngine::create_view`). That is how `engine_webview2/thumbs.rs` finds a tab's target. It was missing from commit `12ca3f8` until the engine split, so hover thumbnails did not work in between.
 
 ## Security rules
 

@@ -86,6 +86,8 @@ pub enum Role {
 
 pub struct ViewConfig<'a> {
     pub role: Role,
+    /// The caller's id for this view. Snapshot requests refer to views by it.
+    pub tag: u32,
     pub content: Source<'a>,
     pub bounds: Bounds,
     pub visible: bool,
@@ -109,6 +111,16 @@ pub struct ViewHandlers {
     pub on_message: Option<Box<dyn Fn(&str)>>,
     /// Return `true` to grant the permission.
     pub on_permission: Option<Box<dyn Fn(Perm) -> bool + Send + Sync>>,
+}
+
+/// Messages for the engine's snapshot worker (tab thumbnails). `u32` is a view's `tag`.
+pub enum SnapshotRequest {
+    /// The view now on screen (`None` while nothing should be captured, e.g. minimized).
+    Active(Option<u32>),
+    /// Capture this view now (it just finished loading or was just shown).
+    Capture(u32),
+    /// The view was closed.
+    Forget(u32),
 }
 
 /// One page (or helper surface). Dropping it frees the page's renderer and memory.
@@ -136,6 +148,13 @@ pub trait PageView {
     /// Delete cookies, cache and site storage for this view's profile.
     fn clear_browsing_data(&self) -> Result<()>;
 
+    /// Look up the engine's DevTools frontend URL for this page, to dock in a pane. `done` runs once,
+    /// possibly on another thread, with `None` if docking is not possible. `seq` is unique per call.
+    /// The caller then calls `devtools_lookup_finished` on the UI thread.
+    fn devtools_frontend(&self, seq: u64, page_url: &str, done: Box<dyn FnOnce(Option<String>) + Send>) -> Result<()>;
+    /// Undo any temporary change `devtools_frontend` made to the page (e.g. its title).
+    fn devtools_lookup_finished(&self);
+
     /// Open the engine's own DevTools window (fallback when docking is unavailable).
     fn open_devtools(&self);
 }
@@ -148,4 +167,7 @@ pub trait PageEngine {
         config: ViewConfig<'_>,
         handlers: ViewHandlers,
     ) -> Result<Box<dyn PageView>>;
+
+    /// Start the worker that takes small snapshots of views for tab hover cards.
+    fn spawn_snapshots(&mut self, on_snapshot: Box<dyn Fn(u32, tiny_skia::Pixmap) + Send>) -> std::sync::mpsc::Sender<SnapshotRequest>;
 }
