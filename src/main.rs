@@ -1520,14 +1520,15 @@ impl FormKey {
 }
 
 /// Which dialog the modal popup is showing.
+#[derive(Clone)]
 enum ModalKind {
     Settings,
     Persona,
     ConfirmDelete(String),
 }
 
-/// The persona editor's state. The popup is not focusable, so the main window keeps the keyboard
-/// and forwards typing here (`Browser::modal_key`).
+/// The persona editor's state. The dialog window takes the keyboard; key presses that land on
+/// the main window or a page instead are forwarded here too (`Browser::modal_key`).
 struct PersonaFormState {
     /// The persona being edited, or `None` for a new one.
     editing: Option<String>,
@@ -2653,7 +2654,28 @@ impl Browser {
         }
         let size = self.logical_size();
         let pos = self.to_screen(((size.width - w as f64) / 2.0).max(0.0), ((size.height - h as f64) / 2.0 - 20.0).max(0.0));
+        let was_open = self.popups.is_open(PopupKind::Modal);
         self.popups.show(PopupKind::Modal, content, pos, w);
+        if !was_open {
+            // The dialog window takes the keyboard, so typing goes straight to it.
+            self.popups.focus(PopupKind::Modal);
+        }
+    }
+
+    /// Keeps an open dialog and the blur behind it in step with the window after it is resized,
+    /// maximized or moved.
+    fn refresh_modal(&mut self) {
+        if self.modal_kind.is_none() || !self.popups.is_open(PopupKind::Modal) {
+            return;
+        }
+        // The last page snapshot is cover-fitted to the new size; no fresh capture per step.
+        self.show_scrim(false);
+        match self.modal_kind.clone() {
+            Some(ModalKind::Settings) => self.show_settings(),
+            Some(ModalKind::Persona) => self.show_persona_form(),
+            Some(ModalKind::ConfirmDelete(id)) => self.ask_delete_persona(&id),
+            None => {}
+        }
     }
 
     /// The persona editor and the delete confirmation: native dialogs, no web page involved.
@@ -2843,28 +2865,41 @@ impl Browser {
         if request_fresh && let Some(t) = self.tabs.get(self.active) {
             let _ = self.thumbs_tx.send(thumbs::Request::Capture(t.id));
         }
-        // The whole window: tab strip, toolbar and page all sit under the blur.
-        let pos = self.to_screen(0.0, 0.0);
-        self.popups.show(PopupKind::Scrim, Content::Scrim { img: Some(img), h: size.height.max(1.0) as f32 }, pos, size.width as f32);
+        // The page sits under this blur; the tab strip and toolbar blur themselves (the toolbar is
+        // locked), which leaves the window's minimize, maximize and close buttons usable.
+        let top = self.top_bar_height();
+        let pos = self.to_screen(0.0, top);
+        let h = (size.height - top).max(1.0) as f32;
+        self.popups.show(PopupKind::Scrim, Content::Scrim { img: Some(img), h }, pos, size.width as f32);
+        self.lock_chrome();
     }
 
-    /// A blurred picture of the whole window as it looks now: the chrome as last drawn and the page
-    /// from its latest snapshot, assembled at a quarter of the window's pixel size (the blur hides
-    /// the low resolution) with the window's exact proportions, so it lines up when stretched back.
+    /// The chrome takes no input (except the window buttons) while setup runs or a dialog is open.
+    fn lock_chrome(&mut self) {
+        let modal = self.modal_kind.is_some();
+        self.toolbar.set_locked(modal || !self.prefs.setup_done, modal);
+        self.window.request_redraw();
+    }
+
+    /// A blurred picture of everything under the toolbar as it looks now: the page from its latest
+    /// snapshot, assembled at a quarter of the pixel size (the blur hides the low resolution) with
+    /// the area's exact proportions, so it lines up when stretched back.
     fn scrim_picture(&self) -> Pixmap {
         use tiny_skia::{FilterQuality, PixmapPaint, Transform};
         let px = self.window.inner_size();
-        let (qw, qh) = ((px.width / 4).max(1), (px.height / 4).max(1));
+        let scale = self.window.scale_factor() as f32;
+        let top = self.top_bar_height() as f32;
+        let area_h = (px.height as f32 - top * scale).max(4.0);
+        let (qw, qh) = ((px.width / 4).max(1), ((area_h / 4.0) as u32).max(1));
         let Some(mut pic) = Pixmap::new(qw, qh) else { return Pixmap::new(1, 1).expect("1x1") };
         let bg = self.newtab_color();
         pic.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
         let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
         // The page, cover-fitted into the content area.
-        let scale = self.window.scale_factor() as f32;
         let content = self.content_bounds();
         let (cx, cy, cw, ch) = match (content.position, content.size) {
-            (wry::dpi::Position::Logical(p), wry::dpi::Size::Logical(s)) => (p.x as f32, p.y as f32, s.width as f32, s.height as f32),
-            _ => (0.0, self.top_bar_height() as f32, px.width as f32 / scale, px.height as f32 / scale),
+            (wry::dpi::Position::Logical(p), wry::dpi::Size::Logical(s)) => (p.x as f32, p.y as f32 - top, s.width as f32, s.height as f32),
+            _ => (0.0, 0.0, px.width as f32 / scale, area_h / scale),
         };
         if let Some(thumb) = self.tabs.get(self.active).and_then(|t| t.thumb.as_ref()) {
             let q = scale / 4.0; // logical px -> picture px
@@ -2872,10 +2907,6 @@ impl Browser {
             let tw = thumb.width() as f32 * k;
             let (ox, oy) = (cx * q + (cw * q - tw) / 2.0, cy * q);
             pic.draw_pixmap(0, 0, thumb.as_ref(), &paint, Transform::from_row(k, 0.0, 0.0, k, ox, oy), None);
-        }
-        // The chrome, as last presented.
-        if self.frame.width() > 1 {
-            pic.draw_pixmap(0, 0, self.frame.as_ref(), &paint, Transform::from_scale(0.25, 0.25), None);
         }
         anvil::blur_pixmap(&pic, 5)
     }
@@ -2888,10 +2919,17 @@ impl Browser {
         if self.modal_kind.is_some() {
             self.set_page_modal(false);
         }
+        let was_open = self.popups.is_open(PopupKind::Modal);
         self.modal_kind = None;
         self.persona_form = None;
         self.popups.hide(PopupKind::Modal);
         self.popups.hide(PopupKind::Scrim);
+        self.lock_chrome();
+        if was_open {
+            // The dialog had the keyboard: hand it back to the window and the page.
+            self.window.set_focus();
+            self.refocus_page();
+        }
     }
 
     fn open_settings(&mut self) {
@@ -3559,6 +3597,8 @@ impl Browser {
                 self.refocus_page();
                 if let Some(Some(action)) = self.sub_actions.get(index).cloned() {
                     self.run_menu_action(action);
+                    // A dialog it opened takes the keyboard back from the page.
+                    self.popups.focus(PopupKind::Modal);
                 }
             }
             Pick::Menu(index) if self.menu_subs.get(index).is_some_and(|s| s.is_some()) => self.show_sub(index),
@@ -3567,6 +3607,8 @@ impl Browser {
                 self.refocus_page();
                 if let Some(Some(action)) = self.menu_actions.get(index).cloned() {
                     self.run_menu_action(action);
+                    // A dialog it opened takes the keyboard back from the page.
+                    self.popups.focus(PopupKind::Modal);
                 }
             }
             Pick::Modal(index) => match &self.modal_kind {
@@ -3781,8 +3823,7 @@ impl Browser {
                     return;
                 }
                 self.prefs.finish_setup();
-                self.toolbar.set_locked(false);
-                self.window.request_redraw();
+                self.lock_chrome();
                 self.sync_all_newtabs();
             }
         }
@@ -4008,6 +4049,19 @@ impl Browser {
 
     fn handle_window(&mut self, id: WindowId, event: WindowEvent) {
         if let Some(kind) = self.popups.owns(id) {
+            // A dialog holds the keyboard while it is open: typing there edits it.
+            match &event {
+                WindowEvent::ModifiersChanged(m) => self.mods = *m,
+                WindowEvent::KeyboardInput { event: key, .. } => {
+                    self.modal_key(key);
+                }
+                WindowEvent::ReceivedImeText(text) => {
+                    if matches!(self.modal_kind, Some(ModalKind::Persona)) && self.popups.is_open(PopupKind::Modal) {
+                        self.form_key(FormKey::Text(text.chars().filter(|c| !c.is_control()).collect()));
+                    }
+                }
+                _ => {}
+            }
             if let Some(pick) = self.popups.window_event(kind, &event) {
                 self.handle_pick(pick);
             }
@@ -4029,11 +4083,13 @@ impl Browser {
                 }
                 // Maximize/restore also arrives here; refresh the toolbar either way.
                 self.sync_ui();
+                self.refresh_modal();
             }
             WindowEvent::Moved(_) => {
                 self.close_suggest();
                 self.close_menu();
                 self.hide_preview();
+                self.refresh_modal();
             }
             WindowEvent::Focused(true) => {
                 self.ensure_chrome_focus();
@@ -4339,7 +4395,7 @@ fn main() -> wry::Result<()> {
     let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32, engine.clone());
     toolbar.set_persona_theme(dark, color, &letter);
     toolbar.set_background(prefs.bg_strip());
-    toolbar.set_locked(!prefs.setup_done);
+    toolbar.set_locked(!prefs.setup_done, false);
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 

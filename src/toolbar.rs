@@ -152,8 +152,11 @@ pub struct Toolbar {
     hover_fade: [f32; 16],
     /// The pointer moved in a way that changes what is drawn (see `take_dirty`).
     dirty: bool,
-    /// Setup is running: the chrome is blurred and only the window buttons and title bar work.
+    /// Setup is running or a dialog is open: the chrome is blurred and only the window buttons
+    /// and title bar work.
     locked: bool,
+    /// Locked behind a dialog: dimmed like the page under the dialog's blur.
+    lock_dim: bool,
     drag: Option<Drag>,
     last_click: (Instant, f32, f32, u32),
     progress: f32,
@@ -314,6 +317,7 @@ impl Toolbar {
             hover_fade: [0.0; 16],
             dirty: false,
             locked: false,
+            lock_dim: false,
             drag: None,
             last_click: (now, 0.0, 0.0, 0),
             progress: 0.0,
@@ -661,8 +665,14 @@ impl Toolbar {
 
     /// True once after a pointer move that needs a repaint. Plain moves over nothing do not, which
     /// keeps the event loop free for clicks.
-    pub fn set_locked(&mut self, on: bool) {
-        self.locked = on;
+    pub fn set_locked(&mut self, on: bool, dim: bool) {
+        if (on, dim) != (self.locked, self.lock_dim) {
+            self.locked = on;
+            self.lock_dim = dim;
+            self.hover = Hit::None;
+            self.pressed = None;
+            self.dirty = true;
+        }
     }
 
     pub fn take_dirty(&mut self) -> bool {
@@ -1397,7 +1407,12 @@ impl Toolbar {
         self.button_bg(c, g.new_tab, Hit::NewTab, 15.0, &th);
         c.icon(Icon::Plus, g.new_tab.x + 7.0, g.new_tab.y + 7.0, 16.0, th.fg.with_alpha(0.8));
 
-        // Window controls.
+        // Window controls. They stay sharp and usable while the chrome is locked; behind a dialog
+        // the strip under them is dimmed to match the blurred rest.
+        if self.locked && self.lock_dim {
+            let a = if th.fg.0 > 128 { 0.42 } else { 0.30 };
+            c.rect(g.min.x, 0.0, 3.0 * WIN_BTN_W, TITLE_H, th.strip.mix(Rgba(0, 0, 0, 255), a));
+        }
         for (r, h, icon) in [
             (g.min, Hit::Min, Icon::WinMin),
             (g.max, Hit::Max, if self.model.maximized { Icon::WinRestore } else { Icon::WinMax }),
@@ -1484,8 +1499,12 @@ impl Toolbar {
         if self.locked {
             // Everything but the window buttons is blurred while setup runs.
             // Two regions that do not overlap: the tab strip up to the window buttons, then the toolbar row.
-            c.veil(0.0, 0.0, self.width - 3.0 * WIN_BTN_W, TITLE_H, th.strip.with_alpha(0.35));
-            c.veil(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, th.toolbar.with_alpha(0.35));
+            // Behind a dialog the tint matches the dim over the page (and under the window
+            // buttons), so it all reads as one.
+            let dim = Rgba(0, 0, 0, 255).with_alpha(if th.fg.0 > 128 { 0.42 } else { 0.30 });
+            let (strip, bar) = if self.lock_dim { (dim, dim) } else { (th.strip.with_alpha(0.35), th.toolbar.with_alpha(0.35)) };
+            c.veil(0.0, 0.0, self.width - 3.0 * WIN_BTN_W, TITLE_H, strip);
+            c.veil(0.0, TITLE_H, self.width, HEIGHT - TITLE_H, bar);
         }
     }
 

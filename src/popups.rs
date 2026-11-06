@@ -17,7 +17,7 @@ use tao::{
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::EventLoopWindowTarget,
     platform::windows::{WindowBuilderExtWindows, WindowExtWindows},
-    window::{Window, WindowBuilder, WindowId},
+    window::{CursorIcon, Window, WindowBuilder, WindowId},
 };
 use tiny_skia::{FillRule, Mask, Paint, Pixmap, PixmapPaint, Stroke, Transform};
 
@@ -48,6 +48,8 @@ const HERO_H: f32 = 160.0;
 const DOT: f32 = 30.0;
 /// Where the sliders' tracks start (their labels sit to the left).
 const SLIDER_X: f32 = 92.0;
+/// Radius of a slider's knob, which stays inside the track.
+const KNOB: f32 = 9.0;
 const MODAL_ROW: f32 = 56.0;
 const MODAL_FOOT: f32 = 62.0;
 
@@ -250,6 +252,8 @@ pub struct Popup {
     card_pos: (f64, f64),
     /// Last pointer position inside the card (logical px), to find the row under a press.
     cursor: (f32, f32),
+    /// The pointer shape last set on the window.
+    icon: CursorIcon,
     v: View,
 }
 
@@ -464,6 +468,14 @@ impl Popups {
         p.window.request_redraw();
     }
 
+    /// Gives a popup the keyboard focus (only dialogs can take it).
+    pub fn focus(&mut self, kind: Kind) {
+        let p = self.get(kind);
+        if p.open {
+            p.window.set_focus();
+        }
+    }
+
     pub fn owns(&self, id: WindowId) -> Option<Kind> {
         [&self.menu, &self.suggest, &self.preview, &self.tip, &self.modal, &self.scrim, &self.sub].into_iter().find(|p| p.window.id() == id).map(|p| p.kind)
     }
@@ -487,6 +499,16 @@ impl Popups {
                 // The shadow margin is part of the window but not of the card.
                 let inside = x >= 0.0 && x < p.v.size.0;
                 let hover = p.v.rows.iter().position(|r| inside && row_hit(r, x, y));
+                // An I-beam over the name field, a hand over anything clickable.
+                let icon = match hover {
+                    Some(0) if matches!(p.v.content, Content::Persona(_)) => CursorIcon::Text,
+                    Some(_) if matches!(kind, Kind::Modal | Kind::Menu | Kind::Sub) => CursorIcon::Hand,
+                    _ => CursorIcon::Default,
+                };
+                if icon != p.icon {
+                    p.icon = icon;
+                    p.window.set_cursor_icon(icon);
+                }
                 if hover != p.v.hover {
                     p.v.hover = hover;
                     if kind == Kind::Suggest
@@ -664,7 +686,9 @@ impl Popup {
                 .with_resizable(false)
                 .with_visible(true)
                 .with_focused(false)
-                .with_focusable(false)
+                // Dialogs take the keyboard (the persona name field); every other popup leaves it
+                // with the browser window.
+                .with_focusable(kind == Kind::Modal)
                 .with_position(PARKED)
                 .with_skip_taskbar(true)
                 .with_owner_window(owner.hwnd())
@@ -693,6 +717,7 @@ impl Popup {
             phys_size: (1, 1),
             card_pos: (0.0, 0.0),
             cursor: (-1.0, -1.0),
+            icon: CursorIcon::Default,
             v: View {
                 content: Content::Empty,
                 rows: Vec::new(),
@@ -999,29 +1024,37 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
                     let Some(r) = p.rows.get(12 + k) else { continue };
                     let ty = r.y + (r.h - c.line_height(12.0, Weight::Regular)) / 2.0;
                     c.text(name, 22.0, ty, 12.0, Weight::Regular, th.dim.with_alpha(a), SLIDER_X - 6.0);
-                    let (tx, tw, th_) = (r.x, r.w, 10.0);
-                    let ty = r.y + (r.h - th_) / 2.0;
+                    // A slim track; the knob travels inside it, so it never pokes past either end.
+                    let (tx, tw, th_) = (r.x, r.w, 6.0);
+                    let cy = r.y + r.h / 2.0;
+                    let ty = cy - th_ / 2.0;
+                    let at = |frac: f32| if k == 0 { crate::gfx::hsl(frac, 0.85, 0.55) } else { crate::gfx::hsl(f.hue, 0.12 + 0.88 * frac, 0.55 - 0.05 * (1.0 - frac)) };
                     if k == 0 {
                         // Six square gradient segments between two round red caps (hue 0 and 1 are
                         // both red), so no segment edge shows a notch.
                         let cap = th_ / 2.0;
-                        let red = crate::gfx::hsl(0.0, 0.85, 0.55).with_alpha(a);
+                        let red = at(0.0).with_alpha(a);
                         c.circle(tx + cap, ty + cap, cap, red);
                         c.circle(tx + tw - cap, ty + cap, cap, red);
                         let (sx, sw) = (tx + cap, tw - 2.0 * cap);
                         let seg = sw / 6.0;
                         for i in 0..6 {
-                            let (c1, c2) = (crate::gfx::hsl(i as f32 / 6.0, 0.85, 0.55), crate::gfx::hsl((i + 1) as f32 / 6.0, 0.85, 0.55));
+                            let (c1, c2) = (at(i as f32 / 6.0), at((i + 1) as f32 / 6.0));
                             c.hgrad(sx + seg * i as f32, ty, seg + 0.6, th_, 0.0, c1.with_alpha(a), c2.with_alpha(a));
                         }
                     } else {
-                        c.hgrad(tx, ty, tw, th_, th_ / 2.0, crate::gfx::hsl(f.hue, 0.12, 0.5).with_alpha(a), crate::gfx::hsl(f.hue, 1.0, 0.55).with_alpha(a));
+                        c.hgrad(tx, ty, tw, th_, th_ / 2.0, at(0.0).with_alpha(a), at(1.0).with_alpha(a));
                     }
-                    let kx = tx + tw * frac.clamp(0.0, 1.0);
+                    let frac = frac.clamp(0.0, 1.0);
+                    let kx = tx + KNOB + (tw - 2.0 * KNOB) * frac;
                     let grabbed = p.pressed == Some(12 + k);
-                    c.circle(kx, ty + th_ / 2.0, 11.0 + if grabbed { 1.5 } else { 0.0 }, Rgba(0, 0, 0, 255).with_alpha(0.25 * a));
-                    c.circle(kx, ty + th_ / 2.0, 10.0 + if grabbed { 1.5 } else { 0.0 }, Rgba(255, 255, 255, 255).with_alpha(a));
-                    c.circle(kx, ty + th_ / 2.0, 6.5, accent.with_alpha(a));
+                    let hot = grabbed || p.hover == Some(12 + k);
+                    let kr = KNOB + if grabbed { 1.5 } else if hot { 0.5 } else { 0.0 };
+                    // A white knob on a soft shadow, filled with the color under it.
+                    c.shadow(kx - kr, cy - kr, 2.0 * kr, 2.0 * kr, kr, 6.0, 1.5, if dark { 0.45 } else { 0.22 } * a);
+                    c.circle(kx, cy, kr + 0.75, Rgba(0, 0, 0, 255).with_alpha(if dark { 0.30 } else { 0.10 } * a));
+                    c.circle(kx, cy, kr, Rgba(255, 255, 255, 255).with_alpha(a));
+                    c.circle(kx, cy, kr - 3.0, at(frac).with_alpha(a));
                 }
                 let btn = |c: &mut crate::anvil::Painter, r: &Row, label: &str, fill: Rgba, fg: Rgba, f: f32| {
                     c.rrect(r.x, r.y, r.w, r.h, 10.0, fill.mix(Rgba(255, 255, 255, 255), 0.12 * f).with_alpha(a));
@@ -1126,7 +1159,9 @@ fn draw(p: &mut View, pm: &mut Pixmap, engine: &mut Option<Engine>, images: &std
 /// The 0..1 position of `x` along row `i` if it is a slider.
 fn slide_at(rows: &[Row], i: usize, x: f32) -> Option<Pick> {
     let r = rows.get(i).filter(|r| r.slider)?;
-    Some(Pick::Slide(i, ((x - r.x) / r.w).clamp(0.0, 1.0)))
+    // The knob's centre travels between KNOB from either end of the track.
+    let span = (r.w - 2.0 * KNOB).max(1.0);
+    Some(Pick::Slide(i, ((x - r.x - KNOB) / span).clamp(0.0, 1.0)))
 }
 
 /// Whether a point (card coordinates) is on an enabled row, honouring rows narrower than the card.
