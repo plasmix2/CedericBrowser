@@ -1,0 +1,25 @@
+[package]
+name = "anvil_ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Anvil UI: immediate-mode widgets, layout and motion, drawn by anvl_gpu"
+
+[dependencies]
+anvl_gpu.workspace = true
+winit.workspace = true
+glam.workspace = true
+taffy.workspace = true
+
+# `platform::Clipboard`. The system clipboard has no Android backend here; Android uses JNI.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard.workspace = true
+
+# `platform` on Android: the clipboard, soft keyboard and insets through JNI.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
+[dev-dependencies]
+# Screenshot tests encode reference PNGs with tiny-skia. Apps never link it.
+resvg.workspace = true

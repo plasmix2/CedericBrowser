@@ -1,0 +1,22 @@
+# The ANVL SDK 0.3.0 crates Persona's native UI draws with. Only the two crates the browser needs
+# are vendored; see AGENTS.md ("Native UI: the ANVL SDK") before changing anything in here.
+[workspace]
+resolver = "2"
+members = ["crates/anvl_gpu", "crates/anvil_ui"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anvl_gpu = { path = "crates/anvl_gpu" }
+anvil_ui = { path = "crates/anvil_ui" }
+winit = "0.29"
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl"] }
+glam = "0.27"
+bytemuck = { version = "1.14", features = ["derive"] }
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
+resvg = "0.45"
+taffy = { version = "0.14", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "content_size"] }
+arboard = { version = "3", default-features = false }

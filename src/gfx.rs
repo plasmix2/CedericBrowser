@@ -1,11 +1,7 @@
-//! Drawing primitives for the native UI: a tiny-skia canvas in physical pixels, shapes, vector
-//! icons, and text through cosmic-text. Everything takes logical coordinates and scales by `s`.
+//! Shared types for the native UI: colors, the persona and brand themes, the icon names, and the
+//! rounded-rectangle path the popups clip with. Drawing itself is done by the ANVL engine (`anvil.rs`).
 
-use cosmic_text::{Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
-use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke,
-    Transform,
-};
+use tiny_skia::{Path, PathBuilder};
 
 /// An sRGB color with straight (not premultiplied) alpha.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -23,12 +19,6 @@ impl Rgba {
         let l = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u8;
         Self(l(self.0, o.0), l(self.1, o.1), l(self.2, o.2), l(self.3, o.3))
     }
-    fn paint(self) -> Paint<'static> {
-        let mut p = Paint::default();
-        p.set_color(Color::from_rgba8(self.0, self.1, self.2, self.3));
-        p.anti_alias = true;
-        p
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -43,6 +33,8 @@ pub enum PersonaColor {
     Rose,
     Cyan,
     Amber,
+    /// Any color the user picked, as 0xRRGGBB. The chrome's palette is derived from it.
+    Custom(u32),
 }
 
 impl PersonaColor {
@@ -58,6 +50,13 @@ impl PersonaColor {
     ];
 
     pub fn from_str_name(s: &str) -> Self {
+        // "#rrggbb" is a custom color.
+        if let Some(hex) = s.trim().strip_prefix('#')
+            && hex.len() == 6
+            && let Ok(v) = u32::from_str_radix(hex, 16)
+        {
+            return Self::Custom(v);
+        }
         match s.trim().to_ascii_lowercase().as_str() {
             "orange" | "cederic" => Self::Orange,
             "slate" | "uzaki" | "blue" | "slate_blue" | "indigo" => Self::Slate,
@@ -81,6 +80,15 @@ impl PersonaColor {
             Self::Rose => "rose",
             Self::Cyan => "cyan",
             Self::Amber => "amber",
+            Self::Custom(_) => "custom",
+        }
+    }
+
+    /// What is stored in a persona's `color`: the preset's name, or `#rrggbb` for a custom color.
+    pub fn to_key(self) -> String {
+        match self {
+            Self::Custom(v) => format!("#{:06x}", v & 0xffffff),
+            c => c.name().to_string(),
         }
     }
 
@@ -94,10 +102,19 @@ impl PersonaColor {
             Self::Rose => "Rose Pink",
             Self::Cyan => "Cyan Blue",
             Self::Amber => "Amber Gold",
+            Self::Custom(_) => "Custom",
         }
     }
 
-    pub const fn hex_code(self) -> &'static str {
+    /// The accent as `#rrggbb`.
+    pub fn hex_string(self) -> String {
+        match self {
+            Self::Custom(v) => format!("#{:06x}", v & 0xffffff),
+            c => c.preset_hex().to_string(),
+        }
+    }
+
+    const fn preset_hex(self) -> &'static str {
         match self {
             Self::Orange => "#ff6a3d",
             Self::Slate => "#7366e6",
@@ -107,10 +124,17 @@ impl PersonaColor {
             Self::Rose => "#f43f5e",
             Self::Cyan => "#06b6d4",
             Self::Amber => "#f59e0b",
+            Self::Custom(_) => "#808080",
         }
     }
 
-    pub const fn accents(self, dark: bool) -> (Rgba, Rgba) {
+    pub fn accents(self, dark: bool) -> (Rgba, Rgba) {
+        if let Self::Custom(v) = self {
+            let (h, s, l) = to_hsl(Rgba::hex(v));
+            let l = if dark { l.clamp(0.5, 0.64) } else { l.clamp(0.36, 0.5) };
+            let s = s.max(0.35);
+            return (hsl(h, s, l), hsl((h + 0.06).fract(), s, (l + 0.1).min(0.8)));
+        }
         match (self, dark) {
             (Self::Orange, _) => (Rgba::hex(0xff6a3d), Rgba::hex(0xffb03d)),
             (Self::Slate, true) => (Rgba::hex(0x7366e6), Rgba::hex(0x94a3f8)),
@@ -127,10 +151,20 @@ impl PersonaColor {
             (Self::Cyan, false) => (Rgba::hex(0x0891b2), Rgba::hex(0x38bdf8)),
             (Self::Amber, true) => (Rgba::hex(0xf59e0b), Rgba::hex(0xfbbf24)),
             (Self::Amber, false) => (Rgba::hex(0xd97706), Rgba::hex(0xfbbf24)),
+            (Self::Custom(_), _) => (Rgba::hex(0xff6a3d), Rgba::hex(0xffb03d)),
         }
     }
-    pub const fn surface_tints(self, dark: bool) -> (Rgba, Rgba, Rgba) {
+    pub fn surface_tints(self, dark: bool) -> (Rgba, Rgba, Rgba) {
         // (strip, toolbar, border)
+        if let Self::Custom(v) = self {
+            let (h, s, _) = to_hsl(Rgba::hex(v));
+            let t = (s * 0.3).clamp(0.12, 0.28);
+            return if dark {
+                (hsl(h, t, 0.085), hsl(h, t + 0.02, 0.135), hsl(h, t, 0.22))
+            } else {
+                (hsl(h, t + 0.02, 0.88), hsl(h, t + 0.04, 0.965), hsl(h, t, 0.82))
+            };
+        }
         match (self, dark) {
             (Self::Orange, true) => (Rgba::hex(0x18191d), Rgba::hex(0x26272c), Rgba::hex(0x34363d)),
             (Self::Orange, false) => (Rgba::hex(0xdfe1e6), Rgba::hex(0xf7f7f9), Rgba::hex(0xd2d4da)),
@@ -148,6 +182,7 @@ impl PersonaColor {
             (Self::Cyan, false) => (Rgba::hex(0xd7e8ee), Rgba::hex(0xeff6f8), Rgba::hex(0xc1dbe4)),
             (Self::Amber, true) => (Rgba::hex(0x1d1a14), Rgba::hex(0x29241b), Rgba::hex(0x3e3729)),
             (Self::Amber, false) => (Rgba::hex(0xece5d7), Rgba::hex(0xf8f5ef), Rgba::hex(0xdfd4be)),
+            (Self::Custom(_), _) => (Rgba::hex(0x18191d), Rgba::hex(0x26272c), Rgba::hex(0x34363d)),
         }
     }
 }
@@ -229,6 +264,22 @@ impl Theme {
 
     pub fn for_persona(dark: bool, color: PersonaColor) -> Self {
         let (accent, accent2) = color.accents(dark);
+        if let PersonaColor::Custom(_) = color {
+            // Start from the neutral palette and tint the surfaces with the chosen color.
+            let mut t = Self::for_persona(dark, PersonaColor::Orange);
+            let (strip, toolbar, border) = color.surface_tints(dark);
+            t.strip = strip;
+            t.toolbar = toolbar;
+            t.border = border;
+            t.tab_hover = strip.mix(toolbar, 0.5);
+            t.field = if dark { strip } else { strip.mix(toolbar, 0.55) };
+            t.field_hover = t.field.mix(toolbar, 0.3);
+            t.card = if dark { toolbar.mix(Rgba(255, 255, 255, 255), 0.03) } else { Rgba(255, 255, 255, 255) };
+            t.accent = accent;
+            t.accent2 = accent2;
+            t.selection = accent.with_alpha(0.4);
+            return t;
+        }
         match (color, dark) {
             (PersonaColor::Orange, true) => Self {
                 strip: Rgba::hex(0x18191d),
@@ -387,184 +438,61 @@ pub enum Icon {
     StarFilled,
     Bookmarks,
     Pip,
-    Palette,
     History,
     Code,
     WinMin,
     WinMax,
     WinRestore,
     WinClose,
+    ExternalLink,
+    Copy,
+    Link,
+    Photo,
+    Printer,
+    Maximize,
+    UserCircle,
+    Users,
+    Settings,
+    ChevronRight,
+    Check,
+    Logout,
+    ShieldLock,
+    Trash,
+    Sparkles,
+    Menu,
+    Leaf,
 }
 
-/// A canvas in physical pixels with a logical-to-physical scale `s`.
-pub struct Canvas<'a> {
-    pub pm: &'a mut Pixmap,
-    pub s: f32,
+/// HSL (all 0..1) to a color.
+pub fn hsl(h: f32, s: f32, l: f32) -> Rgba {
+    let (h, s, l) = (h.rem_euclid(1.0), s.clamp(0.0, 1.0), l.clamp(0.0, 1.0));
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (h * 6.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let q = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Rgba(q(r), q(g), q(b), 255)
 }
 
-impl Canvas<'_> {
-    fn t(&self) -> Transform {
-        Transform::from_scale(self.s, self.s)
+/// A color's (hue, saturation, lightness), all 0..1.
+pub fn to_hsl(c: Rgba) -> (f32, f32, f32) {
+    let (r, g, b) = (c.0 as f32 / 255.0, c.1 as f32 / 255.0, c.2 as f32 / 255.0);
+    let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+    let l = (mx + mn) / 2.0;
+    let d = mx - mn;
+    if d < 1e-6 {
+        return (0.0, 0.0, l);
     }
-
-    pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Rgba) {
-        if let Some(r) = Rect::from_xywh(x, y, w, h) {
-            self.pm.fill_rect(r, &c.paint(), self.t(), None);
-        }
-    }
-
-    /// A line exactly one physical pixel thick, snapped to the pixel grid so it stays crisp.
-    pub fn hairline_h(&mut self, x: f32, y: f32, w: f32, c: Rgba) {
-        let py = (y * self.s).floor();
-        if let Some(r) = Rect::from_xywh((x * self.s).round(), py, (w * self.s).round(), 1.0) {
-            self.pm.fill_rect(r, &c.paint(), Transform::identity(), None);
-        }
-    }
-
-    pub fn hairline_v(&mut self, x: f32, y: f32, h: f32, c: Rgba) {
-        let px = (x * self.s).floor();
-        if let Some(r) = Rect::from_xywh(px, (y * self.s).round(), 1.0, (h * self.s).round()) {
-            self.pm.fill_rect(r, &c.paint(), Transform::identity(), None);
-        }
-    }
-
-    /// Rounded rectangle with per-corner radii (top-left, top-right, bottom-right, bottom-left).
-    pub fn rrect(&mut self, x: f32, y: f32, w: f32, h: f32, r: [f32; 4], c: Rgba) {
-        if let Some(p) = rrect_path(x, y, w, h, r) {
-            self.pm.fill_path(&p, &c.paint(), FillRule::Winding, self.t(), None);
-        }
-    }
-
-    pub fn circle(&mut self, cx: f32, cy: f32, r: f32, c: Rgba) {
-        if let Some(p) = PathBuilder::from_circle(cx, cy, r) {
-            self.pm.fill_path(&p, &c.paint(), FillRule::Winding, self.t(), None);
-        }
-    }
-
-    pub fn fill(&mut self, p: &Path, c: Rgba) {
-        self.pm.fill_path(p, &c.paint(), FillRule::Winding, self.t(), None);
-    }
-
-    pub fn stroke(&mut self, p: &Path, width: f32, c: Rgba) {
-        let st = Stroke { width, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
-        self.pm.stroke_path(p, &c.paint(), &st, self.t(), None);
-    }
-
-    /// The concave "foot" that joins a tab to the toolbar below it. `right` picks the side.
-    pub fn foot(&mut self, x: f32, bottom: f32, r: f32, right: bool, c: Rgba) {
-        let k = 0.552_284_8 * r;
-        let mut pb = PathBuilder::new();
-        if right {
-            // Filled on the left (touching the tab), curving up to the right.
-            pb.move_to(x, bottom - r);
-            pb.line_to(x, bottom);
-            pb.line_to(x + r, bottom);
-            pb.cubic_to(x + r - k, bottom, x, bottom - r + k, x, bottom - r);
-        } else {
-            pb.move_to(x + r, bottom - r);
-            pb.line_to(x + r, bottom);
-            pb.line_to(x, bottom);
-            pb.cubic_to(x + k, bottom, x + r, bottom - r + k, x + r, bottom - r);
-        }
-        pb.close();
-        if let Some(p) = pb.finish() {
-            self.fill(&p, c);
-        }
-    }
-
-    /// Draws `icon` with its grid scaled into a `size`-wide box at (x, y).
-    pub fn icon(&mut self, icon: Icon, x: f32, y: f32, size: f32, c: Rgba) {
-        let grid = if matches!(icon, Icon::WinMin | Icon::WinMax | Icon::WinRestore | Icon::WinClose) { 10.0 } else { 24.0 };
-        let k = size / grid;
-        let (strokes, fills, width) = cached_icon(icon);
-        let paint = c.paint();
-        let st = Stroke { width: width * k * if grid > 20.0 { 1.2 } else { 1.0 }, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
-        let t = Transform::from_row(k, 0.0, 0.0, k, x, y).post_scale(self.s, self.s);
-        for p in fills {
-            self.pm.fill_path(p, &paint, FillRule::Winding, t, None);
-        }
-        for p in strokes {
-            self.pm.stroke_path(p, &paint, &st, t, None);
-        }
-    }
-
-    /// A loading spinner: a 3/4 ring rotated by `turn` (0..1).
-    pub fn spinner(&mut self, cx: f32, cy: f32, r: f32, turn: f32, c: Rgba) {
-        let a0 = turn * std::f32::consts::TAU;
-        if let Some(p) = arc_path(cx, cy, r, a0, a0 + std::f32::consts::TAU * 0.75) {
-            self.stroke(&p, 2.0, c);
-        }
-    }
-
-    /// Draws an image scaled into the logical box (x, y, w, h).
-    pub fn image(&mut self, img: &Pixmap, x: f32, y: f32, w: f32, h: f32, alpha: f32) {
-        let sx = w * self.s / img.width() as f32;
-        let sy = h * self.s / img.height() as f32;
-        let quality = if w > 64.0 {
-            tiny_skia::FilterQuality::Bilinear
-        } else {
-            tiny_skia::FilterQuality::Bicubic
-        };
-        let paint = PixmapPaint { opacity: alpha, quality, ..PixmapPaint::default() };
-        let t = Transform::from_row(sx, 0.0, 0.0, sy, x * self.s, y * self.s);
-        self.pm.draw_pixmap(0, 0, img.as_ref(), &paint, t, None);
-    }
-
-    /// Draws a laid-out text buffer with its top-left at logical (x, y). Glyphs past `clip_r`
-    /// are dropped and the last `fade` logical pixels before it fade out.
-    pub fn text(&mut self, fonts: &mut Fonts, buf: &mut Buffer, x: f32, y: f32, c: Rgba, clip_r: f32, fade: f32) {
-        let (ox, oy) = ((x * self.s).round() as i32, (y * self.s).round() as i32);
-        let (w, h) = (self.pm.width() as i32, self.pm.height() as i32);
-        let clip = ((clip_r * self.s) as i32).min(w);
-        let fade_start = clip - (fade * self.s).round() as i32;
-        let fade_px = (fade * self.s).max(1.0);
-        let color = TextColor::rgba(c.0, c.1, c.2, c.3);
-        let data = self.pm.data_mut();
-        buf.draw(&mut fonts.system, &mut fonts.cache, color, |gx, gy, gw, gh, col| {
-            let ca = col.a();
-            if ca == 0 {
-                return;
-            }
-            let y0 = (oy + gy).max(0);
-            let y1 = (oy + gy + gh as i32).min(h);
-            let x0 = (ox + gx).max(0);
-            let x1 = (ox + gx + gw as i32).min(clip);
-            if x0 >= x1 || y0 >= y1 {
-                return;
-            }
-            let (r, g, b) = (col.r(), col.g(), col.b());
-            for py in y0..y1 {
-                let row = (py * w) as usize;
-                for px in x0..x1 {
-                    let a = if fade > 0.0 && px > fade_start {
-                        (ca as f32 * ((clip - px) as f32 / fade_px).clamp(0.0, 1.0)) as u32
-                    } else {
-                        ca as u32
-                    };
-                    blend_u8(data, row + px as usize, r, g, b, a);
-                }
-            }
-        });
-    }
-}
-
-/// Source-over blend of a cosmic-text color into premultiplied RGBA pixel `i`.
-pub fn blend_px(data: &mut [u8], i: usize, c: TextColor) {
-    blend_u8(data, i, c.r(), c.g(), c.b(), c.a() as u32);
-}
-
-/// Fast integer source-over blend of straight-alpha `(r, g, b, a)` into premultiplied RGBA pixel `i`.
-#[inline(always)]
-fn blend_u8(data: &mut [u8], i: usize, r: u8, g: u8, b: u8, a: u32) {
-    if a == 0 {
-        return;
-    }
-    let p = &mut data[i * 4..i * 4 + 4];
-    let inv = 255 - a;
-    p[0] = ((r as u32 * a + p[0] as u32 * inv + 127) / 255) as u8;
-    p[1] = ((g as u32 * a + p[1] as u32 * inv + 127) / 255) as u8;
-    p[2] = ((b as u32 * a + p[2] as u32 * inv + 127) / 255) as u8;
-    p[3] = ((255 * a + p[3] as u32 * inv + 127) / 255) as u8;
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if mx == r { ((g - b) / d).rem_euclid(6.0) } else if mx == g { (b - r) / d + 2.0 } else { (r - g) / d + 4.0 } / 6.0;
+    (h, s, l)
 }
 
 pub fn rrect_path(x: f32, y: f32, w: f32, h: f32, r: [f32; 4]) -> Option<Path> {
@@ -588,244 +516,34 @@ pub fn rrect_path(x: f32, y: f32, w: f32, h: f32, r: [f32; 4]) -> Option<Path> {
     pb.finish()
 }
 
-/// Circular arc from angle `a0` to `a1` (radians, y down, clockwise), as cubic segments.
-fn arc_path(cx: f32, cy: f32, r: f32, a0: f32, a1: f32) -> Option<Path> {
-    let mut pb = PathBuilder::new();
-    push_arc(&mut pb, cx, cy, r, a0, a1, true);
-    pb.finish()
-}
+#[cfg(test)]
+mod custom_color_tests {
+    use super::*;
 
-fn push_arc(pb: &mut PathBuilder, cx: f32, cy: f32, r: f32, a0: f32, a1: f32, start: bool) {
-    let n = ((a1 - a0).abs() / (std::f32::consts::FRAC_PI_2)).ceil().max(1.0) as usize;
-    let step = (a1 - a0) / n as f32;
-    let k = 4.0 / 3.0 * (step / 4.0).tan();
-    let pt = |a: f32| (cx + r * a.cos(), cy + r * a.sin());
-    let (sx, sy) = pt(a0);
-    if start {
-        pb.move_to(sx, sy);
-    } else {
-        pb.line_to(sx, sy);
-    }
-    for i in 0..n {
-        let (b0, b1) = (a0 + step * i as f32, a0 + step * (i + 1) as f32);
-        let (x0, y0) = pt(b0);
-        let (x1, y1) = pt(b1);
-        pb.cubic_to(
-            x0 - k * r * b0.sin(),
-            y0 + k * r * b0.cos(),
-            x1 + k * r * b1.sin(),
-            y1 - k * r * b1.cos(),
-            x1,
-            y1,
-        );
-    }
-}
-
-fn poly(points: &[(f32, f32)]) -> Option<Path> {
-    let mut pb = PathBuilder::new();
-    let (first, rest) = points.split_first()?;
-    pb.move_to(first.0, first.1);
-    for p in rest {
-        pb.line_to(p.0, p.1);
-    }
-    pb.finish()
-}
-
-fn rect_outline(x: f32, y: f32, w: f32, h: f32) -> Option<Path> {
-    let mut pb = PathBuilder::new();
-    pb.push_rect(Rect::from_xywh(x, y, w, h)?);
-    pb.finish()
-}
-
-const ALL_ICONS: [Icon; 21] = [
-    Icon::Back,
-    Icon::Forward,
-    Icon::Reload,
-    Icon::Stop,
-    Icon::Close,
-    Icon::Plus,
-    Icon::Lock,
-    Icon::Info,
-    Icon::Search,
-    Icon::Globe,
-    Icon::Star,
-    Icon::StarFilled,
-    Icon::Bookmarks,
-    Icon::Pip,
-    Icon::Palette,
-    Icon::History,
-    Icon::Code,
-    Icon::WinMin,
-    Icon::WinMax,
-    Icon::WinRestore,
-    Icon::WinClose,
-];
-
-fn cached_icon(icon: Icon) -> (&'static [Path], &'static [Path], f32) {
-    static CACHE: std::sync::OnceLock<[(Vec<Path>, Vec<Path>, f32); 21]> = std::sync::OnceLock::new();
-    let entry = &CACHE.get_or_init(|| {
-        ALL_ICONS.map(|ic| {
-            let (raw_strokes, w) = icon_paths(ic);
-            let strokes: Vec<Path> = raw_strokes.into_iter().flatten().collect();
-            let fills: Vec<Path> = match ic {
-                Icon::StarFilled => strokes.clone(),
-                Icon::Info => PathBuilder::from_circle(12.0, 8.0, 1.2).into_iter().collect(),
-                Icon::Pip => rrect_path(12.5, 12.5, 8.5, 6.5, [1.5; 4]).into_iter().collect(),
-                Icon::Palette => [(8.0, 10.5), (10.5, 7.5), (14.5, 7.5)]
-                    .into_iter()
-                    .filter_map(|(cx, cy)| PathBuilder::from_circle(cx, cy, 1.1))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            (strokes, fills, w)
-        })
-    })[icon as usize];
-    (&entry.0, &entry.1, entry.2)
-}
-
-/// Paths and stroke width (in grid units) for each icon.
-fn icon_paths(icon: Icon) -> (Vec<Option<Path>>, f32) {
-    use std::f32::consts::PI;
-    let deg = |d: f32| d * PI / 180.0;
-    match icon {
-        Icon::Back => (vec![poly(&[(19.0, 12.0), (5.0, 12.0)]), poly(&[(11.0, 18.0), (5.0, 12.0), (11.0, 6.0)])], 1.9),
-        Icon::Forward => (vec![poly(&[(5.0, 12.0), (19.0, 12.0)]), poly(&[(13.0, 18.0), (19.0, 12.0), (13.0, 6.0)])], 1.9),
-        Icon::Reload => {
-            // Open circle with an arrow head at its top-right end.
-            let mut pb = PathBuilder::new();
-            push_arc(&mut pb, 12.0, 12.0, 8.0, deg(0.0), deg(315.0), true);
-            pb.line_to(20.0, 8.5);
-            (vec![pb.finish(), poly(&[(20.0, 4.0), (20.0, 8.5), (15.5, 8.5)])], 1.9)
+    #[test]
+    fn hsl_round_trips() {
+        for c in [Rgba(255, 106, 61, 255), Rgba(16, 185, 129, 255), Rgba(139, 92, 246, 255), Rgba(30, 30, 30, 255)] {
+            let (h, s, l) = to_hsl(c);
+            let back = hsl(h, s, l);
+            for (a, b) in [(c.0, back.0), (c.1, back.1), (c.2, back.2)] {
+                assert!((a as i32 - b as i32).abs() <= 1, "{c:?} -> {back:?}");
+            }
         }
-        Icon::Stop => (vec![poly(&[(17.0, 7.0), (7.0, 17.0)]), poly(&[(7.0, 7.0), (17.0, 17.0)])], 1.9),
-        Icon::Close => (vec![poly(&[(6.0, 6.0), (18.0, 18.0)]), poly(&[(18.0, 6.0), (6.0, 18.0)])], 2.4),
-        Icon::Plus => (vec![poly(&[(12.0, 5.0), (12.0, 19.0)]), poly(&[(5.0, 12.0), (19.0, 12.0)])], 1.9),
-        Icon::Lock => {
-            let mut shackle = PathBuilder::new();
-            shackle.move_to(8.0, 11.0);
-            shackle.line_to(8.0, 8.0);
-            push_arc(&mut shackle, 12.0, 8.0, 4.0, deg(180.0), deg(360.0), false);
-            shackle.line_to(16.0, 11.0);
-            (vec![rrect_path(5.0, 11.0, 14.0, 10.0, [2.0; 4]), shackle.finish()], 1.9)
+    }
+
+    #[test]
+    fn custom_colors_are_stored_as_hex_and_make_a_theme() {
+        let c = PersonaColor::from_str_name("#12ab9f");
+        assert_eq!(c, PersonaColor::Custom(0x12ab9f));
+        assert_eq!(c.to_key(), "#12ab9f");
+        assert_eq!(PersonaColor::from_str_name("ruby").to_key(), "ruby");
+        assert_eq!(PersonaColor::from_str_name("#zzz"), PersonaColor::Orange);
+        for dark in [true, false] {
+            let t = Theme::for_persona(dark, c);
+            // Surfaces are tinted (not the neutral grey) and the accent stays visible against them.
+            assert_ne!(t.toolbar, Theme::for_persona(dark, PersonaColor::Orange).toolbar);
+            let lum = |x: Rgba| x.0 as i32 + x.1 as i32 + x.2 as i32;
+            assert!((lum(t.accent) - lum(t.toolbar)).abs() > 120);
         }
-        Icon::Info => (vec![PathBuilder::from_circle(12.0, 12.0, 9.0), poly(&[(12.0, 16.0), (12.0, 11.0)])], 1.9),
-        Icon::Search => (vec![PathBuilder::from_circle(11.0, 11.0, 7.0), poly(&[(20.0, 20.0), (16.0, 16.0)])], 1.9),
-        Icon::Globe => (
-            vec![
-                PathBuilder::from_circle(12.0, 12.0, 9.0),
-                poly(&[(3.0, 12.0), (21.0, 12.0)]),
-                Rect::from_xywh(7.5, 3.0, 9.0, 18.0).and_then(PathBuilder::from_oval),
-            ],
-            1.9,
-        ),
-        Icon::Star | Icon::StarFilled => (
-            vec![poly(&[
-                (12.0, 3.2),
-                (14.8, 8.9),
-                (21.0, 9.8),
-                (16.5, 14.2),
-                (17.6, 20.4),
-                (12.0, 17.4),
-                (6.4, 20.4),
-                (7.5, 14.2),
-                (3.0, 9.8),
-                (9.2, 8.9),
-                (12.0, 3.2),
-            ])],
-            1.8,
-        ),
-        Icon::Bookmarks => (
-            vec![poly(&[
-                (6.0, 4.0),
-                (18.0, 4.0),
-                (18.0, 20.5),
-                (12.0, 16.5),
-                (6.0, 20.5),
-                (6.0, 4.0),
-            ])],
-            1.9,
-        ),
-        Icon::Pip => (
-            vec![poly(&[
-                (21.0, 10.0),
-                (21.0, 5.5),
-                (3.0, 5.5),
-                (3.0, 18.5),
-                (10.5, 18.5),
-            ])],
-            1.9,
-        ),
-        Icon::Palette => (
-            vec![
-                PathBuilder::from_circle(12.0, 12.0, 9.0),
-                poly(&[(12.0, 21.0), (14.5, 17.5), (12.0, 14.5), (16.5, 13.5), (20.8, 12.0)]),
-            ],
-            1.8,
-        ),
-        Icon::History => {
-            let mut pb = PathBuilder::new();
-            push_arc(&mut pb, 12.0, 12.0, 9.0, deg(180.0), deg(180.0 + 312.0), true);
-            (vec![pb.finish(), poly(&[(3.0, 4.0), (3.0, 8.5), (7.5, 8.5)]), poly(&[(12.0, 7.0), (12.0, 12.0), (15.0, 14.0)])], 1.9)
-        }
-        Icon::Code => (vec![poly(&[(8.0, 7.0), (3.0, 12.0), (8.0, 17.0)]), poly(&[(16.0, 7.0), (21.0, 12.0), (16.0, 17.0)])], 1.9),
-        Icon::WinMin => (vec![poly(&[(0.0, 5.0), (10.0, 5.0)])], 1.0),
-        Icon::WinMax => (vec![rect_outline(0.5, 0.5, 9.0, 9.0)], 1.0),
-        Icon::WinRestore => (vec![rect_outline(0.5, 2.5, 7.0, 7.0), poly(&[(2.5, 2.5), (2.5, 0.5), (9.5, 0.5), (9.5, 7.5), (7.5, 7.5)])], 1.0),
-        Icon::WinClose => (vec![poly(&[(0.0, 0.0), (10.0, 10.0)]), poly(&[(10.0, 0.0), (0.0, 10.0)])], 1.0),
     }
-}
-
-/// Fonts and the glyph cache. Only the handful of system fonts the UI needs are loaded, which
-/// keeps startup fast compared with scanning every installed font.
-pub struct Fonts {
-    pub system: FontSystem,
-    pub cache: SwashCache,
-}
-
-pub const UI_FAMILY: &str = "Segoe UI";
-
-impl Fonts {
-    pub fn load() -> Self {
-        static DB: std::sync::OnceLock<cosmic_text::fontdb::Database> = std::sync::OnceLock::new();
-        let db = DB
-            .get_or_init(|| {
-                let mut db = cosmic_text::fontdb::Database::new();
-                let dir = std::env::var_os("WINDIR")
-                    .map_or_else(|| "C:\\Windows".into(), std::path::PathBuf::from)
-                    .join("Fonts");
-                for f in [
-                    "segoeui.ttf", "seguisb.ttf", "segoeuib.ttf", "seguisym.ttf", "seguiemj.ttf",
-                    "msyh.ttc", "YuGothM.ttc", "malgun.ttf", "Nirmala.ttf", "ebrima.ttf", "tahoma.ttf",
-                ] {
-                    let _ = db.load_font_file(dir.join(f));
-                }
-                db
-            })
-            .clone();
-        let locale = sys_locale().unwrap_or_else(|| "en-US".into());
-        Self { system: FontSystem::new_with_locale_and_db(locale, db), cache: SwashCache::new() }
-    }
-
-    /// A single-line text buffer in physical pixels.
-    pub fn line(&mut self, text: &str, size: f32, weight: Weight, s: f32) -> Buffer {
-        let mut b = Buffer::new(&mut self.system, Metrics::new(size * s, size * 1.35 * s));
-        b.set_wrap(cosmic_text::Wrap::None);
-        b.set_size(None, None);
-        b.set_text(text, &attrs(weight), Shaping::Advanced, None);
-        b.shape_until_scroll(&mut self.system, false);
-        b
-    }
-}
-
-pub fn attrs(weight: Weight) -> Attrs<'static> {
-    Attrs::new().family(Family::Name(UI_FAMILY)).weight(weight)
-}
-
-fn sys_locale() -> Option<String> {
-    std::env::var("LANG").ok().filter(|l| !l.is_empty())
-}
-
-/// Logical width of a laid-out single-line buffer.
-pub fn text_width(b: &Buffer, s: f32) -> f32 {
-    b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) / s
 }

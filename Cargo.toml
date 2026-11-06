@@ -1,6 +1,6 @@
 [package]
 name = "persona"
-version = "0.2.0"
+version = "2.0.0"
 edition = "2024"
 description = "A lean, memory-safe browser shell written in Rust"
 default-run = "Persona"
@@ -10,8 +10,9 @@ name = "Persona"
 path = "src/main.rs"
 
 [dependencies]
+anvil_ui = { path = "vendor/anvil/crates/anvil_ui" }
 arboard = { version = "3.7.0", default-features = false }
-cosmic-text = "0.19.0"
+glam = "0.27"
 ico = "0.6.0"
 jpeg-decoder = { version = "0.3", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -24,6 +25,12 @@ tungstenite = { version = "0.30.0", default-features = false, features = ["hands
 ureq = { version = "3.5.1", default-features = false, features = ["native-tls"] }
 url = "2.5.8"
 wry = { version = "0.57.1", features = ["devtools"] }
+
+# Test builds only: also compile wgpu's Vulkan backend, so the headless ANVL render tests find a GPU
+# in containers (Wine + Mesa lavapipe, with Wine's d3d12 disabled) as well as on Windows (DX12).
+# Release builds are unchanged.
+[dev-dependencies]
+wgpu = { version = "30", default-features = false, features = ["vulkan"] }
 
 [profile.release]
 opt-level = 3

@@ -1,6 +1,5 @@
-//! Docked DevTools. WebView2 only offers DevTools as a separate window, so the browser runs with
-//! a loopback-only debugging port (picked by the OS) and loads the DevTools frontend that the
-//! engine itself serves into a pane next to the page.
+//! Finding a tab's page on the engine's loopback-only debugging port (picked by the OS). Persona's
+//! own DevTools (`inspector.rs`) and the tab snapshots (`thumbs.rs`) talk to pages through it.
 
 use std::{
     io::{Read, Write},
@@ -67,10 +66,10 @@ fn host(url: &str) -> &str {
     url.split_once("://").map_or("", |(_, r)| r.split(['/', '?', '#']).next().unwrap_or(""))
 }
 
-/// Finds the tab's page target and returns the docked DevTools URL for it: by the marker title,
-/// else by a unique URL, else by a unique host (pages may change their URL or title themselves).
-/// Retries briefly because the engine updates its target list asynchronously.
-pub fn frontend_url(data_dir: &Path, marker: &str, url: &str) -> Option<String> {
+/// Finds the tab's page target: by the marker title, else by a unique URL, else by a unique host
+/// (pages may change their URL or title themselves). Returns the debugging port and the target
+/// id. Retries briefly because the engine updates its target list asynchronously.
+pub fn find_page(data_dir: &Path, marker: &str, url: &str) -> Option<(u16, String)> {
     let port = port(data_dir)?;
     let unique = |ts: Vec<&Target>| (ts.len() == 1).then(|| ts[0].id.clone());
     for attempt in 0..40 {
@@ -86,9 +85,7 @@ pub fn frontend_url(data_dir: &Path, marker: &str, url: &str) -> Option<String> 
                 })?
             });
             if let Some(id) = found {
-                return Some(format!(
-                    "http://127.0.0.1:{port}/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/{id}"
-                ));
+                return Some((port, id));
             }
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -129,8 +126,8 @@ mod tests {
     #[ignore]
     fn live_lookup_finds_search_tab() {
         let dir = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("Cederic");
-        let url = super::frontend_url(&dir, "no-marker", "https://search.brave.com/search?q=x");
-        println!("{url:?}");
-        assert!(url.is_some_and(|u| u.contains("/devtools/inspector.html?ws=127.0.0.1:")));
+        let found = super::find_page(&dir, "no-marker", "https://search.brave.com/search?q=x");
+        println!("{found:?}");
+        assert!(found.is_some());
     }
 }
