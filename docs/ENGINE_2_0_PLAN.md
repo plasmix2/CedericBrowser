@@ -7,11 +7,13 @@ background knowledge or thin sources and must be measured before they drive a de
 
 Replace WebView2 (wry) with an in-process engine that uses much less memory per tab and starts faster.
 
-A from-scratch engine that renders the modern web is a multi-year project, and the hardest parts are not
-rendering but **JavaScript speed**, **web compatibility** (floats, tables, inline layout, ~hundreds of Web APIs)
-and **security/site isolation**. So the plan assembles proven Rust components behind our own interface,
-and lets measurements, not opinions, decide each layer. WebView2 stays as a fallback engine until the new
-one is good enough, so users are never left with a browser that cannot open their sites.
+A from-scratch engine that renders the modern web is a multi-year project, and the hardest parts are
+**JavaScript speed**, **web compatibility** and **security/site isolation**. **Decision (owner, 2026-11-06): use
+[Servo](https://servo.org) as the base and add on to it where needed.** Servo already provides HTML parsing
+(html5ever), styling (Stylo), layout, WebRender, a SpiderMonkey JS engine, networking, DOM and Web APIs, and
+ships as an embeddable crate. We write the browser around it, upstream fixes where we can, and keep patches to a
+minimum. Servo is pre-1.0 and less compatible than Chromium, so WebView2 stays as a fallback engine until
+measurements say otherwise.
 
 Success is defined by numbers (section 6), not by "we wrote it ourselves".
 
@@ -42,16 +44,14 @@ The hard couplings:
 ## 3. Architecture
 
 ```
- Browser (main.rs, toolbar, popups ...)          unchanged UI
+ Browser (main.rs, toolbar, popups ...)          unchanged native UI
         |
    trait PageEngine / PageView                  Phase 0 seam
         |
-   +----+-----------------------+
-   | WebView2 backend (today)   |  Persona Engine backend (new)
-   +----------------------------+
-                                   net -> html5ever -> DOM -> Stylo (style)
-                                   -> layout -> display list -> paint -> our surface
-                                   JS engine + DOM/Web API bindings, event loop
+   +----+--------------------------+
+   | WebView2 backend (today,      |  Servo backend (new, default when it passes the gates)
+   | kept as fallback)             |  servo crate (LTS branch) + Persona patches/add-ons
+   +-------------------------------+
 ```
 
 Proposed trait (derived from actual usage; refine in Phase 0): `PageEngine::create_view(opts, event
@@ -61,28 +61,25 @@ callback, nav filter, permission callback)` and `clear_browsing_data(profile)`; 
 Events: `Started, Finished, Title, NewWindow, Ipc, Pip, Fullscreen`. The security whitelist
 (`Shortcut::parse`, `ContextRequest::parse`) stays host-side.
 
-## 4. Component choices (candidates, to be decided by benchmarks)
+## 4. What Servo gives us and what we add
 
-| Layer | Primary candidate | Alternative | Notes |
-|---|---|---|---|
-| HTML parse | html5ever | - | Spec-complete, small |
-| CSS cascade | Stylo | own cascade over cssparser | Stylo is heavy and MPL-2, but writing a cascade is a huge compat cost |
-| Layout | Taffy (block/flex/grid) + own inline, float, table | Blitz layout | Blitz is pre-alpha, float support unconfirmed; Servo layout is not usable standalone |
-| Text | cosmic-text (already used) | Parley | Avoid two shaping stacks |
-| Paint | **GPU**: Vello or Skia (Graphite/Ganesh) on D3D12 via wgpu, compositor with GPU-resident tile layers | tiny-skia / vello_cpu as software fallback | Speed is the priority, so GPU is the default; GPU stack costs roughly 50-150 MB driver memory *(unverified)*, accepted. Bake-off picks Vello vs Skia |
-| JavaScript | **V8 (JIT)** via the `v8` crate | QuickJS-ng only for tiny internal pages | Only option with JIT speed and full ES/Wasm support. Cost: ~20-30 MB binary, several MB per isolate *(unverified)*. Heavy `unsafe` stays in the renderer process |
-| Network | hyper + rustls + h2, own cookie jar/cache | quinn+h3 later | HTTP/3 still unstable in the ecosystem |
-| Whole engine fallback | Servo crate (0.x, monthly breaking releases, LTS branch) | WebView2 | Evaluate in Phase 1 as a bake-off |
+| Area | From Servo | Persona add-on / risk |
+|---|---|---|
+| Parse, style, layout, paint | html5ever, Stylo, Servo layout, WebRender | Compatibility gaps vs Chromium; report/fix upstream first, patch only if blocked |
+| JavaScript | SpiderMonkey (mozjs), with JIT | Not V8: speed and Web API behavior differ from WebView2. Windows build of mozjs is painful (MozillaBuild); use prebuilt/cached artifacts in CI |
+| Rendering into our window | Servo rendering contexts (software readback or GPU/window) | Must integrate with our softbuffer UI and remove the child-HWND/`present_with_damage` workaround; spike in Phase 1 |
+| Networking | Servo net stack | Need cookies per persona profile, cache, TLS/QUIC policy, HTTPS upgrade; `input::is_allowed_navigation` stays as a navigation filter |
+| Events/IPC | Embedder delegate callbacks | Re-create the `window.ipc.postMessage` shim and keep the host-side whitelist; document-start script injection |
+| Profiles, permissions, clear-data | Partial | Persona profiles, permission callback, clear-site-data: likely add-ons |
+| DevTools | Servo devtools server (Firefox remote protocol, not CDP) | Our docked pane, thumbnails and `live_eval` can't use CDP: thumbnails become `snapshot()`, inspector needs a Firefox-protocol client/frontend or a native one |
+| PiP, fullscreen, media | Partial, codecs depend on build | Verify video/audio codecs, PiP and background playback; may need add-ons |
+| Chromium-only features in our scripts | none | `speculationrules`, Chromium PiP API: drop or reimplement host-side |
 
-**JavaScript is the make-or-break layer.** Given "fastest" and WebView2-level usefulness, the default is V8
-(JIT, Wasm, full modern ES), with Phase 1 confirming its Windows build, isolate-per-site memory and embedding
-cost. Interpreters (QuickJS-ng, Boa) are ruled out for general pages because they are too slow. Note that
-V8 alone is not a web platform: DOM, fetch, workers, Web APIs, media, WebGL/WebGPU and WebRTC are all ours to build
-or integrate, and are the real parity cost.
+Servo is MPL-2: modified Servo files must stay MPL-2 and available. `unsafe_code = "forbid"` only covers our
+own crate; Servo, SpiderMonkey and Stylo contain `unsafe`. Say so plainly in README (AGENTS.md rule 9) and, if
+Servo's multi-process/sandbox mode is usable on Windows, enable it for site isolation.
 
-`unsafe_code = "forbid"` only covers our crate. JS engines, Stylo and graphics crates contain `unsafe`.
-Plan: keep them in separate workspace crates / a renderer process, audit with `cargo-geiger` / `cargo-vet`,
-and say so plainly in README (AGENTS.md rule 9).
+Use Servo's **LTS branch** for shipping and pin exact versions; the monthly releases may break the embedding API.
 
 ## 5. Phases and agent workstreams
 
@@ -92,26 +89,20 @@ Each workstream is one branch, one owner, small PRs, per AGENTS.md. Claim it in 
 - WS-A *Trait extraction*: introduce `PageEngine`/`PageView`, move `build_tab` and the ~25 wry calls behind a
   WebView2 backend. Touches `main.rs` heavily: do this first, alone, to avoid conflicts.
 - WS-B *CDP removal*: `snapshot()` and `eval` on the trait; make `thumbs.rs` and `live_eval` use them.
-- WS-C *Benchmark harness*: reproducible memory (private bytes per tab, idle and loaded), startup, scroll
-  frame time, Speedometer/JetStream-style JS scores, and a page corpus (top sites + simple documents).
-  Baseline WebView2.
+- WS-C *Benchmark harness*: private bytes per tab (idle/loaded), startup, scroll frame time, JS benchmarks, a page
+  corpus (top sites + simple documents). Baseline WebView2.
 
-**Phase 1: de-risk (4-6 weeks, parallel, throwaway prototypes).**
-- WS-D *V8 embedding spike*: `v8` crate on Windows, isolate/context cost, snapshotting for fast startup, a minimal DOM binding layer; compare to Boa/SpiderMonkey only as sanity checks.
-- WS-E *Paint bake-off*: Vello vs Skia on D3D12 with a fixed display list; frame time, latency, GPU memory; tiny-skia as software fallback.
-- WS-F *Servo bake-off*: embed the `servo` crate with software readback on our surface; measure memory/size/compat vs WebView2.
-- WS-G *Compat gap study*: run html5ever+Stylo+Taffy prototype over the corpus; count what breaks (float, inline, tables).
-- Gate: written go/no-go with numbers. If Servo or WebView2 meets the targets, we do not build layers ourselves.
+**Phase 1: Servo feasibility (4-6 weeks, parallel spikes).**
+- WS-D *Embed Servo on Windows*: build the `servo` crate (LTS) in CI, create a view with software or GPU readback into our surface, load pages, input and focus.
+- WS-E *Compat and speed run*: run the corpus and a WPT subset on Servo vs WebView2; list failures by cause (layout, JS, Web API, media).
+- WS-F *Integration gaps*: IPC shim, document-start scripts, navigation filter, profiles/cookies, permissions, devtools options.
+- Gate: written go/no-go with numbers. If Servo cannot meet the targets, we reconsider before investing further.
 
-**Phase 2: engine core (3-6 months).** Network + cache + cookies; DOM + event loop; style + layout (inline, float,
-table); paint + scrolling + compositing into our surface; input/focus; JS bindings for DOM, fetch, timers,
-storage, canvas. Renderer isolated in its own process with a sandbox.
+**Phase 2: Servo backend.** Implement `PageEngine` on Servo; tab lifecycle (spare tab, suspend/discard), history, favicons, title, new-window, context-menu, view-source.
 
-**Phase 3: browser parity.** IPC shim and injected scripts, profiles/cookies, permissions, PiP/fullscreen,
-media (audio/video codecs are a separate large item), native inspector replacing CDP docking, view-source.
+**Phase 3: parity add-ons.** Close the gaps from WS-E/F: profiles, permissions, PiP/fullscreen, media, inspector/thumbnails without CDP, installer size and update flow. Upstream patches first.
 
-**Phase 4: ship.** Opt-in flag (`PERSONA_ENGINE=native`), auto-fallback to WebView2 for sites that fail,
-telemetry-free crash reports (existing `crash.log`), then default switch only when section 6 targets hold.
+**Phase 4: ship.** Opt-in flag (`PERSONA_ENGINE=servo`), automatic fallback to WebView2 for sites that fail, existing `crash.log`, then switch the default only when section 6 holds.
 
 ## 6. Targets (set after the Phase 0 baseline; proposed)
 
@@ -122,19 +113,19 @@ telemetry-free crash reports (existing `crash.log`), then default switch only wh
 
 ## 7. Risks
 
-1. **Web compatibility gap**: real sites break. Mitigation: corpus-driven development, WebView2 fallback.
-2. **No JS engine is fast, small, Windows-friendly and safe at once**: decided by Phase 1 data.
-3. **Servo / Stylo / Vello / Blitz are pre-1.0**: pin versions, budget for upgrades, track MPL-2 obligations.
-4. **Security**: an in-process engine has no site isolation; one bug in a dependency's `unsafe` takes down the browser. Plan a renderer process and sandbox.
-5. **Scope creep**: media codecs, WebRTC, WebGL, accessibility, IME, printing and PDF are each large; cut explicitly in a scope list.
-6. **Merge collisions** with the other agent in `main.rs`/`toolbar.rs`: do WS-A first and alone.
+1. **Web compatibility gap**: Servo trails Chromium; real sites will break. Mitigation: corpus-driven testing, WebView2 fallback, upstream contributions.
+2. **SpiderMonkey, not V8**: JS speed and behavior may fall short of WebView2; measured in WS-E. Swapping the JS engine inside Servo is not realistic.
+3. **Servo is pre-1.0**: monthly breaking embedding API; use LTS, pin versions, budget for upgrades and security patches.
+4. **Memory and binary size**: Servo is much bigger than our current ~4 MB exe *(unverified)*; speed is the priority but we measure and report it.
+5. **Security**: unless Servo's sandbox/multi-process works on Windows, there is no site isolation. Verify in Phase 1.
+6. **Windows build and CI time**: mozjs and Stylo are slow to build; cache artifacts.
+7. **Scope creep** and **merge collisions** in `main.rs`/`toolbar.rs`: do WS-A first and alone.
 
 ## 8. Decisions
 
-Decided (owner, 2026-11-06): speed is the top priority and the engine must be as useful as WebView2, so the JS engine is V8 (JIT)
-and painting is GPU-first.
+Decided (owner, 2026-11-06): speed is the top priority, the engine must be as useful as WebView2, and **Servo is the base**
+with add-ons where needed (this replaces the earlier V8/GPU-stack proposal).
 
 Still open:
-1. Is a WebView2 fallback acceptable during and after the transition? (Plan assumes yes; without it, "as useful as WebView2" cannot be guaranteed at launch.)
-2. Is Servo acceptable as the 2.0 engine if the bake-off shows it beats a custom stack on speed and compat?
-3. Target platforms beyond Windows?
+1. Is a WebView2 fallback acceptable during and after the transition? (Plan assumes yes.)
+2. Target platforms beyond Windows?
