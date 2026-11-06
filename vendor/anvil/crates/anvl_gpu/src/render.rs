@@ -24,6 +24,10 @@ const SHADER: &str = include_str!("shaders.wgsl");
 
 /// Smallest instance buffer allocated, in bytes.
 const MIN_INSTANCE_BYTES: u64 = 4096;
+/// Persona patch: at most this many cached offscreen textures (and read-back buffers), and at
+/// most this many bytes of each.
+const OFFSCREEN_MAX: usize = 4;
+const OFFSCREEN_BUDGET: u64 = 16 * 1024 * 1024;
 
 /// A picture on the GPU, with the bind group that exposes it to the image shader.
 struct ImageTexture {
@@ -761,7 +765,13 @@ impl Renderer {
     pub fn render_to_frame(&mut self, draw: &DrawList, text: &mut TextSystem, clear: Color) -> Frame {
         let (w, h) = (self.config.width.max(1), self.config.height.max(1));
         let prepared = self.prepare(draw, text);
-        if !self.offscreen.iter().any(|(ow, oh, _)| (*ow, *oh) == (w, h)) {
+        // Persona patch: the caches below are least-recently-used (a hit moves to the back) and
+        // kept within OFFSCREEN_BUDGET bytes. Keyed by exact size and capped only by count, they
+        // filled up with full-window buffers while a window was resized (160 MB measured).
+        if let Some(i) = self.offscreen.iter().position(|(ow, oh, _)| (*ow, *oh) == (w, h)) {
+            let hit = self.offscreen.remove(i);
+            self.offscreen.push(hit);
+        } else {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("anvil-offscreen"),
                 size: wgpu::Extent3d {
@@ -776,10 +786,11 @@ impl Renderer {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
-            if self.offscreen.len() >= 8 {
+            self.offscreen.push((w, h, texture));
+            let bytes = |list: &Vec<(u32, u32, wgpu::Texture)>| list.iter().map(|(w, h, _)| *w as u64 * *h as u64 * 4).sum::<u64>();
+            while self.offscreen.len() > 1 && (self.offscreen.len() > OFFSCREEN_MAX || bytes(&self.offscreen) > OFFSCREEN_BUDGET) {
                 self.offscreen.remove(0);
             }
-            self.offscreen.push((w, h, texture));
         }
         let target = match self.offscreen.iter().find(|(ow, oh, _)| (*ow, *oh) == (w, h)) {
             Some((_, _, t)) => t.clone(),
@@ -794,19 +805,26 @@ impl Renderer {
         let row = w * 4;
         let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let size = (padded * h) as u64;
-        if !self.readback.iter().any(|(sz, _)| *sz == size) {
+        // Any buffer at least this big will do (the copy fills its start).
+        let fit = self.readback.iter().enumerate().filter(|(_, (sz, _))| *sz >= size).min_by_key(|(_, (sz, _))| *sz).map(|(i, _)| i);
+        if let Some(i) = fit {
+            let hit = self.readback.remove(i);
+            self.readback.push(hit);
+        } else {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("anvil-readback"),
                 size,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            if self.readback.len() >= 8 {
+            self.readback.push((size, buffer));
+            while self.readback.len() > 1
+                && (self.readback.len() > OFFSCREEN_MAX || self.readback.iter().map(|(sz, _)| *sz).sum::<u64>() > OFFSCREEN_BUDGET)
+            {
                 self.readback.remove(0);
             }
-            self.readback.push((size, buffer));
         }
-        let readback = match self.readback.iter().find(|(sz, _)| *sz == size) {
+        let readback = match self.readback.last() {
             Some((_, b)) => b.clone(),
             None => return Frame { width: w, height: h, rgba: vec![0; (w * h * 4) as usize] },
         };
@@ -832,10 +850,10 @@ impl Renderer {
             },
         );
         self.queue.submit(std::iter::once(encoder.finish()));
-        readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        readback.map_async(wgpu::MapMode::Read, ..size, |_| {});
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         let mut rgba = Vec::with_capacity((row * h) as usize);
-        match readback.get_mapped_range(..) {
+        match readback.get_mapped_range(..size) {
             Ok(data) => {
                 for y in 0..h {
                     let start = (y * padded) as usize;

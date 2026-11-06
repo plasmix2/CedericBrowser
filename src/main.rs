@@ -620,7 +620,7 @@ enum UserEvent {
     OpenInNewTab(String),
     Suggestions(suggest::Response),
     DevtoolsTarget { tab: TabId, old_title: String, url: Option<String> },
-    /// Once a minute: unload idle background tabs.
+    /// Every few seconds: free idle GPU buffers, unload idle background tabs.
     Housekeep,
     /// Frame tick from the pacer while the UI animates.
     Frame,
@@ -1725,6 +1725,10 @@ struct Browser {
     home: home::Home,
     /// The New Tab page is what the window's buffer shows under the toolbar.
     home_on_screen: bool,
+    /// The GPU engine shared by the toolbar, popups and New Tab page (for trimming it when idle).
+    engine: Option<anvil::Engine>,
+    /// When the window was last drawn.
+    last_paint: Instant,
     /// Setup's current step, and whether it is waiting for a Google sign-in in a tab.
     setup_step: u8,
     setup_linking: bool,
@@ -1972,6 +1976,13 @@ impl Browser {
     /// goes; title, icon, address and snapshot stay, and the page loads again when it is shown.
     /// Tabs playing video or in Picture-in-Picture, loading, or inspected by DevTools are kept.
     fn housekeep(&mut self) {
+        // Nothing drawn for a while: let the GPU engine drop its frame buffers. The next frame
+        // makes the one it needs again in a few milliseconds.
+        if self.last_paint.elapsed() >= Duration::from_secs(5)
+            && let Some(e) = &self.engine
+        {
+            e.trim(0);
+        }
         const IDLE: Duration = Duration::from_secs(5 * 60);
         const MAX_LIVE: usize = 4;
         let now = Instant::now();
@@ -4384,6 +4395,7 @@ impl Browser {
             return;
         }
         let now = Instant::now();
+        self.last_paint = now;
         self.next_frame = self.toolbar.tick(now);
         self.flush_toolbar();
         let size = self.window.inner_size();
@@ -4600,6 +4612,7 @@ fn main() -> wry::Result<()> {
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
 
     let home = home::Home::new(engine.clone(), dark, color);
+    let gpu = engine.clone();
     let mut popups = Popups::new(&event_loop, &window, dark, brand, engine);
     popups.set_persona_theme(dark, color);
 
@@ -4616,7 +4629,7 @@ fn main() -> wry::Result<()> {
     let p_house = proxy.clone();
     std::thread::spawn(move || {
         while p_house.send_event(UserEvent::Housekeep).is_ok() {
-            std::thread::sleep(Duration::from_secs(60));
+            std::thread::sleep(Duration::from_secs(10));
         }
     });
 
@@ -4668,6 +4681,8 @@ fn main() -> wry::Result<()> {
         menu_owner: None,
         home,
         home_on_screen: false,
+        engine: gpu,
+        last_paint: Instant::now(),
         setup_step: 0,
         setup_linking: false,
         closed_tabs: Vec::new(),
