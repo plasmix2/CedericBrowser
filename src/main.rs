@@ -199,13 +199,18 @@ const SHORTCUT_SCRIPT: &str = r#"
   let ctxVideo = null;
   const videos = (root = document, out = []) => {
     for (const v of root.querySelectorAll('video')) out.push(v);
-    if (out.length) return out;
     for (const el of root.querySelectorAll('*')) {
       if (el.shadowRoot) videos(el.shadowRoot, out);
     }
+    // Same-origin frames (embedded players); cross-origin ones throw and are skipped.
+    for (const f of root.querySelectorAll('iframe')) {
+      try {
+        if (f.contentDocument) videos(f.contentDocument, out);
+      } catch (_) {}
+    }
     return out;
   };
-  const usable = (v) => v instanceof HTMLVideoElement && v.isConnected && (v.readyState >= 1 || v.videoWidth > 0 || !!(v.currentSrc || v.src));
+  const usable = (v) => v instanceof HTMLVideoElement && v.isConnected && (v.readyState >= 1 || v.videoWidth > 0 || !!(v.currentSrc || v.src || v.srcObject) || !v.paused);
   const videoAt = (x, y) => {
     for (const el of document.elementsFromPoint(x, y)) {
       if (usable(el)) return el;
@@ -230,7 +235,7 @@ const SHORTCUT_SCRIPT: &str = r#"
       const r = v.getBoundingClientRect();
       const area = Math.max(0, r.width) * Math.max(0, r.height);
       const playing = (!v.paused && !v.ended) ? 1e9 : 0;
-      return playing + (area || (v.videoWidth * v.videoHeight));
+      return playing + (area || (v.videoWidth * v.videoHeight) || 1);
     };
     list.sort((a, b) => score(b) - score(a));
     return list[0];
@@ -247,7 +252,15 @@ const SHORTCUT_SCRIPT: &str = r#"
       v.disablePictureInPicture = false;
       v.removeAttribute('disablepictureinpicture');
       v.addEventListener('leavepictureinpicture', () => post('pip_off'), { once: true });
-      await v.requestPictureInPicture();
+      try {
+        await v.requestPictureInPicture();
+      } catch (_) {
+        // Some players refuse a request from outside their own controls; use the player's own
+        // picture-in-picture button when it has one (YouTube, players labelled for it).
+        const btn = document.querySelector('.ytp-pip-button, button[aria-label*="picture in picture" i], button[title*="picture in picture" i]');
+        if (!btn) return false;
+        btn.click();
+      }
       post('pip_on');
       return true;
     } catch (_) {

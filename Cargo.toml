@@ -27,6 +27,12 @@ ureq = { version = "3.5.1", default-features = false, features = ["native-tls"] 
 url = "2.5.8"
 wry = { version = "0.57.1", features = ["devtools"] }
 
+# Test builds only: also compile wgpu's Vulkan backend, so the headless ANVL render tests find a GPU
+# in containers (Wine + Mesa lavapipe, with Wine's d3d12 disabled) as well as on Windows (DX12).
+# Release builds are unchanged.
+[dev-dependencies]
+wgpu = { version = "30", default-features = false, features = ["vulkan"] }
+
 [profile.release]
 opt-level = 3
 lto = "fat"

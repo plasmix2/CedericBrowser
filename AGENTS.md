@@ -112,7 +112,12 @@ Rules:
 4. **Do not edit `vendor/anvil` casually.** Changes there must be listed in `INSTRUCTIONS.md`. Adding a Lucide icon
    means re-baking the atlas (`anvl_gpu` `bake_icons` example, not vendored here); prefer drawing it in `icon_def`.
 5. **Say what you could not test.** Headless ANVL needs a GPU adapter. In Linux containers install
-   `mesa-vulkan-drivers` (lavapipe) to render the `render_*` tests.
+   `mesa-vulkan-drivers` (lavapipe) to render the `render_*` tests. Persona is Windows-only, so in a Linux
+   container cross-compile the tests (`--target x86_64-pc-windows-gnu`) and run them under Wine with
+   `WINEDLLOVERRIDES="d3d12=;d3d12core="`: test builds include wgpu's Vulkan backend, which then reaches
+   lavapipe. `live_popups` opens real popup windows (run Xvfb and take a screenshot while it runs).
+6. **Never make a window click-through with `set_ignore_cursor_events`.** tao turns it into a layered
+   window without `SetLayeredWindowAttributes`, and Windows then never shows it.
 
 ## What must keep working
 
