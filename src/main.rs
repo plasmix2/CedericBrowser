@@ -948,6 +948,9 @@ struct PrefsData {
     /// Memory saver: unload background tabs much sooner (`Browser::housekeep`).
     #[serde(default)]
     memory_saver: Option<bool>,
+    /// Bubble tabs: floating rounded capsule tabs instead of folder tabs.
+    #[serde(default)]
+    bubble_tabs: Option<bool>,
     /// Which version of the setup screen was completed. Raising `SETUP_VERSION` makes everyone,
     /// including profiles with saved data, go through setup once more.
     #[serde(default)]
@@ -965,6 +968,7 @@ struct Prefs {
     permissions: SitePermissions,
     setup_done: bool,
     memory_saver: bool,
+    bubble_tabs: bool,
     /// The linked Google account's (name, email) for the setup screen; not saved.
     google_hint: Option<(String, String)>,
     bg_cache: HashMap<String, Option<String>>,
@@ -1055,6 +1059,7 @@ impl Prefs {
             permissions,
             setup_done,
             memory_saver: data.memory_saver.unwrap_or(false),
+            bubble_tabs: data.bubble_tabs.unwrap_or(false),
             google_hint: None,
             bg_cache,
             strip_cache,
@@ -1179,6 +1184,7 @@ impl Prefs {
             setup_done: Some(self.setup_done),
             setup_version: self.setup_done.then_some(SETUP_VERSION),
             memory_saver: Some(self.memory_saver),
+            bubble_tabs: Some(self.bubble_tabs),
         };
         if let Ok(json) = serde_json::to_string_pretty(&data) {
             let tmp = self.path.with_extension("json.tmp");
@@ -1197,6 +1203,22 @@ impl Prefs {
         self.permissions.microphone = microphone;
         self.permissions.geolocation = geolocation;
         self.save();
+    }
+
+    pub fn bubble_tabs(&self) -> bool {
+        self.bubble_tabs
+    }
+
+    #[allow(dead_code)]
+    pub fn set_bubble_tabs(&mut self, enabled: bool) {
+        self.bubble_tabs = enabled;
+        self.save();
+    }
+
+    pub fn toggle_bubble_tabs(&mut self) -> bool {
+        self.bubble_tabs = !self.bubble_tabs;
+        self.save();
+        self.bubble_tabs
     }
 
     fn set_active_persona(&mut self, id: &str) -> bool {
@@ -1583,6 +1605,7 @@ impl Page {
     fn set_visible(&self, on: bool) -> wry::Result<()> {
         self.on(|v| v.set_visible(on))
     }
+    #[allow(dead_code)]
     fn set_memory_usage_level(&self, l: MemoryUsageLevel) -> wry::Result<()> {
         self.on(|v| v.set_memory_usage_level(l))
     }
@@ -1944,6 +1967,9 @@ impl Browser {
         {
             e.trim(0);
         }
+        if !self.home_active() && self.last_paint.elapsed() >= Duration::from_secs(if saver { 30 } else { 300 }) {
+            self.home.release();
+        }
         // Memory saver: a background tab sleeps after a minute, and only one stays awake.
         let (idle, max_live) = if saver { (Duration::from_secs(60), 1) } else { (Duration::from_secs(5 * 60), 4) };
         self.unload_idle(idle, max_live);
@@ -2124,7 +2150,6 @@ impl Browser {
                 let _ = t.view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             } else {
                 let _ = t.view.set_visible(false);
-                let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
             }
         }
     }
@@ -2143,7 +2168,6 @@ impl Browser {
                 // (and light) until the tab goes somewhere.
                 let _ = tab.view.set_visible(false);
             } else {
-                let _ = tab.view.set_memory_usage_level(MemoryUsageLevel::Normal);
                 let _ = tab.view.set_visible(true);
                 let _ = tab.view.focus();
             }
@@ -2160,8 +2184,6 @@ impl Browser {
         if is_newtab {
             self.refresh_home();
             self.focus_address();
-        } else {
-            self.home.release();
         }
         self.maybe_setup();
         if self.devtools.open {
@@ -2187,7 +2209,7 @@ impl Browser {
     /// the address bar is being edited.
     fn ensure_chrome_focus(&self) {
         if self.toolbar.is_editing() {
-            for t in &self.tabs {
+            if let Some(t) = self.tabs.get(self.active) {
                 let _ = t.view.focus_parent();
             }
             self.window.set_focus();
@@ -2239,6 +2261,7 @@ impl Browser {
             self.window.set_title(&full_title);
             self.last_title = full_title;
         }
+        self.toolbar.set_bubble_tabs(self.prefs.bubble_tabs());
         self.toolbar.set_model(model);
         for url in self.toolbar.take_icon_requests() {
             let _ = self.icons_tx.send(url);
@@ -2582,11 +2605,9 @@ impl Browser {
 
     /// Shows the active tab's page after it left the New Tab page.
     fn reveal_active_page(&mut self) {
-        self.home.release();
         let bounds = self.content_bounds();
         if let Some(tab) = self.tabs.get(self.active) {
             let _ = tab.view.set_bounds(bounds);
-            let _ = tab.view.set_memory_usage_level(MemoryUsageLevel::Normal);
             let _ = tab.view.set_visible(true);
             let _ = tab.view.focus();
         }
@@ -2811,11 +2832,49 @@ impl Browser {
         self.refresh_home();
     }
 
-    /// The site-permissions dialog, drawn by the ANVL engine in its own popup window.
+    /// The settings & permissions dialog, drawn by the ANVL engine in its own popup window.
     fn show_settings(&mut self) {
         self.modal_kind = Some(ModalKind::Settings);
-        let content = self.permissions_content("Site permissions", "Done");
-        self.show_modal(content, popups::MODAL_W, 74.0 + 4.0 * 56.0 + 62.0);
+        let content = self.settings_content("Settings", "Done");
+        self.show_modal(content, popups::MODAL_W, 74.0 + 5.0 * 56.0 + 62.0);
+    }
+
+    fn settings_content(&self, title: &str, done: &str) -> Content {
+        let item = |label: &str, desc: &str, on: bool| popups::ToggleEntry { label: label.into(), desc: desc.into(), on };
+        let perms = &self.prefs.permissions;
+        Content::Modal {
+            title: title.into(),
+            note: "Customize your browser appearance and site permissions.".into(),
+            items: vec![
+                item("Bubble tabs", "Display tabs as floating bubbles instead of folders", self.prefs.bubble_tabs()),
+                item("Camera & video", "Websites may use your webcam", perms.camera),
+                item("Microphone & audio", "Websites may use your microphone", perms.microphone),
+                item("Notifications", "Sites may send desktop notifications", perms.notifications),
+                item("Location", "Websites may read your location", perms.geolocation),
+            ],
+            done: done.into(),
+        }
+    }
+
+    /// Flips one setting (row `index` of the switches dialog).
+    fn toggle_setting(&mut self, index: usize) {
+        if index == 0 {
+            let bubble = self.prefs.toggle_bubble_tabs();
+            self.toolbar.set_bubble_tabs(bubble);
+            self.sync_ui();
+            self.window.request_redraw();
+            return;
+        }
+        let p = &self.prefs.permissions;
+        let (mut cam, mut mic, mut notif, mut geo) = (p.camera, p.microphone, p.notifications, p.geolocation);
+        match index {
+            1 => cam = !cam,
+            2 => mic = !mic,
+            3 => notif = !notif,
+            4 => geo = !geo,
+            _ => return,
+        }
+        self.set_permissions(cam, notif, mic, geo);
     }
 
     fn permissions_content(&self, title: &str, done: &str) -> Content {
@@ -3769,7 +3828,6 @@ impl Browser {
         let Some(id) = id else { return };
         let Some(i) = self.index_of(id) else { return };
         if i != self.active && !self.tabs[i].pip {
-            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Normal);
             let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
             let _ = self.tabs[i].view.set_visible(true);
         }
@@ -4041,11 +4099,11 @@ impl Browser {
                 }
                 Some(ModalKind::Notice) => self.hide_modal(),
                 Some(ModalKind::Settings) | None => {
-                    if index >= 4 {
+                    if index >= 5 {
                         self.hide_modal();
                         return;
                     }
-                    self.toggle_permission(index);
+                    self.toggle_setting(index);
                     self.show_settings();
                 }
             },
@@ -4182,7 +4240,6 @@ impl Browser {
                                 t.pip = false;
                                 if j != active {
                                     let _ = t.view.set_visible(false);
-                                    let _ = t.view.set_memory_usage_level(MemoryUsageLevel::Low);
                                     let _ = t.view.set_bounds(bounds);
                                 }
                             }
@@ -4191,12 +4248,10 @@ impl Browser {
                     self.tabs[i].pip = on;
                     if i != active {
                         if on {
-                            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Normal);
                             let _ = self.tabs[i].view.set_bounds(rect(-10.0, -10.0, 1.0, 1.0));
                             let _ = self.tabs[i].view.set_visible(true);
                         } else {
                             let _ = self.tabs[i].view.set_visible(false);
-                            let _ = self.tabs[i].view.set_memory_usage_level(MemoryUsageLevel::Low);
                             let _ = self.tabs[i].view.set_bounds(bounds);
                         }
                     }
@@ -4943,6 +4998,7 @@ fn main() -> wry::Result<()> {
     let engine = anvil::Engine::new();
     let mut toolbar = Toolbar::new_with_brand(dark, brand, scale as f32, size.width as f32, engine.clone());
     toolbar.set_persona_theme(dark, color, &letter);
+    toolbar.set_bubble_tabs(prefs.bubble_tabs());
     toolbar.set_locked(false, false);
     let softbuffer_ctx = softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
     let surface = softbuffer::Surface::new(&softbuffer_ctx, window.clone()).expect("failed to create drawing surface");
@@ -5550,5 +5606,74 @@ mod tests {
         // 4. Test clear_pressed clears any dangling state
         tb.clear_pressed();
         assert!(!tb.captures_mouse());
+    }
+
+    #[test]
+    fn bubble_tabs_prefs_persistence_and_toggle() {
+        let dir = std::env::temp_dir().join(format!("cederic_bubble_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        {
+            let mut prefs = Prefs::open(&dir);
+            assert!(!prefs.bubble_tabs(), "Bubble tabs must default to false (folder tabs)");
+            let toggled = prefs.toggle_bubble_tabs();
+            assert!(toggled);
+            assert!(prefs.bubble_tabs());
+        }
+
+        // Reopen from disk to verify persistence
+        {
+            let mut prefs = Prefs::open(&dir);
+            assert!(prefs.bubble_tabs(), "Bubble tabs setting must persist to disk");
+            let toggled = prefs.toggle_bubble_tabs();
+            assert!(!toggled);
+            assert!(!prefs.bubble_tabs());
+        }
+
+        {
+            let prefs = Prefs::open(&dir);
+            assert!(!prefs.bubble_tabs());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toolbar_bubble_tabs_and_instant_tab_opening() {
+        let mut tb = Toolbar::new(true, 1.0, 1000.0);
+        assert!(!tb.bubble_tabs);
+        tb.take_dirty();
+
+        tb.set_bubble_tabs(true);
+        assert!(tb.bubble_tabs);
+        assert!(tb.take_dirty(), "Setting bubble tabs must mark toolbar dirty for repaint");
+
+        // Open initial tabs
+        let model = toolbar::Model {
+            tabs: vec![
+                toolbar::TabInfo { id: 1, title: "Tab 1".into(), ..Default::default() },
+            ],
+            active: 1,
+            ..Default::default()
+        };
+        tb.set_model(model);
+        tb.tick(Instant::now());
+
+        // Now open a second tab in foreground
+        let model2 = toolbar::Model {
+            tabs: vec![
+                toolbar::TabInfo { id: 1, title: "Tab 1".into(), ..Default::default() },
+                toolbar::TabInfo { id: 2, title: "Tab 2".into(), ..Default::default() },
+            ],
+            active: 2,
+            ..Default::default()
+        };
+        tb.set_model(model2);
+
+        // Verify the newly opened tab was added with full width and alpha (instant opening, no 60% expanding lag)
+        let (tab2_x, tab2_w, tab2_alpha) = tb.test_tab_vis(2).expect("tab 2 vis");
+        assert_eq!(tab2_w, tb.test_tab_w(), "New tab must start at full width immediately");
+        assert_eq!(tab2_alpha, 1.0, "New tab must start at full opacity immediately");
+        assert_eq!(tb.test_sel_x(), tab2_x, "Selection shape must snap directly to new tab to avoid rubber-banding lag across other tabs");
     }
 }

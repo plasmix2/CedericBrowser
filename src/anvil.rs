@@ -234,6 +234,7 @@ impl Painter<'_> {
 
     /// Shows what is on layer 0 beneath the box blurred; `amount` (0..1) is how much of the blur
     /// shows through, so a falling amount makes a progressive blur.
+    #[allow(dead_code)]
     pub fn blur_region(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, amount: f32) {
         if amount <= 0.01 || w <= 0.0 || h <= 0.0 {
             return;

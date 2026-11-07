@@ -193,6 +193,7 @@ pub struct Toolbar {
     tip: Option<(Hit, Instant, bool)>,
     last_frame: Instant,
     logo: Option<Pixmap>,
+    pub bubble_tabs: bool,
     /// Requests for the browser, drained after each event.
     pub cmds: Vec<ChromeCmd>,
 }
@@ -284,6 +285,21 @@ impl Toolbar {
         Self::new_with_brand(dark, Brand::Cederic, scale, width, Engine::new())
     }
 
+    #[cfg(test)]
+    pub fn test_tab_vis(&self, id: TabId) -> Option<(f32, f32, f32)> {
+        self.vis.iter().find(|v| v.id == id).map(|v| (v.x, v.w, v.alpha))
+    }
+
+    #[cfg(test)]
+    pub fn test_tab_w(&self) -> f32 {
+        self.tab_w
+    }
+
+    #[cfg(test)]
+    pub fn test_sel_x(&self) -> f32 {
+        self.sel.0
+    }
+
     pub fn new_with_brand(dark: bool, brand: Brand, scale: f32, width: f32, engine: Option<Engine>) -> Self {
         if engine.is_none() {
             eprintln!("persona: no GPU adapter for the ANVL engine; the toolbar will be blank");
@@ -339,6 +355,7 @@ impl Toolbar {
             tip: None,
             last_frame: now,
             logo: Pixmap::decode_png(include_bytes!("ui/logo_64.png")).ok(),
+            bubble_tabs: false,
             cmds: Vec::new(),
         }
     }
@@ -369,6 +386,13 @@ impl Toolbar {
         self.layout();
     }
 
+    pub fn set_bubble_tabs(&mut self, enabled: bool) {
+        if self.bubble_tabs != enabled {
+            self.bubble_tabs = enabled;
+            self.dirty = true;
+        }
+    }
+
     pub fn set_model(&mut self, model: Model) {
         let incoming: Vec<TabId> = model.tabs.iter().map(|t| t.id).collect();
         for t in &model.tabs {
@@ -397,29 +421,48 @@ impl Toolbar {
                 v.leaving = true;
             }
         }
-        let mut fresh = false;
-        for (i, id) in self.order.iter().enumerate() {
-            if !self.vis.iter().any(|v| v.id == *id) {
-                // New tabs start collapsed at their slot and grow in place.
-                let x = self.slot_x(i);
-                // New tabs start part-open (not from nothing) so opening one feels immediate.
-                self.vis.push(TabVis { id: *id, x, w: self.tab_w * 0.6, alpha: 0.9, hover: 0.0, act: if model.active == *id { 1.0 } else { 0.0 }, vx: 0.0, vw: 0.0, blur: 0.0, leaving: false });
-                fresh = true;
-            }
-        }
-        if fresh {
-            self.frozen_w = None;
+        if model.bookmarked && !self.model.bookmarked && model.url == self.model.url {
+            self.star_pop = 1.0;
         }
         if model.loading && !self.was_loading {
             self.progress = 0.0;
             self.progress_alpha = 1.0;
         }
         self.was_loading = model.loading;
-        if model.bookmarked && !self.model.bookmarked && model.url == self.model.url {
-            self.star_pop = 1.0;
-        }
+        let was_empty = self.vis.is_empty();
         self.model = model;
         self.layout();
+        let mut fresh = false;
+        for (i, id) in self.order.iter().enumerate() {
+            if !self.vis.iter().any(|v| v.id == *id) {
+                let x = self.slot_x(i);
+                // New tabs start at full slot width immediately so opening feels snappy and instant
+                self.vis.push(TabVis {
+                    id: *id,
+                    x,
+                    w: self.tab_w,
+                    alpha: 1.0,
+                    hover: 0.0,
+                    act: if self.model.active == *id { 1.0 } else { 0.0 },
+                    vx: 0.0,
+                    vw: 0.0,
+                    blur: 0.0,
+                    leaving: false,
+                });
+                if !was_empty && self.model.active == *id {
+                    // Snap the selection shape directly to the new tab so it doesn't rubber-band across all tabs
+                    self.sel.0 = x;
+                    self.sel.1 = self.tab_w;
+                    self.sel.2 = 0.0;
+                    self.sel.3 = 0.0;
+                    self.sel_init = true;
+                }
+                fresh = true;
+            }
+        }
+        if fresh {
+            self.frozen_w = None;
+        }
     }
 
     pub fn icon_loaded(&mut self, url: String, img: Option<Pixmap>) {
@@ -654,7 +697,8 @@ impl Toolbar {
             if let Some(d) = self.drag.as_ref().filter(|d| d.active) {
                 let n = self.live_ids().len();
                 let tx = (x - d.grab_dx).clamp(PAD, PAD + (n.max(1) - 1) as f32 * self.tab_w);
-                let to = (((tx - PAD) / self.tab_w).round().max(0.0) as usize).min(n.saturating_sub(1));
+                let center_x = tx + self.tab_w / 2.0;
+                let to = (((center_x - PAD) / self.tab_w).floor().max(0.0) as usize).min(n.saturating_sub(1));
                 let id = d.id;
                 if let Some(v) = self.vis.iter_mut().find(|v| v.id == id) {
                     v.x = tx;
@@ -662,6 +706,7 @@ impl Toolbar {
                 if let Some(d) = &mut self.drag {
                     d.to = to;
                 }
+                self.dirty = true;
             }
             return CursorIcon::Default;
         }
@@ -832,6 +877,7 @@ impl Toolbar {
                 self.keep_order_until = Instant::now() + Duration::from_millis(500);
                 self.cmds.push(ChromeCmd::MoveTab { id: d.id, to: d.to });
             }
+            self.dirty = true;
         }
         let Some(p) = self.pressed.take() else { return };
         // A release a few pixels off the button (a slight wobble while clicking) still counts.
@@ -1212,7 +1258,7 @@ impl Toolbar {
             if Some(v.id) != drag_id
                 && let Some((_, tx)) = targets.iter().find(|(id, _)| *id == v.id)
             {
-                moving |= damp(&mut v.x, &mut v.vx, *tx, dt, if drag_id.is_some() { 34.0 } else { 26.0 });
+                moving |= damp(&mut v.x, &mut v.vx, *tx, dt, if drag_id.is_some() { 36.0 } else { 28.0 });
             } else {
                 v.vx = 0.0;
             }
@@ -1223,24 +1269,19 @@ impl Toolbar {
             if !self.sel_init {
                 self.sel = (tx, tw, 0.0, 0.0);
                 self.sel_init = true;
+            } else if drag_id == Some(active) {
+                // Pin directly to the dragged tab so the selection shape doesn't lag behind
+                self.sel.0 = tx;
+                self.sel.1 = tw;
+                self.sel.2 = 0.0;
+                self.sel.3 = 0.0;
             } else {
-                moving |= spring(&mut self.sel.0, &mut self.sel.2, tx, dt, 30.0, 0.72);
-                moving |= spring(&mut self.sel.1, &mut self.sel.3, tw, dt, 30.0, 0.72);
+                moving |= spring(&mut self.sel.0, &mut self.sel.2, tx, dt, 32.0, 0.75);
+                moving |= spring(&mut self.sel.1, &mut self.sel.3, tw, dt, 32.0, 0.75);
             }
         }
-        // Progressive blur of the tabs around a dragged one: strongest next to it, easing off with
-        // the real distance (not the slot count), and eased in time so nothing pops.
-        let drag_c = self.lift_id.and_then(|l| self.vis.iter().find(|v| v.id == l)).map(|v| (v.x + v.w / 2.0, v.w));
-        let (lift, lift_id) = (self.lift, self.lift_id);
         for v in &mut self.vis {
-            let target = match drag_c {
-                Some((dc, dw)) if Some(v.id) != lift_id && !v.leaving => {
-                    let gap = ((v.x + v.w / 2.0) - dc).abs() - (v.w + dw) / 2.0;
-                    0.88 * (-gap.max(0.0) / (tab_w * 1.25)).exp() * lift
-                }
-                _ => 0.0,
-            };
-            busy |= approach01(&mut v.blur, target, kf * 0.8);
+            v.blur = 0.0;
         }
         self.moving = moving;
         busy |= moving;
@@ -1460,15 +1501,22 @@ impl Toolbar {
             let v = &self.vis[i];
             (v.leaving as u8 == 0, v.id == active, Some(v.id) == lift_id)
         });
+        let active_lifted = lift_id == Some(active) && self.lift > 0.01;
         // The one selected-tab shape, morphing between tabs.
-        if self.sel_init && self.sel.1 > 1.0 {
+        if self.sel_init && self.sel.1 > 1.0 && !active_lifted {
             let (sx, sw) = (self.px(self.sel.0), self.px(self.sel.0 + self.sel.1) - self.px(self.sel.0));
-            c.rrect_top(sx, TAB_Y, sw, TAB_H, 10.0, th.toolbar);
-            c.foot(sx - 10.0, TITLE_H, 10.0, false, th.toolbar);
-            c.foot(sx + sw, TITLE_H, 10.0, true, th.toolbar);
+            if self.bubble_tabs {
+                // Floating bubble/capsule tab
+                c.rrect(sx + 3.0, TAB_Y + 4.0, sw - 6.0, TAB_H - 6.0, 9.0, Rgba(0, 0, 0, 35));
+                c.rrect(sx + 3.0, TAB_Y + 3.0, sw - 6.0, TAB_H - 6.0, 9.0, th.toolbar);
+            } else {
+                c.rrect_top(sx, TAB_Y, sw, TAB_H, 10.0, th.toolbar);
+                c.foot(sx - 10.0, TITLE_H, 10.0, false, th.toolbar);
+                c.foot(sx + sw, TITLE_H, 10.0, true, th.toolbar);
+            }
         }
         for i in idx {
-            let (id, x, w, alpha, hover, leaving, act, blur) = {
+            let (id, x, w, alpha, hover, leaving, act, _blur) = {
                 let v = &self.vis[i];
                 (v.id, self.px(v.x), self.px(v.x + v.w) - self.px(v.x), v.alpha, v.hover, v.leaving, v.act, v.blur)
             };
@@ -1478,29 +1526,37 @@ impl Toolbar {
             let lift = if Some(id) == lift_id { self.lift } else { 0.0 };
             let dragging = lift > 0.01;
             let slot = slots.iter().position(|t| *t == id);
-            // While another tab is being dragged, this one is blurred more the closer it is to it.
-            if blur > 0.01 && !leaving && Some(id) != lift_id {
-                c.blur_region(x, TAB_Y, w, TITLE_H - TAB_Y, 10.0, blur);
-            }
-            // The dragged tab is drawn above the blur layer, so it stays sharp.
+            // The dragged tab is drawn above other layers, so it stays sharp.
             if dragging_tab(lift_id, id, self.lift) {
                 c.layer(2);
             }
             // A lifted tab grows a little and floats on a soft shadow.
             let (x, w) = (x - 2.0 * lift, w + 4.0 * lift);
             if dragging {
-                for (spread, a) in [(10.0, 0.05), (6.0, 0.08), (3.0, 0.11), (1.0, 0.14)] {
-                    c.rrect(x - spread, TAB_Y - spread * 0.2 + 2.0 * lift, w + spread * 2.0, TAB_H + spread, 10.0 + spread, Rgba(0, 0, 0, 255).with_alpha(a * lift));
+                if self.bubble_tabs {
+                    for (spread, a) in [(8.0, 0.05), (5.0, 0.08), (2.0, 0.12)] {
+                        c.rrect(x + 3.0 - spread, TAB_Y + 3.0 - spread * 0.2 + 2.0 * lift, w - 6.0 + spread * 2.0, TAB_H - 6.0 + spread, 9.0 + spread, Rgba(0, 0, 0, 255).with_alpha(a * lift));
+                    }
+                    c.rrect(x + 3.0, TAB_Y + 3.0, w - 6.0, TAB_H - 6.0, 9.0, th.toolbar.mix(Rgba(255, 255, 255, 255), 0.05 * lift));
+                } else {
+                    for (spread, a) in [(10.0, 0.05), (6.0, 0.08), (3.0, 0.11), (1.0, 0.14)] {
+                        c.rrect(x - spread, TAB_Y - spread * 0.2 + 2.0 * lift, w + spread * 2.0, TAB_H + spread, 10.0 + spread, Rgba(0, 0, 0, 255).with_alpha(a * lift));
+                    }
+                    c.rrect(x, TAB_Y, w, TAB_H, 10.0, th.toolbar.mix(Rgba(255, 255, 255, 255), 0.05 * lift));
                 }
-                c.rrect(x, TAB_Y, w, TAB_H, 10.0, th.toolbar.mix(Rgba(255, 255, 255, 255), 0.05 * lift));
             } else {
                 if hover > 0.0 && act < 0.99 {
-                    c.rrect_top(x, TAB_Y, w, TAB_H, 10.0, th.tab_hover.with_alpha(hover * alpha * (1.0 - act)));
+                    if self.bubble_tabs {
+                        c.rrect(x + 3.0, TAB_Y + 3.0, w - 6.0, TAB_H - 6.0, 9.0, th.tab_hover.with_alpha(hover * alpha * (1.0 - act)));
+                    } else {
+                        c.rrect_top(x, TAB_Y, w, TAB_H, 10.0, th.tab_hover.with_alpha(hover * alpha * (1.0 - act)));
+                    }
                 }
             }
             let is_active = act > 0.5;
-            // Separator after inactive tabs, except next to the active or hovered tab and after the last.
-            if let Some(i) = slot
+            // Separator after inactive tabs, except next to the active or hovered tab and after the last (folder mode only).
+            if !self.bubble_tabs
+                && let Some(i) = slot
                 && !dragging
                 && !leaving
             {

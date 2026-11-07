@@ -34,7 +34,7 @@ pub struct Tile {
 }
 
 /// What the page shows; set by `Browser` whenever it changes.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct HomeData {
     #[allow(dead_code)]
     pub persona: String,
@@ -134,10 +134,12 @@ impl Home {
     }
 
     pub fn set_data(&mut self, data: HomeData) {
-        self.data = data;
-        self.hover = None;
-        self.pressed = None;
-        self.dirty = true;
+        if self.data != data {
+            self.data = data;
+            self.hover = None;
+            self.pressed = None;
+            self.dirty = true;
+        }
     }
 
     #[allow(dead_code)]
